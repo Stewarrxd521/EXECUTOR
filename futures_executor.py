@@ -49,8 +49,8 @@ USE_TESTNET        = os.environ.get("USE_TESTNET", "false").lower() == "true"
 # Token compartido con el bot principal para autenticar señales
 SIGNAL_SECRET = os.environ.get("SIGNAL_SECRET", "cambiar-por-secreto-seguro")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8700613197:AAFu7KAP3_9joN8Jq76r3ZcKIZiGcUWzSc4")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "1474510598")
 
 # ── Trading ────────────────────────────────────────────────
 TP_PCT         = float(os.environ.get("TP_PCT",         "1.0"))
