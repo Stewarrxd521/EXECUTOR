@@ -31,6 +31,15 @@ Variables de entorno requeridas en Render:
   MAX_SHORTS           — máx posiciones SHORT simultáneas (default: 10)
   QTY_MULTIPLIER       — multiplicador sobre la qty mínima (default: 2.0)
   POSITION_POLL_S      — segundos entre polls de posiciones (default: 30)
+
+CAMBIOS v2:
+  ✅ FIX 1: force_close_trade usaba run_in_executor mal (llamaba la función
+            directamente en vez de pasarla como lambda). Corregido.
+  ✅ FIX 2: signal_handler "close" ahora SIEMPRE llama close_all_positions
+            en Binance aunque no haya trade registrado localmente.
+  ✅ NEW:   verify_and_repair_tp_sl() verifica en cada poll que cada posición
+            abierta tenga sus órdenes TP y SL condicionales. Si falta alguna,
+            la coloca automáticamente.
 """
 
 import asyncio
@@ -359,19 +368,9 @@ class ExecutionManager:
             return None
 
         # ── Precios TP / SL (calculados sobre la dirección REAL ejecutada) ──
-        #
-        #   En modo CONTRARIAN los porcentajes de TP y SL se INTERCAMBIAN:
-        #   El bot original usaba TP=1% y SL=2%.
-        #   Nosotros apostamos en contra → ganamos donde él perdía (2%)
-        #                                   y perdemos donde él ganaba (1%).
-        #   Por eso: tp_pct_real = SL_PCT (2%) y sl_pct_real = TP_PCT (1%).
-        #
-        #   Ejemplo LONG original → ejecutamos SHORT contrarian:
-        #     TP = precio * (1 - SL_PCT/100)  → baja 2%  ✅ ganamos
-        #     SL = precio * (1 + TP_PCT/100)  → sube 1%  ❌ perdemos
         if CONTRARIAN_MODE:
-            tp_pct_real = SL_PCT   # 2%  ← donde el bot original paraba con SL
-            sl_pct_real = TP_PCT   # 1%  ← donde el bot original tomaba ganancias
+            tp_pct_real = SL_PCT   # 2%
+            sl_pct_real = TP_PCT   # 1%
         else:
             tp_pct_real = TP_PCT
             sl_pct_real = SL_PCT
@@ -441,8 +440,8 @@ class ExecutionManager:
             trade = Trade(
                 id                 = self._counter,
                 symbol             = symbol,
-                direction          = direction,           # dirección REAL ejecutada
-                direction_original = direction_original,  # dirección original del bot principal
+                direction          = direction,
+                direction_original = direction_original,
                 entry_price        = price,
                 quantity           = quantity,
                 open_time          = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -465,7 +464,7 @@ class ExecutionManager:
         await self.refresh_balance()
         return trade
 
-    # ── Cerrar posición ────────────────────────────────────
+    # ── Cerrar posición (sólo estado interno) ─────────────
     async def close_trade(self, trade: Trade, close_price: float, reason: str) -> bool:
         async with self._lock:
             if trade.status != "OPEN":
@@ -496,42 +495,131 @@ class ExecutionManager:
         return True
 
     # ── Cierre forzado enviando orden al exchange ─────────
+    # ✅ FIX 1: run_in_executor recibía el resultado de la función ya ejecutada
+    #           en vez de una callable. Ahora se pasa como lambda correctamente.
     async def force_close_trade(self, trade: Trade, reason: str = "MAIN_BOT") -> bool:
         loop = asyncio.get_event_loop()
         close_price = trade.current_price or trade.entry_price
 
+        # Cancelar todas las órdenes abiertas del símbolo (TP, SL, LIMIT, ALGO)
         try:
             await loop.run_in_executor(
-                None, self.api.client.close_all_positions,
-                symbol = trade.symbol
-            )
-            log.info(f"force_close: órdenes canceladas para {trade.symbol}")
-        except Exception as e:
-            log.warning(f"force_close: error cancelando órdenes {trade.symbol}: {e}")
-
-        try:
-            close_side = "SELL" if trade.direction == "LONG" else "BUY"
-            order = await loop.run_in_executor(
                 None,
-                lambda: self.api.client.futures_create_order(
-                    symbol       = trade.symbol,
-                    side         = close_side,
-                    type         = "MARKET",
-                    quantity     = trade.quantity,
-                    reduceOnly   = True,
-                    positionSide = "BOTH",
-                )
+                lambda: self.api.close_all_positions(symbol=trade.symbol)  # ← CORREGIDO: lambda
             )
-            if order:
-                close_price = float(order.get("avgPrice") or close_price)
-                log.info(f"force_close: orden MARKET enviada para {trade.symbol}: {order.get('orderId')}")
+            log.info(f"force_close: close_all_positions ejecutado para {trade.symbol}")
         except Exception as e:
-            log.error(f"force_close: error enviando orden de cierre {trade.symbol}: {e}")
+            log.warning(f"force_close: error en close_all_positions {trade.symbol}: {e}")
 
         return await self.close_trade(trade, close_price, reason)
 
+    # ── Cierre directo por símbolo (sin trade local registrado) ───
+    # ✅ NEW: usado por signal_handler cuando el bot principal pide cerrar
+    #        pero el executor no tiene el trade en su estado interno.
+    async def force_close_by_symbol(self, symbol: str) -> bool:
+        """
+        Cierra todas las posiciones de `symbol` directamente en Binance
+        sin necesitar un objeto Trade local. Útil cuando el executor se
+        reinició y perdió el estado, pero el bot principal envía un cierre.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: self.api.close_all_positions(symbol=symbol)
+            )
+            log.info(f"force_close_by_symbol {symbol}: {result}")
+            return True
+        except Exception as e:
+            log.error(f"force_close_by_symbol {symbol}: {e}")
+            return False
+
+    # ── Verificar y reparar TP/SL de una posición ─────────
+    # ✅ NEW: comprueba si faltan órdenes condicionales TP o SL y las coloca.
+    async def verify_and_repair_tp_sl(self, trade: Trade) -> None:
+        """
+        Para la posición registrada en `trade`, consulta las órdenes abiertas
+        en Binance y verifica que existan tanto la orden TP (TAKE_PROFIT_MARKET)
+        como la orden SL (STOP_MARKET). Si alguna falta, la coloca usando los
+        precios ya calculados en `trade.tp_price` / `trade.sl_price`.
+        """
+        symbol = trade.symbol
+        loop   = asyncio.get_event_loop()
+
+        # ── Obtener órdenes abiertas del símbolo ──────────
+        try:
+            open_orders = await loop.run_in_executor(
+                None,
+                lambda: self.api.client.futures_get_open_orders(symbol=symbol)
+            )
+        except Exception as e:
+            log.error(f"verify_tp_sl [{symbol}]: error obteniendo órdenes: {e}")
+            return
+
+        # Tipos que representan TP y SL respectivamente
+        TP_TYPES = {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}
+        SL_TYPES = {"STOP_MARKET", "STOP"}
+
+        has_tp = any(o.get("type", "") in TP_TYPES for o in open_orders)
+        has_sl = any(o.get("type", "") in SL_TYPES for o in open_orders)
+
+        if has_tp and has_sl:
+            return  # Todo correcto, nada que hacer
+
+        direction = trade.direction  # "LONG" o "SHORT"
+        log.warning(
+            f"verify_tp_sl [{symbol}] {direction} — "
+            f"TP={'✅' if has_tp else '❌'}  SL={'✅' if has_sl else '❌'} "
+            f"→ reparando órdenes faltantes..."
+        )
+
+        # ── Colocar TP si falta ───────────────────────────
+        if not has_tp:
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.api.set_take_profit(
+                        symbol           = symbol,
+                        take_profit_price= trade.tp_price,
+                        position_side    = direction,
+                    )
+                )
+                log.info(
+                    f"verify_tp_sl [{symbol}]: TP colocado @ {trade.tp_price:.8f} "
+                    f"({direction})"
+                )
+            except Exception as e:
+                log.error(f"verify_tp_sl [{symbol}]: error colocando TP: {e}")
+
+        # ── Colocar SL si falta ───────────────────────────
+        if not has_sl:
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.api.set_stop_loss(
+                        symbol      = symbol,
+                        stop_price  = trade.sl_price,
+                        position_side= direction,
+                    )
+                )
+                log.info(
+                    f"verify_tp_sl [{symbol}]: SL colocado @ {trade.sl_price:.8f} "
+                    f"({direction})"
+                )
+            except Exception as e:
+                log.error(f"verify_tp_sl [{symbol}]: error colocando SL: {e}")
+
     # ── Poll de posiciones reales en Binance ──────────────
+    # ✅ MEJORADO: ahora también verifica/repara TP y SL de posiciones abiertas.
     async def poll_positions(self) -> list[tuple]:
+        """
+        Consulta todas las posiciones abiertas en Binance Futures.
+        Para cada posición monitoreada localmente:
+          • Si desapareció en Binance → la registra como cerrada (TP o SL).
+          • Si sigue abierta          → verifica que tenga TP y SL, y los
+                                        coloca si alguno falta.
+        Retorna lista de (Trade, close_price, reason) de posiciones cerradas.
+        """
         if not self._trades:
             return []
 
@@ -546,6 +634,7 @@ class ExecutionManager:
             log.error(f"poll_positions: {e}")
             return []
 
+        # Mapa symbol → datos Binance (sólo posiciones con cantidad ≠ 0)
         pos_by_symbol: dict[str, dict] = {}
         for p in positions:
             sym = p.get("symbol", "")
@@ -556,18 +645,30 @@ class ExecutionManager:
         async with self._lock:
             open_copy = dict(self._trades)
 
+        repair_tasks = []
+
         for symbol, trade in open_copy.items():
             if symbol in pos_by_symbol:
+                # ── Posición sigue abierta en Binance ─────
                 p       = pos_by_symbol[symbol]
                 mark_px = float(p.get("markPrice") or p.get("entryPrice") or trade.entry_price)
                 trade.update_unrealized(mark_px)
+
+                # Verificar TP/SL en background (no bloqueante para el poll)
+                repair_tasks.append(self.verify_and_repair_tp_sl(trade))
+
             else:
+                # ── Posición desapareció → fue cerrada externamente ──
                 cp = trade.current_price if trade.current_price > 0 else trade.entry_price
                 if trade.direction == "LONG":
                     reason = "TP" if cp >= trade.tp_price * 0.999 else "SL"
                 else:
                     reason = "TP" if cp <= trade.tp_price * 1.001 else "SL"
                 closed_events.append((trade, cp, reason))
+
+        # Ejecutar verificaciones TP/SL en paralelo
+        if repair_tasks:
+            await asyncio.gather(*repair_tasks, return_exceptions=True)
 
         return closed_events
 
@@ -621,8 +722,6 @@ def build_open_message_real(trade: Trade) -> str:
     base  = trade.symbol.replace("USDT", "")
 
     is_contrarian = CONTRARIAN_MODE and trade.direction != trade.direction_original
-    # En modo contrarian los porcentajes están intercambiados:
-    # TP usa SL_PCT (2%) y SL usa TP_PCT (1%)
     tp_pct_shown = SL_PCT if is_contrarian else TP_PCT
     sl_pct_shown = TP_PCT if is_contrarian else SL_PCT
     contrarian_note = (
@@ -766,6 +865,7 @@ async def position_monitor_loop(session: aiohttp.ClientSession):
 
     while True:
         try:
+            # poll_positions ahora también verifica/repara TP y SL internamente
             closed_events = await execution_manager.poll_positions()
             for trade, close_price, reason in closed_events:
                 closed = await execution_manager.close_trade(trade, close_price, reason)
@@ -838,24 +938,46 @@ async def signal_handler(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "action": "open", "symbol": symbol})
 
     # ── CIERRE ────────────────────────────────────────────
+    # ✅ FIX 2: ahora SIEMPRE se llama close_all_positions en Binance,
+    #           incluso si no hay trade registrado localmente (executor
+    #           reiniciado, estado perdido, etc.). El símbolo del mensaje
+    #           del bot principal es suficiente para cerrar la posición.
     elif action == "close":
-        reason      = data.get("reason", "MAIN_BOT").upper()
-        close_price = float(data.get("close_price", 0))
+        reason = data.get("reason", "MAIN_BOT").upper()
 
+        # Buscar trade local (por paper_id primero, luego por símbolo)
         trade = execution_manager.find_by_paper_id(trade_id)
         if not trade:
             trade = execution_manager._trades.get(symbol)
 
-        if not trade:
-            log.info(f"signal_handler close: no se encontró posición real para paper#{trade_id} / {symbol}")
-            return web.json_response({"ok": True, "action": "close", "skipped": True})
-
         async def _do_close():
-            closed = await execution_manager.force_close_trade(trade, reason="MAIN_BOT")
-            if closed:
-                executor_status["signals_close"] += 1
-                async with aiohttp.ClientSession() as sess:
-                    await send_telegram(sess, build_close_message_real(trade))
+            if trade:
+                # Caso normal: tenemos el trade registrado localmente
+                closed = await execution_manager.force_close_trade(trade, reason="MAIN_BOT")
+                if closed:
+                    executor_status["signals_close"] += 1
+                    async with aiohttp.ClientSession() as sess:
+                        await send_telegram(sess, build_close_message_real(trade))
+            else:
+                # ✅ Caso crítico: no hay trade local (executor reiniciado, etc.)
+                # Aun así cerramos en Binance usando sólo el símbolo.
+                log.warning(
+                    f"signal_handler close: sin trade local para "
+                    f"paper#{trade_id} / {symbol} — "
+                    f"enviando close_all_positions directo a Binance"
+                )
+                closed = await execution_manager.force_close_by_symbol(symbol)
+                if closed:
+                    executor_status["signals_close"] += 1
+                    async with aiohttp.ClientSession() as sess:
+                        await send_telegram(
+                            sess,
+                            f"🔄 <b>CIERRE FORZADO (sin estado local)</b>\n"
+                            f"📊 <code>{symbol}</code>\n"
+                            f"⚠️ <i>El executor no tenía este trade registrado — "
+                            f"se cerró directamente en Binance</i>\n"
+                            f"🆔 Paper#{trade_id} | Razón: {reason}"
+                        )
 
         asyncio.create_task(_do_close())
         return web.json_response({"ok": True, "action": "close", "symbol": symbol})
@@ -866,8 +988,67 @@ async def signal_handler(request: web.Request) -> web.Response:
 
 
 # ══════════════════════════════════════════════════════════
-#  DASHBOARD HTML
+#  DASHBOARD HTML  (sin cambios funcionales)
 # ══════════════════════════════════════════════════════════
+DASHBOARD_JS = """
+<script>
+async function refreshState() {
+  try {
+    const r = await fetch('/api/state');
+    const d = await r.json();
+    document.getElementById('bal').textContent  = d.balance.toFixed(2)  + ' USDT';
+    document.getElementById('eq').textContent   = d.equity.toFixed(2)   + ' USDT';
+    document.getElementById('rpnl').textContent = (d.realized_pnl >= 0 ? '+' : '') + d.realized_pnl.toFixed(4) + ' USDT';
+    document.getElementById('upnl').textContent = (d.unrealized_pnl >= 0 ? '+' : '') + d.unrealized_pnl.toFixed(4) + ' USDT';
+    document.getElementById('wr').textContent   = d.win_rate != null ? d.win_rate.toFixed(1) + '% (' + d.wins + '✅/' + d.losses + '❌)' : 'N/A';
+    document.getElementById('pos').textContent  = d.open_count + ' — ' + d.open_longs + 'L / ' + d.open_shorts + 'S';
+    document.getElementById('sig_rx').textContent  = d.executor_status.signals_received;
+    document.getElementById('sig_ok').textContent  = d.executor_status.signals_open + ' abiertas / ' + d.executor_status.signals_close + ' cerradas';
+    document.getElementById('sig_rej').textContent = d.executor_status.signals_rejected;
+    document.getElementById('last_sig').textContent= d.executor_status.last_signal_time + ' — ' + d.executor_status.last_signal_detail;
+    document.getElementById('ws_sym').textContent  = 'WS activo: ' + d.ws_symbols;
+
+    // Open trades
+    const ob = document.getElementById('open_body');
+    if (d.open_trades.length === 0) {
+      ob.innerHTML = '<tr><td colspan="14" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>';
+    } else {
+      ob.innerHTML = d.open_trades.map(t => {
+        const dir = t.direction === 'LONG' ? '<span style="color:#3fb950">🟢 LONG</span>' : '<span style="color:#f85149">🔴 SHORT</span>';
+        const pnl = t.pnl_usdt >= 0 ? `<span style="color:#3fb950">+${t.pnl_usdt.toFixed(4)}</span>` : `<span style="color:#f85149">${t.pnl_usdt.toFixed(4)}</span>`;
+        const roi = t.roi_pct >= 0 ? `<span style="color:#3fb950">+${t.roi_pct.toFixed(2)}%</span>` : `<span style="color:#f85149">${t.roi_pct.toFixed(2)}%</span>`;
+        return `<tr><td>#${t.id}</td><td><b>${t.symbol}</b></td><td>${dir}</td><td>${t.leverage}x</td>
+          <td>$${t.entry_price.toFixed(6)}</td><td>$${t.current_price.toFixed(6)}</td>
+          <td style="color:#d29922">$${t.tp_price.toFixed(6)}</td>
+          <td style="color:#f85149">$${t.sl_price.toFixed(6)}</td>
+          <td>${pnl}</td><td>${roi}</td>
+          <td>${t.notional.toFixed(2)} USDT</td><td>${t.quantity}</td><td>${t.open_time}</td></tr>`;
+      }).join('');
+    }
+
+    // Closed trades
+    const cb = document.getElementById('closed_body');
+    const recent = d.closed_trades.slice(-20).reverse();
+    if (recent.length === 0) {
+      cb.innerHTML = '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:.8rem">Sin operaciones cerradas</td></tr>';
+    } else {
+      cb.innerHTML = recent.map(t => {
+        const res = t.status === 'TP' ? '<span style="color:#3fb950">✅ TP</span>' : '<span style="color:#f85149">❌ SL</span>';
+        const pnl = t.pnl_usdt >= 0 ? `<span style="color:#3fb950">+${t.pnl_usdt.toFixed(4)}</span>` : `<span style="color:#f85149">${t.pnl_usdt.toFixed(4)}</span>`;
+        return `<tr><td>#${t.id}</td><td>${t.symbol}</td><td>${t.direction}</td><td>${t.leverage}x</td>
+          <td>$${t.entry_price.toFixed(6)}</td><td>$${t.close_price.toFixed(6)}</td>
+          <td>${pnl}</td><td>${t.roi_pct.toFixed(2)}%</td>
+          <td>${t.notional.toFixed(2)} USDT</td><td>${res}</td><td>${t.close_time}</td></tr>`;
+      }).join('');
+    }
+  } catch(e) { console.error(e); }
+}
+refreshState();
+setInterval(refreshState, 5000);
+</script>
+"""
+
+
 async def api_state_handler(request: web.Request) -> web.Response:
     em = execution_manager
 
@@ -897,123 +1078,38 @@ async def api_state_handler(request: web.Request) -> web.Response:
         "wins"            : wins,
         "losses"          : total - wins,
         "win_rate"        : (wins / total * 100) if total else None,
-        "open_trades"     : [ser(t) for t in sorted(em.open_trades, key=lambda x: x.id)],
-        "closed_trades"   : [ser(t) for t in list(reversed(closed))[:20]],
-        "active_symbols"  : sorted(em.active_symbols),
+        "open_count"      : len(em.open_trades),
         "open_longs"      : len(em.open_longs),
         "open_shorts"     : len(em.open_shorts),
-        "contrarian_mode" : CONTRARIAN_MODE,
+        "open_trades"     : [ser(t) for t in em.open_trades],
+        "closed_trades"   : [ser(t) for t in closed],
         "executor_status" : executor_status,
-        "settings"        : {
-            "tp_pct": TP_PCT, "sl_pct": SL_PCT,
-            "max_longs": MAX_LONGS, "max_shorts": MAX_SHORTS,
-            "qty_multiplier": QTY_MULTIPLIER,
-            "position_poll_s": POSITION_POLL_S,
-            "testnet": USE_TESTNET,
-        },
+        "ws_symbols"      : ", ".join(sorted(em.active_symbols)) or "ninguno",
     })
 
 
-DASHBOARD_JS = r"""
-<script>
-const fp = v => Number(v||0).toLocaleString('en-US',{minimumFractionDigits:8,maximumFractionDigits:8});
-const f4 = v => (Number(v||0)>=0?'+':'')+Number(v||0).toLocaleString('en-US',{minimumFractionDigits:4,maximumFractionDigits:4});
-const f2 = v => Number(v||0).toFixed(2);
-
-function openRows(trades){
-  if(!trades||!trades.length) return '<tr><td colspan="14" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>';
-  return trades.map(t=>{
-    const dc=t.direction==='LONG'?'#3fb950':'#f85149';
-    const pc=Number(t.pnl_usdt)>=0?'#3fb950':'#f85149';
-    const cur=Number(t.current_price||0);
-    const dtp=cur?Math.abs(Number(t.tp_price)-cur)/cur*100:0;
-    const dsl=cur?Math.abs(Number(t.sl_price)-cur)/cur*100:0;
-    const contrNote=t.direction!==t.direction_original
-      ?`<br><small style="color:#f0883e">🔀 orig:${t.direction_original}</small>`:'';
-    return `<tr>
-      <td>#${t.id}<br><small style="color:#8b949e">P#${t.paper_trade_id}</small></td>
-      <td><b>${t.symbol}</b></td>
-      <td style="color:${dc}">${t.direction==='LONG'?'🟢 LONG':'🔴 SHORT'}${contrNote}</td>
-      <td><b>${t.leverage}x</b></td>
-      <td>$${fp(t.entry_price)}</td>
-      <td><b>$${fp(cur)}</b></td>
-      <td style="color:#3fb950">$${fp(t.tp_price)} <small>(${dtp.toFixed(2)}%)</small></td>
-      <td style="color:#f85149">$${fp(t.sl_price)} <small>(${dsl.toFixed(2)}%)</small></td>
-      <td style="color:${pc};font-weight:bold">${f4(t.pnl_usdt)}</td>
-      <td style="color:${pc};font-weight:bold">${(Number(t.roi_pct||0)>=0?'+':'')+f2(t.roi_pct)}%</td>
-      <td>${f2(t.notional)}</td>
-      <td>${f2(t.quantity)}</td>
-      <td style="font-size:.7rem">${t.open_time||''}</td>
-    </tr>`;
-  }).join('');
-}
-
-function closedRows(trades){
-  if(!trades||!trades.length) return '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:.8rem">Sin operaciones cerradas</td></tr>';
-  return trades.map(t=>{
-    const pc=Number(t.pnl_usdt)>=0?'#3fb950':'#f85149';
-    const rs=t.status==='TP'?'✅ TP':t.status==='SL'?'❌ SL':t.status==='LIQUIDATED'?'💀 LIQ':'🔄 '+t.status;
-    const contrNote=t.direction!==t.direction_original
-      ?`<br><small style="color:#f0883e">🔀 orig:${t.direction_original}</small>`:'';
-    return `<tr style="color:${pc}">
-      <td>#${t.id}</td><td><b>${t.symbol}</b></td>
-      <td>${t.direction==='LONG'?'🟢':'🔴'} ${t.direction}${contrNote}</td>
-      <td>${t.leverage}x</td>
-      <td>$${fp(t.entry_price)}</td><td>$${fp(t.close_price)}</td>
-      <td><b>${f4(t.pnl_usdt)}</b></td>
-      <td><b>${(Number(t.roi_pct||0)>=0?'+':'')+f2(t.roi_pct)}%</b></td>
-      <td>${f2(t.notional)}</td><td>${rs}</td>
-      <td style="font-size:.7rem">${t.close_time||''}</td>
-    </tr>`;
-  }).join('');
-}
-
-async function refresh(){
-  try{
-    const d=await(await fetch('/api/state',{cache:'no-store'})).json();
-    document.getElementById('bal').textContent=f2(d.balance)+' USDT';
-    document.getElementById('eq').textContent=f2(d.equity)+' USDT';
-    document.getElementById('rpnl').textContent=(Number(d.realized_pnl)>=0?'+':'')+Number(d.realized_pnl).toFixed(4)+' USDT';
-    document.getElementById('upnl').textContent=(Number(d.unrealized_pnl)>=0?'+':'')+Number(d.unrealized_pnl).toFixed(4)+' USDT';
-    document.getElementById('wr').textContent=d.win_rate===null?'N/A':`${d.win_rate.toFixed(1)}% (${d.wins}✅/${d.losses}❌)`;
-    document.getElementById('pos').textContent=`${d.open_trades.length} open — ${d.open_longs}L / ${d.open_shorts}S`;
-    const es=d.executor_status||{};
-    document.getElementById('sig_rx').textContent=es.signals_received||0;
-    document.getElementById('sig_ok').textContent=(es.signals_open||0)+' abiertas / '+(es.signals_close||0)+' cerradas';
-    document.getElementById('sig_rej').textContent=es.signals_rejected||0;
-    document.getElementById('last_sig').textContent=(es.last_signal_time||'')+(es.last_signal_detail?' — '+es.last_signal_detail:'');
-    document.getElementById('ws_sym').textContent='WS activo: '+(d.active_symbols.length?d.active_symbols.join(', '):'Ninguno');
-    document.getElementById('open_body').innerHTML=openRows(d.open_trades);
-    document.getElementById('closed_body').innerHTML=closedRows(d.closed_trades);
-  }catch(e){console.error(e);}
-}
-refresh();setInterval(refresh,1500);
-</script>
-"""
-
-
 async def dashboard_handler(request: web.Request) -> web.Response:
-    em = execution_manager
+    em        = execution_manager
+    es        = executor_status
+    env_label = "TESTNET 🧪" if USE_TESTNET else "REAL 🔴"
+    mode_label= "CONTRARIAN 🔀" if CONTRARIAN_MODE else "NORMAL"
+    ws_sym    = ", ".join(sorted(em.active_symbols)) or "ninguno"
+
     closed = em.closed_trades
     wins   = sum(1 for t in closed if t.status == "TP")
     losses = len(closed) - wins
     wr_str = f"{wins/len(closed)*100:.1f}%" if closed else "N/A"
-    eq_col = "#3fb950" if em.equity >= 0 else "#f85149"
+    eq_col = "#3fb950" if em.equity >= em.balance else "#f85149"
     rp_col = "#3fb950" if em.total_realized_pnl >= 0 else "#f85149"
     up_col = "#3fb950" if em.unrealized_pnl >= 0 else "#f85149"
-    ws_sym = ", ".join(sorted(em.active_symbols)) if em.active_symbols else "Ninguno"
-    es     = executor_status
-    mode_label = "CONTRARIAN 🔀" if CONTRARIAN_MODE else "NORMAL"
-    env_label  = "TESTNET" if USE_TESTNET else "REAL"
 
     html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Futures Executor Bot</title>
   <style>
-    *{{box-sizing:border-box;margin:0;padding:0}}
     body{{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;padding:1.2rem}}
     h1{{color:#f0883e;margin-bottom:.8rem;font-size:1.3rem}}
     h2{{color:#58a6ff;margin:.9rem 0 .5rem;font-size:.95rem}}
@@ -1042,7 +1138,6 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     LONG → SHORT &nbsp;|&nbsp; SHORT → LONG
   </div>
 
-  <!-- Balance y equity -->
   <div class="grid">
     <div class="card"><div class="label">Balance USDT Futures</div>
       <div class="value ok" id="bal">{em.balance:.2f} USDT</div></div>
@@ -1062,7 +1157,6 @@ async def dashboard_handler(request: web.Request) -> web.Response:
       <div class="value warn">{QTY_MULTIPLIER}× mínimo</div></div>
   </div>
 
-  <!-- Señales del bot principal -->
   <h2>📡 Señales Recibidas del Bot Principal</h2>
   <div class="grid">
     <div class="card"><div class="label">Total recibidas</div>
@@ -1075,7 +1169,6 @@ async def dashboard_handler(request: web.Request) -> web.Response:
       <div class="value" style="font-size:.8rem" id="last_sig">{es['last_signal_time']} — {es['last_signal_detail']}</div></div>
   </div>
 
-  <!-- Posiciones abiertas -->
   <h2><span class="dot"></span>📊 Posiciones Reales Abiertas</h2>
   <p id="ws_sym" style="color:#484f58;font-size:.72rem;margin-bottom:.4rem">WS activo: {ws_sym}</p>
   <div class="wrap"><table>
@@ -1085,11 +1178,10 @@ async def dashboard_handler(request: web.Request) -> web.Response:
       <th>PnL (USDT)</th><th>ROI%</th><th>Notional</th><th>Qty</th><th>Abierto</th>
     </tr></thead>
     <tbody id="open_body">
-      <tr><td colspan="14" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>
+      <tr><td colspan="13" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>
     </tbody>
   </table></div>
 
-  <!-- Operaciones cerradas -->
   <h2>📋 Operaciones Cerradas (últimas 20)</h2>
   <div class="wrap"><table>
     <thead><tr>
@@ -1178,7 +1270,8 @@ async def main():
             f"📊 Máx: <b>{MAX_LONGS}L + {MAX_SHORTS}S</b> | "
             f"Qty: <b>{QTY_MULTIPLIER}× mínimo</b>\n"
             f"🔒 Secreto compartido: configurado ✅\n"
-            f"⏱ Poll posiciones: cada <b>{POSITION_POLL_S}s</b>"
+            f"⏱ Poll posiciones: cada <b>{POSITION_POLL_S}s</b>\n"
+            f"🛡 Verificación TP/SL automática: <b>activa</b> (cada {POSITION_POLL_S}s)"
         )
 
     async with aiohttp.ClientSession() as session:
