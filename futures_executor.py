@@ -502,7 +502,8 @@ class ExecutionManager:
 
         try:
             await loop.run_in_executor(
-                None, self.api.client.futures_cancel_all_open_orders, trade.symbol
+                None, self.api.client.close_all_positions,
+                symbol = trade.symbol
             )
             log.info(f"force_close: órdenes canceladas para {trade.symbol}")
         except Exception as e:
