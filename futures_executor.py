@@ -4,8 +4,13 @@ futures_executor.py — Bot Ejecutor de Futuros Binance
 Recibe señales HTTP del bot principal (paper trading) y ejecuta
 órdenes REALES en Binance Futures USDT Perpetuos.
 
+⚠️  MODO CONTRARIAN ACTIVO:
+    Las señales del bot principal se INVIERTEN antes de ejecutarse:
+      LONG  → SHORT  (TP y SL también se calculan en la dirección opuesta)
+      SHORT → LONG
+
 Flujo:
-  Bot Principal → POST /signal  →  Ejecutor  →  Binance Futures
+  Bot Principal → POST /signal  →  Ejecutor (invierte dirección)  →  Binance Futures
                                               ↓
                                      Telegram (confirmación real)
                                               ↓
@@ -63,6 +68,15 @@ QTY_MULTIPLIER = float(os.environ.get("QTY_MULTIPLIER", "2.0"))
 PORT             = int(os.environ.get("PORT",            "10000"))
 POSITION_POLL_S  = int(os.environ.get("POSITION_POLL_S", "30"))
 
+# ══════════════════════════════════════════════════════════
+#  MODO CONTRARIAN — invierte la dirección de toda señal
+# ══════════════════════════════════════════════════════════
+CONTRARIAN_MODE = True   # ← Cambiar a False para volver al modo normal
+
+def invert_direction(direction: str) -> str:
+    """Invierte LONG→SHORT y SHORT→LONG."""
+    return "SHORT" if direction.upper() == "LONG" else "LONG"
+
 # ── Binance endpoints ──────────────────────────────────────
 BINANCE_FAPI_WS = "wss://fstream.binance.com"
 
@@ -78,23 +92,24 @@ log = logging.getLogger("Executor")
 # ══════════════════════════════════════════════════════════
 @dataclass
 class Trade:
-    id             : int
-    symbol         : str
-    direction      : str       # "LONG" | "SHORT"
-    entry_price    : float
-    quantity       : float
-    open_time      : str
-    tp_price       : float
-    sl_price       : float
-    leverage       : int
-    paper_trade_id : int = 0   # ID del trade en el bot principal
-    entry_order_id : str = ""
-    current_price  : float = 0.0
-    status         : str   = "OPEN"   # OPEN | TP | SL | LIQUIDATED | MANUAL
-    close_price    : float = 0.0
-    close_time     : str   = ""
-    pnl_usdt       : float = 0.0
-    roi_pct        : float = 0.0
+    id                    : int
+    symbol                : str
+    direction             : str       # "LONG" | "SHORT"  (ya invertida si CONTRARIAN_MODE)
+    direction_original    : str       # dirección que envió el bot principal
+    entry_price           : float
+    quantity              : float
+    open_time             : str
+    tp_price              : float
+    sl_price              : float
+    leverage              : int
+    paper_trade_id        : int = 0   # ID del trade en el bot principal
+    entry_order_id        : str = ""
+    current_price         : float = 0.0
+    status                : str   = "OPEN"   # OPEN | TP | SL | LIQUIDATED | MANUAL
+    close_price           : float = 0.0
+    close_time            : str   = ""
+    pnl_usdt              : float = 0.0
+    roi_pct               : float = 0.0
 
     @property
     def notional_usdt(self) -> float:
@@ -231,7 +246,7 @@ class PositionSizer:
 class ExecutionManager:
     """
     Ejecuta y gestiona posiciones reales en Binance Futures.
-    Las llamadas síncronas a BinanceAPI se ejecutan en run_in_executor.
+    En CONTRARIAN_MODE invierte la dirección de cada señal antes de enviarla.
     """
 
     def __init__(self, binance_api):
@@ -242,7 +257,6 @@ class ExecutionManager:
         self._counter : int = 0
         self._lock    = asyncio.Lock()
         self._balance : float = 0.0
-        # Mapeo paper_trade_id → symbol (para el cierre por señal del bot principal)
         self._paper_id_map : dict[int, str] = {}
 
     # ── Balance real ──────────────────────────────────────
@@ -298,15 +312,25 @@ class ExecutionManager:
     # ── Abrir posición real ───────────────────────────────
     async def open_trade(
         self,
-        symbol        : str,
-        direction     : str,
-        price         : float,
-        paper_trade_id: int = 0,
+        symbol            : str,
+        direction_original: str,   # dirección que envió el bot principal
+        price             : float,
+        paper_trade_id    : int = 0,
     ) -> Optional[Trade]:
         """
-        Recibe la señal del bot principal y abre una posición real.
-        Usa bracket_batch para enviar entrada + TP + SL en una sola llamada.
+        Recibe la señal del bot principal.
+        Si CONTRARIAN_MODE está activo, invierte la dirección antes de operar.
         """
+        # ── Inversión de dirección ─────────────────────────
+        if CONTRARIAN_MODE:
+            direction = invert_direction(direction_original)
+            log.info(
+                f"[CONTRARIAN] Señal original: {direction_original} → "
+                f"Ejecutando: {direction} en {symbol}"
+            )
+        else:
+            direction = direction_original.upper()
+
         async with self._lock:
             if symbol in self._trades:
                 log.warning(f"open_trade: {symbol} ya tiene posición abierta — ignorando")
@@ -334,15 +358,32 @@ class ExecutionManager:
             log.warning(f"open_trade: qty inválida {quantity} para {symbol}")
             return None
 
-        # ── Precios TP / SL ────────────────────────────────
+        # ── Precios TP / SL (calculados sobre la dirección REAL ejecutada) ──
+        #
+        #   En modo CONTRARIAN los porcentajes de TP y SL se INTERCAMBIAN:
+        #   El bot original usaba TP=1% y SL=2%.
+        #   Nosotros apostamos en contra → ganamos donde él perdía (2%)
+        #                                   y perdemos donde él ganaba (1%).
+        #   Por eso: tp_pct_real = SL_PCT (2%) y sl_pct_real = TP_PCT (1%).
+        #
+        #   Ejemplo LONG original → ejecutamos SHORT contrarian:
+        #     TP = precio * (1 - SL_PCT/100)  → baja 2%  ✅ ganamos
+        #     SL = precio * (1 + TP_PCT/100)  → sube 1%  ❌ perdemos
+        if CONTRARIAN_MODE:
+            tp_pct_real = SL_PCT   # 2%  ← donde el bot original paraba con SL
+            sl_pct_real = TP_PCT   # 1%  ← donde el bot original tomaba ganancias
+        else:
+            tp_pct_real = TP_PCT
+            sl_pct_real = SL_PCT
+
         try:
             if direction == "LONG":
-                tp_raw = price * (1 + TP_PCT / 100)
-                sl_raw = price * (1 - SL_PCT / 100)
+                tp_raw = price * (1 + tp_pct_real / 100)
+                sl_raw = price * (1 - sl_pct_real / 100)
                 side   = "BUY"
-            else:
-                tp_raw = price * (1 - TP_PCT / 100)
-                sl_raw = price * (1 + SL_PCT / 100)
+            else:  # SHORT
+                tp_raw = price * (1 - tp_pct_real / 100)
+                sl_raw = price * (1 + sl_pct_real / 100)
                 side   = "SELL"
 
             tp_price = await loop.run_in_executor(None, self.sizer.round_price, symbol, tp_raw)
@@ -379,7 +420,6 @@ class ExecutionManager:
             log.error(f"open_trade: bracket_batch retornó vacío para {symbol}")
             return None
 
-        # Extraer orderId de la orden de entrada
         entry_order_id = ""
         try:
             for r in result:
@@ -399,37 +439,34 @@ class ExecutionManager:
 
             self._counter += 1
             trade = Trade(
-                id             = self._counter,
-                symbol         = symbol,
-                direction      = direction,
-                entry_price    = price,
-                quantity       = quantity,
-                open_time      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                tp_price       = tp_price,
-                sl_price       = sl_price,
-                leverage       = leverage,
-                paper_trade_id = paper_trade_id,
-                entry_order_id = entry_order_id,
-                current_price  = price,
+                id                 = self._counter,
+                symbol             = symbol,
+                direction          = direction,           # dirección REAL ejecutada
+                direction_original = direction_original,  # dirección original del bot principal
+                entry_price        = price,
+                quantity           = quantity,
+                open_time          = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                tp_price           = tp_price,
+                sl_price           = sl_price,
+                leverage           = leverage,
+                paper_trade_id     = paper_trade_id,
+                entry_order_id     = entry_order_id,
+                current_price      = price,
             )
             self._trades[symbol] = trade
             self._paper_id_map[paper_trade_id] = symbol
 
         log.info(
             f"[REAL #{trade.id}] ABIERTO {direction} {symbol} @ ${price:.8f} "
+            f"(señal original: {direction_original}) "
             f"| TP: ${tp_price:.8f} | SL: ${sl_price:.8f} "
             f"| Qty: {quantity} | Lev: {leverage}x | Paper#{paper_trade_id}"
         )
         await self.refresh_balance()
         return trade
 
-    # ── Cerrar posición (por poll o señal del bot principal) ──
+    # ── Cerrar posición ────────────────────────────────────
     async def close_trade(self, trade: Trade, close_price: float, reason: str) -> bool:
-        """
-        Registra cierre de un trade. reason: "TP" | "SL" | "LIQUIDATED" | "MAIN_BOT"
-        No envía orden al exchange (el TP/SL ya está server-side en Binance).
-        Para cierre forzado desde señal usa force_close_trade().
-        """
         async with self._lock:
             if trade.status != "OPEN":
                 return False
@@ -460,15 +497,9 @@ class ExecutionManager:
 
     # ── Cierre forzado enviando orden al exchange ─────────
     async def force_close_trade(self, trade: Trade, reason: str = "MAIN_BOT") -> bool:
-        """
-        Cierra la posición enviando una orden MARKET al exchange.
-        Se usa cuando el bot principal nos indica cierre manual.
-        Cancela también las órdenes TP/SL pendientes.
-        """
         loop = asyncio.get_event_loop()
         close_price = trade.current_price or trade.entry_price
 
-        # 1. Cancelar todas las órdenes abiertas del símbolo (TP/SL server-side)
         try:
             await loop.run_in_executor(
                 None, self.api.client.futures_cancel_all_open_orders, trade.symbol
@@ -477,18 +508,17 @@ class ExecutionManager:
         except Exception as e:
             log.warning(f"force_close: error cancelando órdenes {trade.symbol}: {e}")
 
-        # 2. Cerrar posición con orden MARKET en dirección contraria
         try:
             close_side = "SELL" if trade.direction == "LONG" else "BUY"
             order = await loop.run_in_executor(
                 None,
                 lambda: self.api.client.futures_create_order(
-                    symbol        = trade.symbol,
-                    side          = close_side,
-                    type          = "MARKET",
-                    quantity      = trade.quantity,
-                    reduceOnly    = True,
-                    positionSide  = "BOTH",  # One-Way mode (se adapta en hedge mode abajo)
+                    symbol       = trade.symbol,
+                    side         = close_side,
+                    type         = "MARKET",
+                    quantity     = trade.quantity,
+                    reduceOnly   = True,
+                    positionSide = "BOTH",
                 )
             )
             if order:
@@ -496,17 +526,11 @@ class ExecutionManager:
                 log.info(f"force_close: orden MARKET enviada para {trade.symbol}: {order.get('orderId')}")
         except Exception as e:
             log.error(f"force_close: error enviando orden de cierre {trade.symbol}: {e}")
-            # Aunque falle el cierre en el exchange, registramos como cerrado localmente
-            # para evitar que el bot intente operar este símbolo de nuevo
 
         return await self.close_trade(trade, close_price, reason)
 
     # ── Poll de posiciones reales en Binance ──────────────
     async def poll_positions(self) -> list[tuple]:
-        """
-        Consulta posiciones abiertas en Binance y detecta cierres por TP/SL/liquidación.
-        Retorna lista de (Trade, close_price, reason) para procesar.
-        """
         if not self._trades:
             return []
 
@@ -521,7 +545,6 @@ class ExecutionManager:
             log.error(f"poll_positions: {e}")
             return []
 
-        # Índice de posiciones activas en el exchange
         pos_by_symbol: dict[str, dict] = {}
         for p in positions:
             sym = p.get("symbol", "")
@@ -538,7 +561,6 @@ class ExecutionManager:
                 mark_px = float(p.get("markPrice") or p.get("entryPrice") or trade.entry_price)
                 trade.update_unrealized(mark_px)
             else:
-                # Posición no existe en el exchange → fue cerrada (TP, SL o liquidación)
                 cp = trade.current_price if trade.current_price > 0 else trade.entry_price
                 if trade.direction == "LONG":
                     reason = "TP" if cp >= trade.tp_price * 0.999 else "SL"
@@ -548,14 +570,12 @@ class ExecutionManager:
 
         return closed_events
 
-    # ── Buscar trade por paper_trade_id ───────────────────
     def find_by_paper_id(self, paper_trade_id: int) -> Optional[Trade]:
         sym = self._paper_id_map.get(paper_trade_id)
         if sym:
             return self._trades.get(sym)
         return None
 
-    # ── Actualizar precio (WebSocket) ─────────────────────
     def update_price(self, symbol: str, price: float):
         t = self._trades.get(symbol)
         if t:
@@ -598,6 +618,17 @@ def build_open_message_real(trade: Trade) -> str:
     emoji = "🟢" if trade.direction == "LONG" else "🔴"
     word  = "LONG  ▲" if trade.direction == "LONG" else "SHORT ▼"
     base  = trade.symbol.replace("USDT", "")
+
+    is_contrarian = CONTRARIAN_MODE and trade.direction != trade.direction_original
+    # En modo contrarian los porcentajes están intercambiados:
+    # TP usa SL_PCT (2%) y SL usa TP_PCT (1%)
+    tp_pct_shown = SL_PCT if is_contrarian else TP_PCT
+    sl_pct_shown = TP_PCT if is_contrarian else SL_PCT
+    contrarian_note = (
+        f"\n🔀 <b>Contrarian:</b> señal {trade.direction_original} → ejecutado {trade.direction}"
+        f"\n    TP={tp_pct_shown}% (era SL) | SL={sl_pct_shown}% (era TP)"
+    ) if is_contrarian else ""
+
     return (
         f"{emoji} <b>🏦 POSICIÓN REAL ABIERTA — {word}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -608,11 +639,12 @@ def build_open_message_real(trade: Trade) -> str:
         f"⚡ <b>Leverage:</b>   <code>{trade.leverage}x</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 <b>Take Profit:</b> <code>${trade.tp_price:,.8f}</code>  "
-        f"<i>(+{TP_PCT}%)</i>\n"
+        f"<i>(+{tp_pct_shown}%)</i>\n"
         f"🛑 <b>Stop Loss:</b>   <code>${trade.sl_price:,.8f}</code>  "
-        f"<i>(-{SL_PCT}%)</i>\n"
+        f"<i>(-{sl_pct_shown}%)</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 Real <b>#{trade.id}</b>  |  Paper <b>#{trade.paper_trade_id}</b>\n"
+        f"🆔 Real <b>#{trade.id}</b>  |  Paper <b>#{trade.paper_trade_id}</b>"
+        f"{contrarian_note}\n"
         f"⏱ {trade.open_time}\n"
         f"💼 Balance: <code>{execution_manager.balance:.2f} USDT</code>"
     )
@@ -620,11 +652,11 @@ def build_open_message_real(trade: Trade) -> str:
 
 def build_close_message_real(trade: Trade) -> str:
     reason_map = {
-        "TP"       : ("✅", "TAKE PROFIT 🎯"),
-        "SL"       : ("❌", "STOP LOSS 🛑"),
+        "TP"        : ("✅", "TAKE PROFIT 🎯"),
+        "SL"        : ("❌", "STOP LOSS 🛑"),
         "LIQUIDATED": ("💀", "LIQUIDACIÓN ⚠️"),
-        "MAIN_BOT" : ("🔄", "CIERRE SEÑAL PRINCIPAL"),
-        "MANUAL"   : ("🖐", "CIERRE MANUAL"),
+        "MAIN_BOT"  : ("🔄", "CIERRE SEÑAL PRINCIPAL"),
+        "MANUAL"    : ("🖐", "CIERRE MANUAL"),
     }
     emoji, reason_str = reason_map.get(trade.status, ("⚠️", trade.status))
     dir_str   = "🟢 LONG" if trade.direction == "LONG" else "🔴 SHORT"
@@ -634,6 +666,12 @@ def build_close_message_real(trade: Trade) -> str:
     wins  = sum(1 for t in closed_all if t.status == "TP")
     total = len(closed_all)
     wr    = f"{wins/total*100:.1f}% ({wins}✅/{total-wins}❌)" if total else "N/A"
+
+    contrarian_note = ""
+    if CONTRARIAN_MODE and trade.direction != trade.direction_original:
+        contrarian_note = (
+            f"\n🔀 <b>Contrarian:</b> señal {trade.direction_original} → ejecutado {trade.direction}"
+        )
 
     return (
         f"{emoji} <b>🏦 POSICIÓN REAL CERRADA — {reason_str}</b>\n"
@@ -651,7 +689,8 @@ def build_close_message_real(trade: Trade) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 <b>Balance:</b>  <code>{execution_manager.balance:.2f} USDT</code>\n"
         f"💼 <b>Equity:</b>   <code>{execution_manager.equity:.2f} USDT</code>\n"
-        f"📈 <b>Win Rate:</b> <code>{wr}</code>\n"
+        f"📈 <b>Win Rate:</b> <code>{wr}</code>"
+        f"{contrarian_note}\n"
         f"🆔 Real <b>#{trade.id}</b>  |  Paper <b>#{trade.paper_trade_id}</b>"
     )
 
@@ -722,7 +761,7 @@ async def ws_price_loop(session: aiohttp.ClientSession):
 # ══════════════════════════════════════════════════════════
 async def position_monitor_loop(session: aiohttp.ClientSession):
     log.info(f"Position Monitor — poll cada {POSITION_POLL_S}s")
-    await asyncio.sleep(10)   # dar tiempo al arranque
+    await asyncio.sleep(10)
 
     while True:
         try:
@@ -750,7 +789,6 @@ async def signal_handler(request: web.Request) -> web.Response:
       Cierre:   {"action":"close", "trade_id":1, "symbol":"BTCUSDT",
                  "direction":"LONG", "reason":"TP", "close_price":50500.0}
     """
-    # ── Autenticación ────────────────────────────────────
     secret = request.headers.get("X-Signal-Secret", "")
     if secret != SIGNAL_SECRET:
         log.warning(f"signal_handler: secreto inválido desde {request.remote}")
@@ -773,20 +811,19 @@ async def signal_handler(request: web.Request) -> web.Response:
 
     # ── APERTURA ─────────────────────────────────────────
     if action == "open":
-        direction = data.get("direction", "").upper()
-        price     = float(data.get("price", 0))
+        direction_original = data.get("direction", "").upper()
+        price              = float(data.get("price", 0))
 
-        if not symbol or not direction or price <= 0:
+        if not symbol or not direction_original or price <= 0:
             executor_status["signals_rejected"] += 1
             return web.json_response({"ok": False, "error": "missing open params"}, status=400)
 
-        # Procesar en background para no bloquear la respuesta HTTP
         async def _do_open():
             trade = await execution_manager.open_trade(
-                symbol=symbol,
-                direction=direction,
-                price=price,
-                paper_trade_id=trade_id,
+                symbol             = symbol,
+                direction_original = direction_original,
+                price              = price,
+                paper_trade_id     = trade_id,
             )
             if trade:
                 executor_status["signals_open"] += 1
@@ -794,7 +831,7 @@ async def signal_handler(request: web.Request) -> web.Response:
                     await send_telegram(sess, build_open_message_real(trade))
             else:
                 executor_status["signals_rejected"] += 1
-                log.warning(f"open_trade rechazado para {symbol} ({direction})")
+                log.warning(f"open_trade rechazado para {symbol} ({direction_original})")
 
         asyncio.create_task(_do_open())
         return web.json_response({"ok": True, "action": "open", "symbol": symbol})
@@ -806,7 +843,6 @@ async def signal_handler(request: web.Request) -> web.Response:
 
         trade = execution_manager.find_by_paper_id(trade_id)
         if not trade:
-            # Buscar también por símbolo en caso de que el paper_trade_id no coincida
             trade = execution_manager._trades.get(symbol)
 
         if not trade:
@@ -814,10 +850,7 @@ async def signal_handler(request: web.Request) -> web.Response:
             return web.json_response({"ok": True, "action": "close", "skipped": True})
 
         async def _do_close():
-            closed = await execution_manager.force_close_trade(
-                trade,
-                reason="MAIN_BOT",
-            )
+            closed = await execution_manager.force_close_trade(trade, reason="MAIN_BOT")
             if closed:
                 executor_status["signals_close"] += 1
                 async with aiohttp.ClientSession() as sess:
@@ -841,6 +874,7 @@ async def api_state_handler(request: web.Request) -> web.Response:
         return {
             "id": t.id, "paper_trade_id": t.paper_trade_id,
             "symbol": t.symbol, "direction": t.direction,
+            "direction_original": t.direction_original,
             "entry_price": t.entry_price, "quantity": t.quantity,
             "notional": t.notional_usdt, "leverage": t.leverage,
             "open_time": t.open_time, "tp_price": t.tp_price,
@@ -855,20 +889,21 @@ async def api_state_handler(request: web.Request) -> web.Response:
     total  = len(closed)
 
     return web.json_response({
-        "balance"        : em.balance,
-        "equity"         : em.equity,
-        "realized_pnl"   : em.total_realized_pnl,
-        "unrealized_pnl" : em.unrealized_pnl,
-        "wins"           : wins,
-        "losses"         : total - wins,
-        "win_rate"       : (wins / total * 100) if total else None,
-        "open_trades"    : [ser(t) for t in sorted(em.open_trades, key=lambda x: x.id)],
-        "closed_trades"  : [ser(t) for t in list(reversed(closed))[:20]],
-        "active_symbols" : sorted(em.active_symbols),
-        "open_longs"     : len(em.open_longs),
-        "open_shorts"    : len(em.open_shorts),
-        "executor_status": executor_status,
-        "settings"       : {
+        "balance"         : em.balance,
+        "equity"          : em.equity,
+        "realized_pnl"    : em.total_realized_pnl,
+        "unrealized_pnl"  : em.unrealized_pnl,
+        "wins"            : wins,
+        "losses"          : total - wins,
+        "win_rate"        : (wins / total * 100) if total else None,
+        "open_trades"     : [ser(t) for t in sorted(em.open_trades, key=lambda x: x.id)],
+        "closed_trades"   : [ser(t) for t in list(reversed(closed))[:20]],
+        "active_symbols"  : sorted(em.active_symbols),
+        "open_longs"      : len(em.open_longs),
+        "open_shorts"     : len(em.open_shorts),
+        "contrarian_mode" : CONTRARIAN_MODE,
+        "executor_status" : executor_status,
+        "settings"        : {
             "tp_pct": TP_PCT, "sl_pct": SL_PCT,
             "max_longs": MAX_LONGS, "max_shorts": MAX_SHORTS,
             "qty_multiplier": QTY_MULTIPLIER,
@@ -885,17 +920,19 @@ const f4 = v => (Number(v||0)>=0?'+':'')+Number(v||0).toLocaleString('en-US',{mi
 const f2 = v => Number(v||0).toFixed(2);
 
 function openRows(trades){
-  if(!trades||!trades.length) return '<tr><td colspan="13" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>';
+  if(!trades||!trades.length) return '<tr><td colspan="14" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>';
   return trades.map(t=>{
     const dc=t.direction==='LONG'?'#3fb950':'#f85149';
     const pc=Number(t.pnl_usdt)>=0?'#3fb950':'#f85149';
     const cur=Number(t.current_price||0);
     const dtp=cur?Math.abs(Number(t.tp_price)-cur)/cur*100:0;
     const dsl=cur?Math.abs(Number(t.sl_price)-cur)/cur*100:0;
+    const contrNote=t.direction!==t.direction_original
+      ?`<br><small style="color:#f0883e">🔀 orig:${t.direction_original}</small>`:'';
     return `<tr>
       <td>#${t.id}<br><small style="color:#8b949e">P#${t.paper_trade_id}</small></td>
       <td><b>${t.symbol}</b></td>
-      <td style="color:${dc}">${t.direction==='LONG'?'🟢 LONG':'🔴 SHORT'}</td>
+      <td style="color:${dc}">${t.direction==='LONG'?'🟢 LONG':'🔴 SHORT'}${contrNote}</td>
       <td><b>${t.leverage}x</b></td>
       <td>$${fp(t.entry_price)}</td>
       <td><b>$${fp(cur)}</b></td>
@@ -915,9 +952,11 @@ function closedRows(trades){
   return trades.map(t=>{
     const pc=Number(t.pnl_usdt)>=0?'#3fb950':'#f85149';
     const rs=t.status==='TP'?'✅ TP':t.status==='SL'?'❌ SL':t.status==='LIQUIDATED'?'💀 LIQ':'🔄 '+t.status;
+    const contrNote=t.direction!==t.direction_original
+      ?`<br><small style="color:#f0883e">🔀 orig:${t.direction_original}</small>`:'';
     return `<tr style="color:${pc}">
       <td>#${t.id}</td><td><b>${t.symbol}</b></td>
-      <td>${t.direction==='LONG'?'🟢':'🔴'} ${t.direction}</td>
+      <td>${t.direction==='LONG'?'🟢':'🔴'} ${t.direction}${contrNote}</td>
       <td>${t.leverage}x</td>
       <td>$${fp(t.entry_price)}</td><td>$${fp(t.close_price)}</td>
       <td><b>${f4(t.pnl_usdt)}</b></td>
@@ -963,6 +1002,8 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     up_col = "#3fb950" if em.unrealized_pnl >= 0 else "#f85149"
     ws_sym = ", ".join(sorted(em.active_symbols)) if em.active_symbols else "Ninguno"
     es     = executor_status
+    mode_label = "CONTRARIAN 🔀" if CONTRARIAN_MODE else "NORMAL"
+    env_label  = "TESTNET" if USE_TESTNET else "REAL"
 
     html = f"""<!DOCTYPE html>
 <html lang="es">
@@ -987,11 +1028,18 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     tr:hover td{{background:#161b22}}
     .dot{{display:inline-block;width:8px;height:8px;background:#3fb950;border-radius:50%;margin-right:5px;animation:blink 1.5s infinite}}
     .badge{{display:inline-block;padding:.1rem .4rem;border-radius:3px;font-size:.7rem;font-weight:bold;background:#161b22;border:1px solid #30363d}}
+    .contrarian-banner{{background:#21262d;border:1px solid #f0883e;border-radius:6px;padding:.6rem 1rem;margin-bottom:1rem;color:#f0883e;font-size:.82rem}}
     @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
   </style>
 </head>
 <body>
-  <h1>⚡ Futures Executor Bot — Binance USDT Perpetuos {'[TESTNET]' if USE_TESTNET else '[REAL]'}</h1>
+  <h1>⚡ Futures Executor Bot — Binance USDT Perpetuos [{env_label}]</h1>
+
+  <div class="contrarian-banner">
+    🔀 <b>Modo {mode_label}</b> activo —
+    las señales del bot principal se invierten antes de ejecutar:
+    LONG → SHORT &nbsp;|&nbsp; SHORT → LONG
+  </div>
 
   <!-- Balance y equity -->
   <div class="grid">
@@ -1031,12 +1079,12 @@ async def dashboard_handler(request: web.Request) -> web.Response:
   <p id="ws_sym" style="color:#484f58;font-size:.72rem;margin-bottom:.4rem">WS activo: {ws_sym}</p>
   <div class="wrap"><table>
     <thead><tr>
-      <th>ID</th><th>Par</th><th>Dir</th><th>Lev</th>
+      <th>ID</th><th>Par</th><th>Dir (ejecutada)</th><th>Lev</th>
       <th>Entrada</th><th>Precio actual</th><th>Take Profit</th><th>Stop Loss</th>
       <th>PnL (USDT)</th><th>ROI%</th><th>Notional</th><th>Qty</th><th>Abierto</th>
     </tr></thead>
     <tbody id="open_body">
-      <tr><td colspan="13" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>
+      <tr><td colspan="14" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>
     </tbody>
   </table></div>
 
@@ -1054,7 +1102,7 @@ async def dashboard_handler(request: web.Request) -> web.Response:
   </table></div>
 
   <p style="color:#484f58;margin-top:.6rem;font-size:.7rem">
-    Futures Executor | TP: +{TP_PCT}% | SL: -{SL_PCT}% |
+    Futures Executor [{mode_label}] | TP: +{TP_PCT}% | SL: -{SL_PCT}% |
     Poll posiciones: {POSITION_POLL_S}s |
     Iniciado: {es['started_at']} |
     Actualizado: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
@@ -1071,10 +1119,10 @@ async def dashboard_handler(request: web.Request) -> web.Response:
 # ══════════════════════════════════════════════════════════
 async def start_http_server():
     app = web.Application()
-    app.router.add_post("/signal",    signal_handler)
-    app.router.add_get("/",           dashboard_handler)
-    app.router.add_get("/health",     dashboard_handler)
-    app.router.add_get("/api/state",  api_state_handler)
+    app.router.add_post("/signal",   signal_handler)
+    app.router.add_get("/",          dashboard_handler)
+    app.router.add_get("/health",    dashboard_handler)
+    app.router.add_get("/api/state", api_state_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -1088,30 +1136,26 @@ async def start_http_server():
 async def main():
     global execution_manager
 
+    mode_str = "CONTRARIAN 🔀 (señales invertidas)" if CONTRARIAN_MODE else "NORMAL"
     log.info("╔══════════════════════════════════════════════════════╗")
     log.info("║   Futures Executor Bot — Binance USDT Perpetuos       ║")
+    log.info(f"║   Modo: {mode_str:<45}║")
     log.info(f"║   TP:{TP_PCT}% | SL:{SL_PCT}% | Qty:{QTY_MULTIPLIER}×mín | Poll:{POSITION_POLL_S}s       ║")
     log.info(f"║   Testnet: {USE_TESTNET}                                      ║")
     log.info("╚══════════════════════════════════════════════════════╝")
 
-    # ── Importar BinanceAPI ──────────────────────────────
     try:
         from binance_api_mejorado import BinanceAPI
     except ImportError:
         log.critical(
-            "No se puede importar BinanceAPI desde binance_api_mejorado.py. "
-            "Asegúrate de que el archivo está en el mismo directorio que futures_executor.py."
+            "No se puede importar BinanceAPI desde binance_api_mejorado.py."
         )
         return
 
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        log.critical(
-            "BINANCE_API_KEY y BINANCE_API_SECRET son obligatorias. "
-            "Configúralas como variables de entorno en Render."
-        )
+        log.critical("BINANCE_API_KEY y BINANCE_API_SECRET son obligatorias.")
         return
 
-    # ── Inicializar BinanceAPI y ExecutionManager ────────
     try:
         api = BinanceAPI(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=USE_TESTNET)
         execution_manager = ExecutionManager(api)
@@ -1120,14 +1164,13 @@ async def main():
         log.critical(f"Error inicializando BinanceAPI: {e}")
         return
 
-    # ── Obtener balance inicial ──────────────────────────
     await execution_manager.refresh_balance()
     log.info(f"Balance USDT Futures: ${execution_manager.balance:.2f}")
 
-    # ── Telegram: mensaje de inicio ──────────────────────
     async with aiohttp.ClientSession() as sess:
         await send_telegram(sess,
             f"⚡ <b>Futures Executor Bot — {'TESTNET' if USE_TESTNET else 'REAL'} INICIADO</b>\n"
+            f"🔀 <b>Modo:</b> {mode_str}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 <b>Balance USDT Futures:</b> <code>{execution_manager.balance:.2f} USDT</code>\n"
             f"🎯 TP: <b>+{TP_PCT}%</b> | 🛑 SL: <b>-{SL_PCT}%</b>\n"
@@ -1137,7 +1180,6 @@ async def main():
             f"⏱ Poll posiciones: cada <b>{POSITION_POLL_S}s</b>"
         )
 
-    # ── Iniciar todas las tareas ─────────────────────────
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(
             start_http_server(),
