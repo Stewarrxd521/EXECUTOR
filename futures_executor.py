@@ -367,6 +367,17 @@ class ExecutionManager:
             log.warning(f"open_trade: qty inválida {quantity} para {symbol}")
             return None
 
+                # ── Filtro de notional máximo ──────────────────────
+        notional = price * quantity
+        max_notional = 6.4 * QTY_MULTIPLIER
+        if notional > max_notional:
+            log.warning(
+                f"open_trade: {symbol} BLOQUEADO — notional ${notional:.4f} "
+                f"> límite ${max_notional:.4f} (6.4 × {QTY_MULTIPLIER})"
+            )
+            return None
+        # ───────────────────────────────────────────────────
+
         # ── Precios TP / SL (calculados sobre la dirección REAL ejecutada) ──
         if CONTRARIAN_MODE:
             tp_pct_real = SL_PCT   # 2%
