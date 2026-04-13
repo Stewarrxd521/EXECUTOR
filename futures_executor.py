@@ -261,12 +261,13 @@ class ExecutionManager:
     def __init__(self, binance_api):
         self.api      = binance_api
         self.sizer    = PositionSizer(binance_api)
-        self._trades  : dict[str, Trade] = {}   # symbol → Trade abierto
+        self._trades  : dict[str, Trade] = {}
         self._closed  : list[Trade]      = []
         self._counter : int = 0
         self._lock    = asyncio.Lock()
         self._balance : float = 0.0
         self._paper_id_map : dict[int, str] = {}
+        self._conditional_orders : dict[str, dict] = {}
 
     # ── Balance real ──────────────────────────────────────
     async def refresh_balance(self):
@@ -431,11 +432,22 @@ class ExecutionManager:
             return None
 
         entry_order_id = ""
+        tp_order_id    = ""
+        sl_order_id    = ""
+        TP_TYPES = {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}
+        SL_TYPES = {"STOP_MARKET", "STOP"}
         try:
             for r in result:
-                if isinstance(r, dict) and r.get("type") in ("MARKET", None, ""):
-                    entry_order_id = str(r.get("orderId", ""))
-                    break
+                if not isinstance(r, dict):
+                    continue
+                otype = r.get("type", "")
+                oid   = str(r.get("orderId", ""))
+                if otype in TP_TYPES:
+                    tp_order_id = oid
+                elif otype in SL_TYPES:
+                    sl_order_id = oid
+                elif otype in ("MARKET", None, "") and not entry_order_id:
+                    entry_order_id = oid
             if not entry_order_id and result:
                 entry_order_id = str(result[0].get("orderId", ""))
         except Exception:
@@ -465,6 +477,10 @@ class ExecutionManager:
             )
             self._trades[symbol] = trade
             self._paper_id_map[paper_trade_id] = symbol
+            self._conditional_orders[symbol] = {
+                "tp_id": tp_order_id,
+                "sl_id": sl_order_id,
+            }
 
         log.info(
             f"[REAL #{trade.id}] ABIERTO {direction} {symbol} @ ${price:.8f} "
@@ -495,6 +511,7 @@ class ExecutionManager:
             trade.roi_pct = (trade.pnl_usdt / trade.notional_usdt * 100) if trade.notional_usdt else 0.0
 
             del self._trades[trade.symbol]
+            self._conditional_orders.pop(trade.symbol, None)
             self._paper_id_map.pop(trade.paper_trade_id, None)
             self._closed.append(trade)
 
@@ -545,49 +562,71 @@ class ExecutionManager:
             log.error(f"force_close_by_symbol {symbol}: {e}")
             return False
 
+    async def close_all_global(self) -> list[Trade]:
+        """
+        Cierra una a una todas las posiciones abiertas de todos los simbolos.
+        Retorna la lista de trades que fueron cerrados exitosamente.
+        """
+        async with self._lock:
+            trades_snapshot = list(self._trades.values())
+
+        closed_trades = []
+        for trade in trades_snapshot:
+            try:
+                closed = await self.force_close_trade(trade, reason="CLOSE_ALL")
+                if closed:
+                    closed_trades.append(trade)
+                    log.info(f"close_all_global: cerrado {trade.symbol} #{trade.id}")
+            except Exception as e:
+                log.error(f"close_all_global: error cerrando {trade.symbol}: {e}")
+
+        self._conditional_orders.clear()
+        log.info(f"close_all_global: {len(closed_trades)}/{len(trades_snapshot)} posiciones cerradas")
+        return closed_trades
+
     # ── Verificar y reparar TP/SL de una posición ─────────
     # ✅ NEW: comprueba si faltan órdenes condicionales TP o SL y las coloca.
     async def verify_and_repair_tp_sl(self, trade: Trade) -> None:
-        """
-        Para la posición registrada en `trade`, consulta las órdenes abiertas
-        en Binance y verifica que existan tanto la orden TP (TAKE_PROFIT_MARKET)
-        como la orden SL (STOP_MARKET). Si alguna falta, la coloca usando los
-        precios ya calculados en `trade.tp_price` / `trade.sl_price`.
-        """
         symbol = trade.symbol
         loop   = asyncio.get_event_loop()
 
-        # ── Obtener órdenes abiertas del símbolo ──────────
+        stored = self._conditional_orders.get(symbol, {})
+        stored_tp_id = stored.get("tp_id", "")
+        stored_sl_id = stored.get("sl_id", "")
+
         try:
             open_orders = await loop.run_in_executor(
                 None,
                 lambda: self.api.client.futures_get_open_orders(symbol=symbol)
             )
         except Exception as e:
-            log.error(f"verify_tp_sl [{symbol}]: error obteniendo órdenes: {e}")
+            log.error(f"verify_tp_sl [{symbol}]: error obteniendo ordenes: {e}")
             return
 
-        # Tipos que representan TP y SL respectivamente
+        open_ids = {str(o.get("orderId", "")) for o in open_orders}
+
         TP_TYPES = {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}
         SL_TYPES = {"STOP_MARKET", "STOP"}
 
-        has_tp = any(o.get("type", "") in TP_TYPES for o in open_orders)
-        has_sl = any(o.get("type", "") in SL_TYPES for o in open_orders)
+        has_tp = (stored_tp_id and stored_tp_id in open_ids) or \
+                 any(o.get("type", "") in TP_TYPES for o in open_orders)
+        has_sl = (stored_sl_id and stored_sl_id in open_ids) or \
+                 any(o.get("type", "") in SL_TYPES for o in open_orders)
 
         if has_tp and has_sl:
-            return  # Todo correcto, nada que hacer
+            return
 
-        direction = trade.direction  # "LONG" o "SHORT"
+        direction = trade.direction
         log.warning(
             f"verify_tp_sl [{symbol}] {direction} — "
-            f"TP={'✅' if has_tp else '❌'}  SL={'✅' if has_sl else '❌'} "
-            f"→ reparando órdenes faltantes..."
+            f"TP={'OK' if has_tp else 'FALTA'} (id={stored_tp_id})  "
+            f"SL={'OK' if has_sl else 'FALTA'} (id={stored_sl_id}) "
+            f"-> reparando ordenes faltantes..."
         )
 
-        # ── Colocar TP si falta ───────────────────────────
         if not has_tp:
             try:
-                await loop.run_in_executor(
+                r = await loop.run_in_executor(
                     None,
                     lambda: self.api.set_take_profit(
                         symbol           = symbol,
@@ -595,17 +634,18 @@ class ExecutionManager:
                         position_side    = direction,
                     )
                 )
+                new_tp_id = str(r.get("orderId", "")) if isinstance(r, dict) else ""
+                self._conditional_orders.setdefault(symbol, {})["tp_id"] = new_tp_id
                 log.info(
                     f"verify_tp_sl [{symbol}]: TP colocado @ {trade.tp_price:.8f} "
-                    f"({direction})"
+                    f"({direction}) id={new_tp_id}"
                 )
             except Exception as e:
                 log.error(f"verify_tp_sl [{symbol}]: error colocando TP: {e}")
 
-        # ── Colocar SL si falta ───────────────────────────
         if not has_sl:
             try:
-                await loop.run_in_executor(
+                r = await loop.run_in_executor(
                     None,
                     lambda: self.api.set_stop_loss(
                         symbol      = symbol,
@@ -613,9 +653,11 @@ class ExecutionManager:
                         position_side= direction,
                     )
                 )
+                new_sl_id = str(r.get("orderId", "")) if isinstance(r, dict) else ""
+                self._conditional_orders.setdefault(symbol, {})["sl_id"] = new_sl_id
                 log.info(
                     f"verify_tp_sl [{symbol}]: SL colocado @ {trade.sl_price:.8f} "
-                    f"({direction})"
+                    f"({direction}) id={new_sl_id}"
                 )
             except Exception as e:
                 log.error(f"verify_tp_sl [{symbol}]: error colocando SL: {e}")
@@ -992,6 +1034,35 @@ async def signal_handler(request: web.Request) -> web.Response:
 
         asyncio.create_task(_do_close())
         return web.json_response({"ok": True, "action": "close", "symbol": symbol})
+
+    # ── CIERRE GLOBAL ─────────────────────────────────────
+    elif action == "close_all":
+        log.warning("signal_handler: CIERRE GLOBAL recibido — cerrando todas las posiciones")
+        total_open = len(execution_manager.open_trades)
+
+        async def _do_close_all():
+            closed_trades = await execution_manager.close_all_global()
+            async with aiohttp.ClientSession() as sess:
+                if not closed_trades:
+                    await send_telegram(
+                        sess,
+                        "CIERRE GLOBAL ejecutado — no habia posiciones abiertas."
+                    )
+                    return
+                for t in closed_trades:
+                    await send_telegram(sess, build_close_message_real(t))
+                await send_telegram(
+                    sess,
+                    f"CIERRE GLOBAL completado — {len(closed_trades)} posicion(es) cerrada(s)."
+                )
+
+        asyncio.create_task(_do_close_all())
+        executor_status["signals_close"] += total_open
+        return web.json_response({
+            "ok": True,
+            "action": "close_all",
+            "positions_targeted": total_open,
+        })
 
     else:
         executor_status["signals_rejected"] += 1
