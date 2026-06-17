@@ -52,6 +52,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 import time
+import threading
 
 try:
     from WS import SymbolWebSocketPriceCache
@@ -163,49 +164,61 @@ class PositionSizer:
         self.api           = api
         self._sym_filters  : dict = {}
         self._lev_brackets : dict = {}
+        self._cache_lock   = threading.Lock()
+        self._exchange_info_loaded = False
 
     def _load_symbol_filters(self, symbol: str) -> dict:
         symbol = symbol.upper()
         if symbol in self._sym_filters:
             return self._sym_filters[symbol]
-        try:
-            info = self.api.client.futures_exchange_info()
-            for s in info.get("symbols", []):
-                sym = s.get("symbol", "").upper()
-                if not sym:
-                    continue
-                filters = {f["filterType"]: f for f in s.get("filters", [])}
-                lot = filters.get("LOT_SIZE", {})
-                mn  = filters.get("MIN_NOTIONAL", {})
-                pf  = filters.get("PRICE_FILTER", {})
-                self._sym_filters[sym] = {
-                    "minQty"     : float(lot.get("minQty",   0)),
-                    "stepSize"   : float(lot.get("stepSize", 0)),
-                    "minNotional": float(mn.get("notional",  0)),
-                    "tickSize"   : float(pf.get("tickSize",  0)),
-                }
-        except Exception as e:
-            log.error(f"_load_symbol_filters({symbol}): {e}")
+
+        # Un solo hilo debe calentar la caché de exchangeInfo.
+        with self._cache_lock:
+            if symbol in self._sym_filters:
+                return self._sym_filters[symbol]
+            if not self._exchange_info_loaded:
+                try:
+                    info = self.api.client.futures_exchange_info()
+                    for s in info.get("symbols", []):
+                        sym = s.get("symbol", "").upper()
+                        if not sym:
+                            continue
+                        filters = {f["filterType"]: f for f in s.get("filters", [])}
+                        lot = filters.get("LOT_SIZE", {})
+                        mn  = filters.get("MIN_NOTIONAL", {})
+                        pf  = filters.get("PRICE_FILTER", {})
+                        self._sym_filters[sym] = {
+                            "minQty"     : float(lot.get("minQty",   0)),
+                            "stepSize"   : float(lot.get("stepSize", 0)),
+                            "minNotional": float(mn.get("notional",  0)),
+                            "tickSize"   : float(pf.get("tickSize",  0)),
+                        }
+                    self._exchange_info_loaded = True
+                except Exception as e:
+                    log.error(f"_load_symbol_filters({symbol}): {e}")
         return self._sym_filters.get(symbol, {})
 
     def _load_leverage_brackets(self, symbol: str) -> list:
         symbol = symbol.upper()
         if symbol in self._lev_brackets:
             return self._lev_brackets[symbol]
-        try:
-            data = self.api.client.futures_leverage_bracket(symbol=symbol)
-            if isinstance(data, list):
-                for d in data:
-                    if d.get("symbol", "").upper() == symbol:
-                        self._lev_brackets[symbol] = d.get("brackets", [])
-                        break
-                else:
-                    if data:
-                        self._lev_brackets[symbol] = data[0].get("brackets", [])
-            elif isinstance(data, dict):
-                self._lev_brackets[symbol] = data.get("brackets", [])
-        except Exception as e:
-            log.error(f"_load_leverage_brackets({symbol}): {e}")
+        with self._cache_lock:
+            if symbol in self._lev_brackets:
+                return self._lev_brackets[symbol]
+            try:
+                data = self.api.client.futures_leverage_bracket(symbol=symbol)
+                if isinstance(data, list):
+                    for d in data:
+                        if d.get("symbol", "").upper() == symbol:
+                            self._lev_brackets[symbol] = d.get("brackets", [])
+                            break
+                    else:
+                        if data:
+                            self._lev_brackets[symbol] = data[0].get("brackets", [])
+                elif isinstance(data, dict):
+                    self._lev_brackets[symbol] = data.get("brackets", [])
+            except Exception as e:
+                log.error(f"_load_leverage_brackets({symbol}): {e}")
         return self._lev_brackets.get(symbol, [])
 
     def max_leverage(self, symbol: str) -> int:
@@ -1486,6 +1499,13 @@ async def main():
     except Exception as e:
         log.critical(f"Error inicializando BinanceAPI: {e}")
         return
+
+    # Calienta la caché de filtros una sola vez para evitar ráfagas de REST
+    # justo cuando entran varias señales a la vez.
+    try:
+        await asyncio.to_thread(execution_manager.sizer._load_symbol_filters, "BTCUSDT")
+    except Exception as e:
+        log.warning(f"Warmup de filtros no crítico: {e}")
 
     await execution_manager.refresh_balance()
     log.info(f"Balance USDT Futures: ${execution_manager.balance:.2f}")
