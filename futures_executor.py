@@ -51,6 +51,15 @@ import os
 import json
 from dataclasses import dataclass
 from typing import Optional
+import time
+
+try:
+    from WS import SymbolWebSocketPriceCache
+except Exception as e:
+    SymbolWebSocketPriceCache = None
+    log_ws_import_error = e
+else:
+    log_ws_import_error = None
 from decimal import Decimal, ROUND_DOWN
 
 # ══════════════════════════════════════════════════════════
@@ -76,6 +85,9 @@ QTY_MULTIPLIER = float(os.environ.get("QTY_MULTIPLIER", "2.0"))
 # ── Bot ────────────────────────────────────────────────────
 PORT             = int(os.environ.get("PORT",            "10000"))
 POSITION_POLL_S  = int(os.environ.get("POSITION_POLL_S", "30"))
+SIGNAL_DEDUPE_TTL_S = int(os.environ.get("SIGNAL_DEDUPE_TTL_S", "20"))
+CLOSE_VERIFY_ATTEMPTS = int(os.environ.get("CLOSE_VERIFY_ATTEMPTS", "6"))
+CLOSE_VERIFY_DELAY_S = float(os.environ.get("CLOSE_VERIFY_DELAY_S", "1.5"))
 
 # ══════════════════════════════════════════════════════════
 #  MODO CONTRARIAN — invierte la dirección de toda señal
@@ -268,6 +280,9 @@ class ExecutionManager:
         self._balance : float = 0.0
         self._paper_id_map : dict[int, str] = {}
         self._conditional_orders : dict[str, dict] = {}
+        self._opening_symbols : set[str] = set()
+        self._closing_symbols : set[str] = set()
+        self._recent_signals : dict[str, float] = {}
 
     # ── Balance real ──────────────────────────────────────
     async def refresh_balance(self):
@@ -318,6 +333,39 @@ class ExecutionManager:
     @property
     def equity(self) -> float:
         return self._balance + self.unrealized_pnl
+
+    def _cleanup_recent_signals(self) -> None:
+        now = time.time()
+        expired = [k for k, ts in self._recent_signals.items() if now - ts > SIGNAL_DEDUPE_TTL_S]
+        for k in expired:
+            self._recent_signals.pop(k, None)
+
+    def reserve_signal(self, action: str, symbol: str, trade_id: int = 0) -> tuple[bool, str]:
+        """Bloquea señales duplicadas o carreras antes de crear tareas async."""
+        action = action.lower()
+        symbol = symbol.upper()
+        self._cleanup_recent_signals()
+        key = f"{action}:{trade_id or symbol}:{symbol}"
+        if key in self._recent_signals:
+            return False, "duplicate_signal"
+        self._recent_signals[key] = time.time()
+
+        if action == "open":
+            if symbol in self._trades or symbol in self._opening_symbols:
+                return False, "symbol_already_open_or_pending"
+            self._opening_symbols.add(symbol)
+        elif action == "close":
+            if symbol in self._closing_symbols:
+                return False, "symbol_close_pending"
+            self._closing_symbols.add(symbol)
+        return True, "reserved"
+
+    async def release_pending(self, action: str, symbol: str) -> None:
+        async with self._lock:
+            if action == "open":
+                self._opening_symbols.discard(symbol.upper())
+            elif action == "close":
+                self._closing_symbols.discard(symbol.upper())
 
     # ── Abrir posición real ───────────────────────────────
     async def open_trade(
@@ -476,6 +524,7 @@ class ExecutionManager:
                 current_price      = price,
             )
             self._trades[symbol] = trade
+            self._opening_symbols.discard(symbol)
             self._paper_id_map[paper_trade_id] = symbol
             self._conditional_orders[symbol] = {
                 "tp_id": tp_order_id,
@@ -511,6 +560,7 @@ class ExecutionManager:
             trade.roi_pct = (trade.pnl_usdt / trade.notional_usdt * 100) if trade.notional_usdt else 0.0
 
             del self._trades[trade.symbol]
+            self._closing_symbols.discard(trade.symbol)
             self._conditional_orders.pop(trade.symbol, None)
             self._paper_id_map.pop(trade.paper_trade_id, None)
             self._closed.append(trade)
@@ -525,20 +575,46 @@ class ExecutionManager:
     # ── Cierre forzado enviando orden al exchange ─────────
     # ✅ FIX 1: run_in_executor recibía el resultado de la función ya ejecutada
     #           en vez de una callable. Ahora se pasa como lambda correctamente.
-    async def force_close_trade(self, trade: Trade, reason: str = "MAIN_BOT") -> bool:
+    async def verify_symbol_flat(self, symbol: str) -> bool:
         loop = asyncio.get_event_loop()
+        try:
+            positions = await loop.run_in_executor(None, lambda: self.api.get_position_info(symbol))
+            open_orders = await loop.run_in_executor(None, lambda: self.api.client.futures_get_open_orders(symbol=symbol))
+            algo_open = []
+            try:
+                algo = await loop.run_in_executor(None, lambda: self.api.client._request_futures_api("get", "algo/openOrders", True, data={"symbol": symbol}))
+                algo_open = algo if isinstance(algo, list) else algo.get("orders", []) if isinstance(algo, dict) else []
+            except Exception as e:
+                log.debug(f"verify_symbol_flat {symbol}: no se pudo consultar algo orders: {e}")
+            has_position = bool(positions)
+            has_orders = bool(open_orders) or bool(algo_open)
+            return not has_position and not has_orders
+        except Exception as e:
+            log.error(f"verify_symbol_flat {symbol}: {e}")
+            return False
+
+    async def close_symbol_on_exchange_verified(self, symbol: str) -> bool:
+        loop = asyncio.get_event_loop()
+        symbol = symbol.upper()
+        for attempt in range(1, CLOSE_VERIFY_ATTEMPTS + 1):
+            try:
+                result = await loop.run_in_executor(None, lambda: self.api.close_all_positions(symbol=symbol))
+                log.info(f"close_symbol_on_exchange_verified {symbol} intento {attempt}: {result}")
+            except Exception as e:
+                log.warning(f"close_symbol_on_exchange_verified {symbol} intento {attempt}: {e}")
+            if await self.verify_symbol_flat(symbol):
+                log.info(f"close_symbol_on_exchange_verified {symbol}: verificado sin posiciones ni ordenes abiertas")
+                return True
+            await asyncio.sleep(CLOSE_VERIFY_DELAY_S)
+        log.error(f"close_symbol_on_exchange_verified {symbol}: NO se pudo verificar cierre completo")
+        return False
+
+    async def force_close_trade(self, trade: Trade, reason: str = "MAIN_BOT") -> bool:
         close_price = trade.current_price or trade.entry_price
 
-        # Cancelar todas las órdenes abiertas del símbolo (TP, SL, LIMIT, ALGO)
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: self.api.close_all_positions(symbol=trade.symbol)  # ← CORREGIDO: lambda
-            )
-            log.info(f"force_close: close_all_positions ejecutado para {trade.symbol}")
-        except Exception as e:
-            log.warning(f"force_close: error en close_all_positions {trade.symbol}: {e}")
-
+        closed_exchange = await self.close_symbol_on_exchange_verified(trade.symbol)
+        if not closed_exchange:
+            return False
         return await self.close_trade(trade, close_price, reason)
 
     # ── Cierre directo por símbolo (sin trade local registrado) ───
@@ -550,27 +626,30 @@ class ExecutionManager:
         sin necesitar un objeto Trade local. Útil cuando el executor se
         reinició y perdió el estado, pero el bot principal envía un cierre.
         """
-        loop = asyncio.get_event_loop()
-        try:
-            result = await loop.run_in_executor(
-                None,
-                lambda: self.api.close_all_positions(symbol=symbol)
-            )
-            log.info(f"force_close_by_symbol {symbol}: {result}")
-            return True
-        except Exception as e:
-            log.error(f"force_close_by_symbol {symbol}: {e}")
-            return False
+        return await self.close_symbol_on_exchange_verified(symbol)
 
     async def close_all_global(self) -> list[Trade]:
         """
-        Cierra una a una todas las posiciones abiertas de todos los simbolos.
-        Retorna la lista de trades que fueron cerrados exitosamente.
+        Cierra y verifica todas las posiciones conocidas localmente y cualquier
+        posición real abierta en Binance que haya quedado fuera del estado local.
         """
+        loop = asyncio.get_event_loop()
         async with self._lock:
             trades_snapshot = list(self._trades.values())
 
+        exchange_symbols: set[str] = set()
+        try:
+            positions = await loop.run_in_executor(None, self.api.client.futures_position_information)
+            for p in positions:
+                sym = p.get("symbol", "")
+                amt = float(p.get("positionAmt", 0) or 0)
+                if sym and abs(amt) > 0:
+                    exchange_symbols.add(sym.upper())
+        except Exception as e:
+            log.error(f"close_all_global: no se pudieron consultar posiciones Binance: {e}")
+
         closed_trades = []
+        local_symbols = {t.symbol for t in trades_snapshot}
         for trade in trades_snapshot:
             try:
                 closed = await self.force_close_trade(trade, reason="CLOSE_ALL")
@@ -580,8 +659,12 @@ class ExecutionManager:
             except Exception as e:
                 log.error(f"close_all_global: error cerrando {trade.symbol}: {e}")
 
+        for symbol in sorted(exchange_symbols - local_symbols):
+            log.warning(f"close_all_global: cerrando símbolo real sin estado local: {symbol}")
+            await self.force_close_by_symbol(symbol)
+
         self._conditional_orders.clear()
-        log.info(f"close_all_global: {len(closed_trades)}/{len(trades_snapshot)} posiciones cerradas")
+        log.info(f"close_all_global: {len(closed_trades)}/{len(trades_snapshot)} posiciones locales cerradas; {len(exchange_symbols - local_symbols)} símbolos extra verificados")
         return closed_trades
 
     # ── Verificar y reparar TP/SL de una posición ─────────
@@ -852,61 +935,50 @@ def build_close_message_real(trade: Trade) -> str:
 #  WEBSOCKET — Precios en tiempo real (Futures miniTicker)
 # ══════════════════════════════════════════════════════════
 async def ws_price_loop(session: aiohttp.ClientSession):
-    log.info("WebSocket Futures Price Manager — iniciado")
-    last_symbols: frozenset = frozenset()
-    reconnect_delay = 3
+    """Actualiza precios usando WS.py para los símbolos con posiciones abiertas.
 
-    while True:
-        symbols = frozenset(execution_manager.active_symbols)
+    Evita consultar precios por REST/polling: cuando cambia el set de símbolos
+    abiertos se reinicia el cache de WS.py y se toman los markPrice desde memoria.
+    """
+    del session  # WS.py gestiona su propia conexión en un hilo dedicado.
+    log.info("WebSocket WS.py Price Manager — iniciado")
+    if SymbolWebSocketPriceCache is None:
+        log.error(f"No se pudo importar WS.py: {log_ws_import_error}")
+        return
 
-        if not symbols:
-            last_symbols = symbols
-            await asyncio.sleep(2)
-            reconnect_delay = 3
-            continue
+    cache = None
+    active_symbols: frozenset[str] = frozenset()
 
-        if symbols != last_symbols:
-            log.info(f"WS Futures: conectando {len(symbols)} símbolo(s)")
+    try:
+        while True:
+            symbols = frozenset(execution_manager.active_symbols)
 
-        streams = "/".join(f"{s.lower()}@miniTicker" for s in sorted(symbols))
-        url     = f"{BINANCE_FAPI_WS}/stream?streams={streams}"
+            if symbols != active_symbols:
+                if cache is not None:
+                    cache.stop()
+                    cache = None
 
-        try:
-            async with session.ws_connect(
-                url,
-                heartbeat=20,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as ws:
-                last_symbols    = symbols
-                reconnect_delay = 3
-                log.info("WS Futures: conectado ✅")
+                active_symbols = symbols
+                if symbols:
+                    log.info(f"WS.py: iniciando cache para {len(symbols)} símbolo(s): {', '.join(sorted(symbols))}")
+                    cache = SymbolWebSocketPriceCache(sorted(symbols))
+                    cache.start()
+                else:
+                    log.info("WS.py: sin símbolos abiertos; cache detenido")
 
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        try:
-                            data   = json.loads(msg.data)
-                            ticker = data.get("data", {})
-                            sym    = ticker.get("s")
-                            price  = float(ticker.get("c") or 0)
-                            if sym and price > 0:
-                                execution_manager.update_price(sym, price)
-                        except Exception:
-                            pass
-                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
-                        log.warning("WS Futures: cerrado, reconectando...")
-                        break
+            if cache is not None:
+                for symbol, price in cache.get_all_prices().items():
+                    if price and symbol in execution_manager.active_symbols:
+                        execution_manager.update_price(symbol, price)
 
-                    new_sym = frozenset(execution_manager.active_symbols)
-                    if new_sym != last_symbols:
-                        log.info("WS Futures: símbolos cambiaron, reconectando...")
-                        break
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.error(f"WS Futures error: {e}")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 30)
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error(f"WS.py price loop error: {e}")
+    finally:
+        if cache is not None:
+            cache.stop()
 
 
 # ══════════════════════════════════════════════════════════
@@ -972,20 +1044,29 @@ async def signal_handler(request: web.Request) -> web.Response:
             executor_status["signals_rejected"] += 1
             return web.json_response({"ok": False, "error": "missing open params"}, status=400)
 
+        reserved, reserve_reason = execution_manager.reserve_signal("open", symbol, trade_id)
+        if not reserved:
+            executor_status["signals_rejected"] += 1
+            log.warning(f"open duplicado/rechazado para {symbol}: {reserve_reason}")
+            return web.json_response({"ok": False, "error": reserve_reason, "symbol": symbol}, status=409)
+
         async def _do_open():
-            trade = await execution_manager.open_trade(
-                symbol             = symbol,
-                direction_original = direction_original,
-                price              = price,
-                paper_trade_id     = trade_id,
-            )
-            if trade:
-                executor_status["signals_open"] += 1
-                async with aiohttp.ClientSession() as sess:
-                    await send_telegram(sess, build_open_message_real(trade))
-            else:
-                executor_status["signals_rejected"] += 1
-                log.warning(f"open_trade rechazado para {symbol} ({direction_original})")
+            try:
+                trade = await execution_manager.open_trade(
+                    symbol             = symbol,
+                    direction_original = direction_original,
+                    price              = price,
+                    paper_trade_id     = trade_id,
+                )
+                if trade:
+                    executor_status["signals_open"] += 1
+                    async with aiohttp.ClientSession() as sess:
+                        await send_telegram(sess, build_open_message_real(trade))
+                else:
+                    executor_status["signals_rejected"] += 1
+                    log.warning(f"open_trade rechazado para {symbol} ({direction_original})")
+            finally:
+                await execution_manager.release_pending("open", symbol)
 
         asyncio.create_task(_do_open())
         return web.json_response({"ok": True, "action": "open", "symbol": symbol})
@@ -1003,34 +1084,43 @@ async def signal_handler(request: web.Request) -> web.Response:
         if not trade:
             trade = execution_manager._trades.get(symbol)
 
+        reserved, reserve_reason = execution_manager.reserve_signal("close", symbol, trade_id)
+        if not reserved:
+            executor_status["signals_rejected"] += 1
+            log.warning(f"close duplicado/rechazado para {symbol}: {reserve_reason}")
+            return web.json_response({"ok": False, "error": reserve_reason, "symbol": symbol}, status=409)
+
         async def _do_close():
-            if trade:
-                # Caso normal: tenemos el trade registrado localmente
-                closed = await execution_manager.force_close_trade(trade, reason="MAIN_BOT")
-                if closed:
-                    executor_status["signals_close"] += 1
-                    async with aiohttp.ClientSession() as sess:
-                        await send_telegram(sess, build_close_message_real(trade))
-            else:
-                # ✅ Caso crítico: no hay trade local (executor reiniciado, etc.)
-                # Aun así cerramos en Binance usando sólo el símbolo.
-                log.warning(
-                    f"signal_handler close: sin trade local para "
-                    f"paper#{trade_id} / {symbol} — "
-                    f"enviando close_all_positions directo a Binance"
-                )
-                closed = await execution_manager.force_close_by_symbol(symbol)
-                if closed:
-                    executor_status["signals_close"] += 1
-                    async with aiohttp.ClientSession() as sess:
-                        await send_telegram(
-                            sess,
-                            f"🔄 <b>CIERRE FORZADO (sin estado local)</b>\n"
-                            f"📊 <code>{symbol}</code>\n"
-                            f"⚠️ <i>El executor no tenía este trade registrado — "
-                            f"se cerró directamente en Binance</i>\n"
-                            f"🆔 Paper#{trade_id} | Razón: {reason}"
-                        )
+            try:
+                if trade:
+                    # Caso normal: tenemos el trade registrado localmente
+                    closed = await execution_manager.force_close_trade(trade, reason="MAIN_BOT")
+                    if closed:
+                        executor_status["signals_close"] += 1
+                        async with aiohttp.ClientSession() as sess:
+                            await send_telegram(sess, build_close_message_real(trade))
+                else:
+                    # Caso crítico: no hay trade local (executor reiniciado, etc.).
+                    # Aun así cerramos en Binance usando sólo el símbolo.
+                    log.warning(
+                        f"signal_handler close: sin trade local para "
+                        f"paper#{trade_id} / {symbol} — "
+                        f"enviando close_all_positions directo a Binance"
+                    )
+                    closed = await execution_manager.force_close_by_symbol(symbol)
+                    if closed:
+                        executor_status["signals_close"] += 1
+                        async with aiohttp.ClientSession() as sess:
+                            await send_telegram(
+                                sess,
+                                f"🔄 <b>CIERRE FORZADO (sin estado local)</b>\n"
+                                f"📊 <code>{symbol}</code>\n"
+                                f"⚠️ <i>El executor no tenía este trade registrado — "
+                                f"se cerró directamente en Binance</i>\n"
+                                f"🆔 Paper#{trade_id} | Razón: {reason}"
+                            )
+            finally:
+                await execution_manager.release_pending("close", symbol)
 
         asyncio.create_task(_do_close())
         return web.json_response({"ok": True, "action": "close", "symbol": symbol})
@@ -1074,6 +1164,22 @@ async def signal_handler(request: web.Request) -> web.Response:
 # ══════════════════════════════════════════════════════════
 DASHBOARD_JS = """
 <script>
+async function closeTrade(symbol, tradeId) {
+  if (!confirm(`¿Cerrar manualmente ${symbol}?`)) return;
+  try {
+    const r = await fetch('/api/close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, trade_id: tradeId})
+    });
+    const d = await r.json();
+    if (!d.ok) alert('No se pudo solicitar el cierre: ' + (d.error || 'error'));
+    await refreshState();
+  } catch(e) {
+    alert('Error solicitando cierre manual: ' + e);
+  }
+}
+
 async function refreshState() {
   try {
     const r = await fetch('/api/state');
@@ -1104,7 +1210,8 @@ async function refreshState() {
           <td style="color:#d29922">$${t.tp_price.toFixed(6)}</td>
           <td style="color:#f85149">$${t.sl_price.toFixed(6)}</td>
           <td>${pnl}</td><td>${roi}</td>
-          <td>${t.notional.toFixed(2)} USDT</td><td>${t.quantity}</td><td>${t.open_time}</td></tr>`;
+          <td>${t.notional.toFixed(2)} USDT</td><td>${t.quantity}</td><td>${t.open_time}</td>
+          <td><button class="close-btn" onclick="closeTrade('${t.symbol}', ${t.paper_trade_id || 0})">Cerrar</button></td></tr>`;
       }).join('');
     }
 
@@ -1129,6 +1236,44 @@ refreshState();
 setInterval(refreshState, 5000);
 </script>
 """
+
+
+async def manual_close_handler(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    symbol = str(data.get("symbol", "")).upper()
+    trade_id = int(data.get("trade_id", 0) or 0)
+    if not symbol:
+        return web.json_response({"ok": False, "error": "missing symbol"}, status=400)
+
+    trade = execution_manager.find_by_paper_id(trade_id) if trade_id else None
+    if not trade:
+        trade = execution_manager._trades.get(symbol)
+
+    reserved, reserve_reason = execution_manager.reserve_signal("close", symbol, trade_id)
+    if not reserved:
+        executor_status["signals_rejected"] += 1
+        return web.json_response({"ok": False, "error": reserve_reason, "symbol": symbol}, status=409)
+
+    async def _do_manual_close():
+        try:
+            if trade:
+                closed = await execution_manager.force_close_trade(trade, reason="MANUAL")
+                if closed:
+                    executor_status["signals_close"] += 1
+                    async with aiohttp.ClientSession() as sess:
+                        await send_telegram(sess, build_close_message_real(trade))
+            else:
+                closed = await execution_manager.force_close_by_symbol(symbol)
+                if closed:
+                    executor_status["signals_close"] += 1
+        finally:
+            await execution_manager.release_pending("close", symbol)
+
+    asyncio.create_task(_do_manual_close())
+    return web.json_response({"ok": True, "action": "manual_close", "symbol": symbol})
 
 
 async def api_state_handler(request: web.Request) -> web.Response:
@@ -1207,6 +1352,8 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     tr:hover td{{background:#161b22}}
     .dot{{display:inline-block;width:8px;height:8px;background:#3fb950;border-radius:50%;margin-right:5px;animation:blink 1.5s infinite}}
     .badge{{display:inline-block;padding:.1rem .4rem;border-radius:3px;font-size:.7rem;font-weight:bold;background:#161b22;border:1px solid #30363d}}
+    .close-btn{{background:#da3633;color:#fff;border:0;border-radius:4px;padding:.25rem .5rem;cursor:pointer;font-weight:bold}}
+    .close-btn:hover{{background:#f85149}}
     .contrarian-banner{{background:#21262d;border:1px solid #f0883e;border-radius:6px;padding:.6rem 1rem;margin-bottom:1rem;color:#f0883e;font-size:.82rem}}
     @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
   </style>
@@ -1257,10 +1404,10 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     <thead><tr>
       <th>ID</th><th>Par</th><th>Dir (ejecutada)</th><th>Lev</th>
       <th>Entrada</th><th>Precio actual</th><th>Take Profit</th><th>Stop Loss</th>
-      <th>PnL (USDT)</th><th>ROI%</th><th>Notional</th><th>Qty</th><th>Abierto</th>
+      <th>PnL (USDT)</th><th>ROI%</th><th>Notional</th><th>Qty</th><th>Abierto</th><th>Acción</th>
     </tr></thead>
     <tbody id="open_body">
-      <tr><td colspan="13" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>
+      <tr><td colspan="14" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones reales abiertas</td></tr>
     </tbody>
   </table></div>
 
@@ -1298,6 +1445,7 @@ async def start_http_server():
     app.router.add_get("/",          dashboard_handler)
     app.router.add_get("/health",    dashboard_handler)
     app.router.add_get("/api/state", api_state_handler)
+    app.router.add_post("/api/close", manual_close_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
