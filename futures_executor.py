@@ -1,5 +1,5 @@
 """
-futures_executor.py v3.0 — Executor de Futuros Binance
+futures_executor.py v4.0 — Executor de Futuros Binance
 ══════════════════════════════════════════════════════════════════════
 Recibe señales HTTP de app.py y ejecuta órdenes REALES en Binance
 Futures USDT-M Perpetuos.
@@ -12,9 +12,15 @@ SEÑALES SOPORTADAS (JSON body):
               "direction":"LONG",  "price":50000.0, "quantity":0.001}
 
   Cierre:   {"action":"close",     "trade_id":1, "symbol":"BTCUSDT",
-              "direction":"LONG",  "reason":"TP", "close_price":50500.0}
+              "direction":"LONG", "reason":"TP", "close_price":50500.0}
 
   Global:   {"action":"close_all"}
+
+CIERRE MANUAL (NUEVO en v4.0):
+  El dashboard (GET /) tiene un botón "Cerrar" por posición y un botón
+  "Cerrar TODO" arriba de la tabla. Disparan POST /manual/close y
+  POST /manual/close_all respectivamente. Estas rutas usan el mismo
+  SIGNAL_SECRET (inyectado en el HTML) como token de autorización.
 
 COMPORTAMIENTO:
   • Quantity y dirección se usan TAL CUAL llegan de app.py (sin recalcular)
@@ -25,17 +31,30 @@ COMPORTAMIENTO:
     posición abierta (la orden se asume enviada)
   • Cierre via close_all_positions() de BinanceAPI:
     cancela TP/SL + Algo Orders + posición de mercado en un paso
+  • Precios en tiempo real: vía ws.py (SymbolWebSocketPriceCache), NO por
+    polling REST. El executor sólo se suscribe a los símbolos con
+    posición abierta y actualiza la suscripción dinámicamente.
+  • NINGUNA posición se cierra automáticamente "porque sí". El executor
+    sólo cierra cuando:
+      1. Llega una señal explícita {"action":"close"/"close_all"} de app.py
+      2. Se presiona el botón de cierre manual en el dashboard
+    Si una posición registrada localmente desaparece de Binance (cierre
+    externo / liquidación / cierre manual hecho directo en el exchange),
+    el executor SOLO envía una alerta por Telegram — no la marca como
+    cerrada ni dispara ninguna orden por su cuenta.
 
 VARIABLES DE ENTORNO:
   BINANCE_API_KEY      — clave API Binance
   BINANCE_API_SECRET   — secreto API Binance
   SIGNAL_SECRET        — token compartido con app.py (cabecera X-Signal-Secret)
+                          también se usa como token del botón de cierre manual
   TELEGRAM_BOT_TOKEN   — token bot Telegram
   TELEGRAM_CHAT_ID     — chat ID Telegram
   USE_TESTNET          — "true" para testnet (default: false)
   PORT                 — puerto HTTP (default: 10000)
   LEVERAGE             — apalancamiento a usar en cada posición (default: 1)
-  POSITION_POLL_S      — segundos entre polls de posiciones (default: 30)
+  POSITION_POLL_S      — segundos entre verificaciones de cierre externo
+                          (sólo genera alertas, nunca cierra por su cuenta)
 """
 
 import asyncio
@@ -63,8 +82,6 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
 LEVERAGE        = int(os.environ.get("LEVERAGE",        "1"))
 PORT            = int(os.environ.get("PORT",            "10000"))
 POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
-
-BINANCE_FAPI_WS = "wss://fstream.binance.com"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,8 +132,9 @@ class Trade:
 class ExecutionManager:
     """Ejecuta y rastrea posiciones reales en Binance Futures."""
 
-    def __init__(self, binance_api):
+    def __init__(self, binance_api, price_ws):
         self.api            = binance_api
+        self.price_ws       = price_ws   # SymbolWebSocketPriceCache (ws.py)
         self._trades        : dict[str, Trade] = {}
         self._closed        : list[Trade]      = []
         self._counter       : int = 0
@@ -173,6 +191,16 @@ class ExecutionManager:
     @property
     def equity(self) -> float:
         return self._balance + self.unrealized_pnl
+
+    # ── Sincroniza la suscripción WS con los símbolos abiertos ───
+    def _sync_ws_symbols(self):
+        """Le dice a ws.py qué símbolos escuchar: sólo los que tienen
+        posición abierta en este momento. Se llama cada vez que se abre
+        o se cierra un trade."""
+        try:
+            self.price_ws.update_symbols(list(self._trades.keys()))
+        except Exception as e:
+            log.error(f"_sync_ws_symbols: {e}")
 
     # ── Apertura de posición ─────────────────────────────
     async def open_trade(
@@ -309,6 +337,9 @@ class ExecutionManager:
             self._trades[symbol]              = trade
             self._paper_id_map[paper_trade_id] = symbol
 
+        # Empezar a recibir precio en tiempo real (WS) para este símbolo
+        self._sync_ws_symbols()
+
         assumed_tag = " [ASUMIDA — MARGIN INSUF]" if order_assumed else ""
         log.info(
             f"[REAL #{trade.id}] ABIERTO {direction} {symbol} @ ${price} "
@@ -344,6 +375,10 @@ class ExecutionManager:
             self._paper_id_map.pop(trade.paper_trade_id, None)
             self._closed.append(trade)
 
+        # Ya no hace falta el precio en tiempo real de este símbolo
+        # (a menos que se haya abierto otra posición distinta en él)
+        self._sync_ws_symbols()
+
         log.info(
             f"[REAL #{trade.id}] CERRADO {reason} {trade.symbol} "
             f"@ ${close_price} | PnL: {trade.pnl_usdt:+.4f} USDT ({trade.roi_pct:+.2f}%)"
@@ -356,6 +391,11 @@ class ExecutionManager:
         """
         Cancela todas las órdenes del símbolo (TP/SL/Algo) y cierra la
         posición a mercado usando close_all_positions() de BinanceAPI.
+
+        Sólo se llama desde:
+          • signal_handler (señal explícita "close"/"close_all" de app.py)
+          • manual_close_handler / manual_close_all_handler (botón del dashboard)
+        Nunca se llama automáticamente por desaparición de una posición.
         """
         loop = asyncio.get_event_loop()
         close_price = trade.current_price if trade.current_price > 0 else trade.entry_price
@@ -391,14 +431,14 @@ class ExecutionManager:
             return False
 
     # ── Cierre global de todas las posiciones ─────────────
-    async def close_all_global(self) -> list[Trade]:
+    async def close_all_global(self, reason: str = "CLOSE_ALL") -> list[Trade]:
         async with self._lock:
             trades_snapshot = list(self._trades.values())
 
         closed_trades = []
         for trade in trades_snapshot:
             try:
-                closed = await self.force_close_trade(trade, reason="CLOSE_ALL")
+                closed = await self.force_close_trade(trade, reason=reason)
                 if closed:
                     closed_trades.append(trade)
                     log.info(f"close_all_global: cerrado {trade.symbol} #{trade.id}")
@@ -410,19 +450,23 @@ class ExecutionManager:
         )
         return closed_trades
 
-    # ── Poll de posiciones reales en Binance ──────────────
-    async def poll_positions(self) -> list[tuple]:
+    # ── Verificación de posibles cierres externos (SOLO ALERTA) ──
+    async def poll_positions(self) -> list[Trade]:
         """
-        Consulta todas las posiciones abiertas en Binance Futures.
-        - Si sigue abierta → actualiza precio unrealized.
-        - Si desapareció   → la detecta como cerrada externamente.
-        Retorna lista de (Trade, close_price, reason).
+        Consulta las posiciones reales en Binance Futures y devuelve los
+        trades registrados localmente que ya NO aparecen en el exchange
+        (posible cierre externo, liquidación, o cierre hecho directo en
+        Binance fuera de este executor).
+
+        IMPORTANTE: esta función no cierra nada ni cambia el estado de
+        ningún trade. Sólo informa para que se envíe una alerta — el
+        cierre real sólo ocurre vía señal explícita de app.py o el botón
+        de cierre manual del dashboard.
         """
         if not self._trades:
             return []
 
         loop = asyncio.get_event_loop()
-        closed_events: list[tuple] = []
 
         try:
             positions = await loop.run_in_executor(
@@ -443,30 +487,17 @@ class ExecutionManager:
         async with self._lock:
             open_copy = dict(self._trades)
 
-        for symbol, trade in open_copy.items():
-            if symbol in pos_by_symbol:
-                p       = pos_by_symbol[symbol]
-                mark_px = float(
-                    p.get("markPrice") or p.get("entryPrice") or trade.entry_price
-                )
-                trade.update_unrealized(mark_px)
-            else:
-                # Posición desapareció → fue cerrada externamente (TP/SL/liquidación)
-                cp = trade.current_price if trade.current_price > 0 else trade.entry_price
-                closed_events.append((trade, cp, "CLOSED"))
-
-        return closed_events
+        missing: list[Trade] = [
+            trade for symbol, trade in open_copy.items()
+            if symbol not in pos_by_symbol
+        ]
+        return missing
 
     def find_by_paper_id(self, paper_trade_id: int) -> Optional[Trade]:
         sym = self._paper_id_map.get(paper_trade_id)
         if sym:
             return self._trades.get(sym)
         return None
-
-    def update_price(self, symbol: str, price: float):
-        t = self._trades.get(symbol)
-        if t:
-            t.update_unrealized(price)
 
 
 # ══════════════════════════════════════════════════════════
@@ -479,6 +510,7 @@ executor_status = {
     "signals_open"       : 0,
     "signals_close"      : 0,
     "signals_rejected"   : 0,
+    "manual_closes"      : 0,
     "last_signal_time"   : "Esperando señales...",
     "last_signal_detail" : "",
     "started_at"         : datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -530,8 +562,8 @@ def build_close_message(trade: Trade) -> str:
         "SL"           : ("❌", "STOP LOSS 🛑"),
         "CLOSED"       : ("🔄", "CIERRE EXTERNO"),
         "MAIN_BOT"     : ("🔄", "CIERRE SEÑAL PRINCIPAL"),
-        "CLOSE_ALL"    : ("🛑", "CIERRE GLOBAL"),
-        "MANUAL"       : ("🖐", "CIERRE MANUAL"),
+        "CLOSE_ALL"    : ("🛑", "CIERRE GLOBAL (SEÑAL)"),
+        "MANUAL"       : ("🖐", "CIERRE MANUAL (DASHBOARD)"),
     }
     emoji, reason_str = reason_map.get(trade.status, ("⚠️", trade.status))
     dir_str   = "🟢 LONG" if trade.direction == "LONG" else "🔴 SHORT"
@@ -564,84 +596,73 @@ def build_close_message(trade: Trade) -> str:
 
 
 # ══════════════════════════════════════════════════════════
-#  WEBSOCKET — Precios Futures en tiempo real
-# ══════════════════════════════════════════════════════════
-async def ws_price_loop(session: aiohttp.ClientSession):
-    log.info("WebSocket Futures Price — iniciado")
-    last_symbols: frozenset = frozenset()
-    reconnect_delay = 3
-
-    while True:
-        symbols = frozenset(execution_manager.active_symbols)
-
-        if not symbols:
-            last_symbols = symbols
-            await asyncio.sleep(2)
-            reconnect_delay = 3
-            continue
-
-        if symbols != last_symbols:
-            log.info(f"WS Futures: conectando {len(symbols)} símbolo(s)")
-
-        streams = "/".join(f"{s.lower()}@miniTicker" for s in sorted(symbols))
-        url     = f"{BINANCE_FAPI_WS}/stream?streams={streams}"
-
-        try:
-            async with session.ws_connect(
-                url,
-                heartbeat=20,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as ws:
-                last_symbols    = symbols
-                reconnect_delay = 3
-                log.info("WS Futures: conectado ✅")
-
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        try:
-                            data   = json.loads(msg.data)
-                            ticker = data.get("data", {})
-                            sym    = ticker.get("s")
-                            price  = float(ticker.get("c") or 0)
-                            if sym and price > 0:
-                                execution_manager.update_price(sym, price)
-                        except Exception:
-                            pass
-                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
-                        log.warning("WS Futures: cerrado, reconectando...")
-                        break
-
-                    new_sym = frozenset(execution_manager.active_symbols)
-                    if new_sym != last_symbols:
-                        log.info("WS Futures: símbolos cambiaron, reconectando...")
-                        break
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.error(f"WS Futures error: {e}")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 30)
-
-
-# ══════════════════════════════════════════════════════════
-#  MONITOR DE POSICIONES — Poll cada POSITION_POLL_S seg.
+#  MONITOR DE POSICIONES — SOLO ALERTA, NUNCA CIERRA
 # ══════════════════════════════════════════════════════════
 async def position_monitor_loop(session: aiohttp.ClientSession):
-    log.info(f"Position Monitor — poll cada {POSITION_POLL_S}s")
+    """
+    Cada POSITION_POLL_S segundos revisa si alguna posición registrada
+    localmente desapareció de Binance. NO cierra nada por su cuenta:
+    sólo avisa por Telegram para que el operador decida — vía botón de
+    cierre manual del dashboard, o confirmando con una señal de app.py.
+    """
+    log.info(f"Position Monitor (sólo alertas, sin auto-cierre) — poll cada {POSITION_POLL_S}s")
     await asyncio.sleep(10)
+    alerted: set[str] = set()
 
     while True:
         try:
-            closed_events = await execution_manager.poll_positions()
-            for trade, close_price, reason in closed_events:
-                closed = await execution_manager.close_trade(trade, close_price, reason)
-                if closed:
-                    await send_telegram(session, build_close_message(trade))
+            missing = await execution_manager.poll_positions()
+            missing_symbols = {t.symbol for t in missing}
+
+            for trade in missing:
+                if trade.symbol in alerted:
+                    continue
+                alerted.add(trade.symbol)
+                log.warning(
+                    f"⚠️ {trade.symbol} (#{trade.id}) ya no aparece en Binance "
+                    f"pero sigue registrado como OPEN localmente — NO se cierra automáticamente."
+                )
+                await send_telegram(
+                    session,
+                    f"⚠️ <b>POSIBLE CIERRE EXTERNO DETECTADO</b>\n"
+                    f"📊 <code>{trade.symbol}</code> (Real #{trade.id} | Paper #{trade.paper_trade_id})\n"
+                    f"Ya no aparece entre tus posiciones de Binance, pero el "
+                    f"executor sigue registrándola como abierta.\n"
+                    f"➡️ No se cerró automáticamente. Verifica en Binance y, si "
+                    f"corresponde, usa el botón <b>Cerrar</b> del dashboard para "
+                    f"sincronizar el registro local.",
+                )
+
+            # Deja de alertar para símbolos que ya no están "missing"
+            # (volvieron a aparecer) o que ya no están registrados.
+            alerted &= (missing_symbols | execution_manager.active_symbols)
+
         except Exception as e:
             log.error(f"position_monitor_loop: {e}")
 
         await asyncio.sleep(POSITION_POLL_S)
+
+
+# ══════════════════════════════════════════════════════════
+#  SYNC DE PRECIOS — lee la caché WS (ws.py), sin red, cada 1s
+# ══════════════════════════════════════════════════════════
+async def price_sync_loop():
+    """
+    Actualiza el precio actual / PnL no realizado de cada trade abierto
+    leyendo la caché en memoria de ws.py (SymbolWebSocketPriceCache).
+    No hace ninguna llamada de red — los precios ya llegan en tiempo
+    real por WebSocket; este loop sólo los traslada a cada Trade.
+    """
+    log.info("Price Sync Loop — actualizando PnL desde caché WS cada 1s")
+    while True:
+        try:
+            for trade in execution_manager.open_trades:
+                price = execution_manager.price_ws.get_price(trade.symbol)
+                if price:
+                    trade.update_unrealized(price)
+        except Exception as e:
+            log.error(f"price_sync_loop: {e}")
+        await asyncio.sleep(1)
 
 
 # ══════════════════════════════════════════════════════════
@@ -770,7 +791,7 @@ async def signal_handler(request: web.Request) -> web.Response:
         log.warning(f"signal_handler: CIERRE GLOBAL — cerrando {total_open} posiciones")
 
         async def _do_close_all():
-            closed_trades = await execution_manager.close_all_global()
+            closed_trades = await execution_manager.close_all_global(reason="CLOSE_ALL")
             async with aiohttp.ClientSession() as sess:
                 if not closed_trades:
                     await send_telegram(
@@ -796,6 +817,93 @@ async def signal_handler(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": f"unknown action: {action}"}, status=400
         )
+
+
+# ══════════════════════════════════════════════════════════
+#  ENDPOINTS /manual/close, /manual/close_all — botón del dashboard
+# ══════════════════════════════════════════════════════════
+def _check_dashboard_token(request: web.Request) -> bool:
+    token = request.headers.get("X-Dashboard-Token", "")
+    return token == SIGNAL_SECRET
+
+
+async def manual_close_handler(request: web.Request) -> web.Response:
+    """
+    POST /manual/close
+    Header: X-Dashboard-Token: <SIGNAL_SECRET>
+    Body: {"symbol": "BTCUSDT"}
+
+    Disparado por el botón "Cerrar" de una fila en el dashboard.
+    Es la ÚNICA forma (junto a /manual/close_all y la señal "close" de
+    app.py) de cerrar una posición — nada se cierra solo.
+    """
+    if not _check_dashboard_token(request):
+        log.warning(f"manual_close_handler: token inválido desde {request.remote}")
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    symbol = data.get("symbol", "").upper()
+    trade  = execution_manager._trades.get(symbol)
+
+    if not trade:
+        return web.json_response(
+            {"ok": False, "error": f"no hay posición abierta registrada para {symbol}"},
+            status=404,
+        )
+
+    log.warning(f"🖐 CIERRE MANUAL solicitado desde dashboard → {symbol} (#{trade.id})")
+
+    async def _do_manual_close():
+        closed = await execution_manager.force_close_trade(trade, reason="MANUAL")
+        if closed:
+            executor_status["signals_close"]  += 1
+            executor_status["manual_closes"]  += 1
+            async with aiohttp.ClientSession() as sess:
+                await send_telegram(sess, build_close_message(trade))
+
+    asyncio.create_task(_do_manual_close())
+    return web.json_response({"ok": True, "action": "manual_close", "symbol": symbol})
+
+
+async def manual_close_all_handler(request: web.Request) -> web.Response:
+    """
+    POST /manual/close_all
+    Header: X-Dashboard-Token: <SIGNAL_SECRET>
+
+    Disparado por el botón "Cerrar TODO" del dashboard.
+    """
+    if not _check_dashboard_token(request):
+        log.warning(f"manual_close_all_handler: token inválido desde {request.remote}")
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    total_open = len(execution_manager.open_trades)
+    log.warning(f"🖐 CIERRE MANUAL GLOBAL solicitado desde dashboard — {total_open} posiciones")
+
+    async def _do_close_all():
+        closed_trades = await execution_manager.close_all_global(reason="MANUAL")
+        async with aiohttp.ClientSession() as sess:
+            if not closed_trades:
+                await send_telegram(
+                    sess, "🖐 Cierre manual global ejecutado — no había posiciones abiertas.",
+                )
+                return
+            for t in closed_trades:
+                await send_telegram(sess, build_close_message(t))
+            await send_telegram(
+                sess,
+                f"🖐 Cierre manual global completado — {len(closed_trades)} posición(es) cerrada(s).",
+            )
+
+    asyncio.create_task(_do_close_all())
+    executor_status["signals_close"] += total_open
+    executor_status["manual_closes"] += total_open
+    return web.json_response({
+        "ok": True, "action": "manual_close_all", "positions_targeted": total_open,
+    })
 
 
 # ══════════════════════════════════════════════════════════
@@ -852,8 +960,10 @@ async def api_state_handler(request: web.Request) -> web.Response:
 # ══════════════════════════════════════════════════════════
 #  DASHBOARD HTML
 # ══════════════════════════════════════════════════════════
-DASHBOARD_JS = """
+DASHBOARD_JS_TEMPLATE = """
 <script>
+const DASH_TOKEN = __DASH_TOKEN__;
+
 async function refresh() {
   try {
     const r = await fetch('/api/state');
@@ -871,11 +981,12 @@ async function refresh() {
     q('sig_ok').textContent  = d.executor_status.signals_open + ' abiertas / ' + d.executor_status.signals_close + ' cerradas';
     q('sig_rej').textContent = d.executor_status.signals_rejected;
     q('last_sig').textContent= d.executor_status.last_signal_time + ' — ' + d.executor_status.last_signal_detail;
-    q('ws_sym').textContent  = 'WS activo: ' + d.ws_symbols;
+    q('ws_sym').textContent  = 'WS activo (ws.py): ' + d.ws_symbols;
+    q('close_all_btn').disabled = d.open_count === 0;
 
     const ob = document.getElementById('open_body');
     if (!d.open_trades.length) {
-      ob.innerHTML = '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones abiertas</td></tr>';
+      ob.innerHTML = '<tr><td colspan="12" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones abiertas</td></tr>';
     } else {
       ob.innerHTML = d.open_trades.map(t => {
         const dir = t.direction === 'LONG' ? '<span style="color:#3fb950">🟢 LONG</span>' : '<span style="color:#f85149">🔴 SHORT</span>';
@@ -888,6 +999,7 @@ async function refresh() {
           <td>${pnl}</td><td>${roi}</td>
           <td>${t.notional.toFixed(4)} USDT</td><td>${t.quantity}</td>
           <td>${t.open_time}${assum}</td>
+          <td><button class="btn-close" onclick="closeTrade('${t.symbol}')">Cerrar</button></td>
         </tr>`;
       }).join('');
     }
@@ -901,6 +1013,7 @@ async function refresh() {
         const pnl = t.pnl_usdt >= 0 ? `<span style="color:#3fb950">+${t.pnl_usdt.toFixed(4)}</span>` : `<span style="color:#f85149">${t.pnl_usdt.toFixed(4)}</span>`;
         const res = t.status === 'TP' ? '<span style="color:#3fb950">✅ TP</span>' :
                     t.status === 'SL' ? '<span style="color:#f85149">❌ SL</span>' :
+                    t.status === 'MANUAL' ? '<span style="color:#58a6ff">🖐 MANUAL</span>' :
                     `<span style="color:#8b949e">${t.status}</span>`;
         return `<tr>
           <td>#${t.id}</td><td>${t.symbol}</td><td>${t.direction}</td><td>${t.leverage}x</td>
@@ -912,6 +1025,34 @@ async function refresh() {
     }
   } catch(e) { console.error(e); }
 }
+
+async function closeTrade(symbol) {
+  if (!confirm('¿Cerrar manualmente la posición ' + symbol + '?')) return;
+  try {
+    const r = await fetch('/manual/close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify({symbol: symbol})
+    });
+    const d = await r.json();
+    if (!d.ok) alert('Error al cerrar ' + symbol + ': ' + (d.error || 'desconocido'));
+    refresh();
+  } catch(e) { alert('Error de red al cerrar ' + symbol); }
+}
+
+async function closeAllTrades() {
+  if (!confirm('¿Cerrar TODAS las posiciones abiertas manualmente? Esta acción no se puede deshacer.')) return;
+  try {
+    const r = await fetch('/manual/close_all', {
+      method: 'POST',
+      headers: {'X-Dashboard-Token': DASH_TOKEN}
+    });
+    const d = await r.json();
+    if (!d.ok) alert('Error al cerrar todas las posiciones: ' + (d.error || 'desconocido'));
+    refresh();
+  } catch(e) { alert('Error de red al cerrar todas las posiciones'); }
+}
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -931,39 +1072,50 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     rp_col = "#3fb950" if em.total_realized_pnl >= 0 else "#f85149"
     up_col = "#3fb950" if em.unrealized_pnl >= 0 else "#f85149"
 
+    # El token del dashboard se inyecta como JSON para evitar problemas de
+    # escapado de comillas en el secreto (viene de una variable de entorno).
+    dashboard_js = DASHBOARD_JS_TEMPLATE.replace("__DASH_TOKEN__", json.dumps(SIGNAL_SECRET))
+
     html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Futures Executor v3</title>
+  <title>Futures Executor v4</title>
   <style>
     body{{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;padding:1.2rem}}
     h1{{color:#f0883e;margin-bottom:.8rem;font-size:1.3rem}}
-    h2{{color:#58a6ff;margin:.9rem 0 .5rem;font-size:.95rem}}
+    h2{{color:#58a6ff;margin:.9rem 0 .5rem;font-size:.95rem;display:flex;align-items:center;gap:.6rem}}
     .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:.6rem;margin-bottom:1.2rem}}
     .card{{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:.75rem}}
     .card .label{{color:#8b949e;font-size:.7rem;margin-bottom:.25rem;text-transform:uppercase;letter-spacing:.04em}}
     .card .value{{color:#f0f6fc;font-size:.95rem;font-weight:bold}}
     .ok{{color:#3fb950}} .warn{{color:#d29922}} .err{{color:#f85149}} .orange{{color:#f0883e}}
     .wrap{{overflow-x:auto;margin-bottom:1.2rem}}
-    table{{width:100%;border-collapse:collapse;font-size:.77rem;min-width:600px}}
+    table{{width:100%;border-collapse:collapse;font-size:.77rem;min-width:660px}}
     th{{color:#8b949e;text-align:left;padding:.35rem .45rem;border-bottom:1px solid #30363d;white-space:nowrap;font-size:.71rem}}
     td{{padding:.3rem .45rem;border-bottom:1px solid #1c2128;white-space:nowrap}}
     tr:hover td{{background:#161b22}}
     .dot{{display:inline-block;width:8px;height:8px;background:#3fb950;border-radius:50%;margin-right:5px;animation:blink 1.5s infinite}}
     @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
     .info-banner{{background:#161b22;border:1px solid #58a6ff;border-radius:6px;padding:.6rem 1rem;margin-bottom:1rem;color:#58a6ff;font-size:.82rem}}
+    .btn-close{{background:#f85149;color:#fff;border:none;border-radius:4px;padding:.25rem .6rem;font-size:.7rem;font-family:inherit;cursor:pointer}}
+    .btn-close:hover{{background:#da3633}}
+    .btn-close-all{{background:#f85149;color:#fff;border:none;border-radius:5px;padding:.4rem .9rem;font-size:.78rem;font-family:inherit;cursor:pointer;font-weight:bold}}
+    .btn-close-all:hover{{background:#da3633}}
+    .btn-close-all:disabled{{background:#30363d;color:#6e7681;cursor:not-allowed}}
   </style>
 </head>
 <body>
-  <h1>⚡ Futures Executor v3 — Binance USDT Perpetuos [{env}]</h1>
+  <h1>⚡ Futures Executor v4 — Binance USDT Perpetuos [{env}]</h1>
 
   <div class="info-banner">
     📡 Recibe señales de <b>app.py</b> y ejecuta en Binance Futures.
     Apertura vía <b>Algo Order</b> (STOP_MARKET) → fallback a Market Order.
-    Sin TP/SL propios — el cierre lo gestiona app.py.
-    Leverage: <b>{LEVERAGE}x</b> | Poll posiciones: <b>{POSITION_POLL_S}s</b>
+    Precios en tiempo real vía <b>WebSocket (ws.py)</b> — sin polling.
+    🔒 <b>Ninguna posición se cierra automáticamente:</b> sólo por señal explícita
+    de app.py o por el botón <b>Cerrar</b> de este dashboard.
+    Leverage: <b>{LEVERAGE}x</b> | Verificación de cierre externo (sólo alerta): cada <b>{POSITION_POLL_S}s</b>
   </div>
 
   <div class="grid">
@@ -995,18 +1147,21 @@ async def dashboard_handler(request: web.Request) -> web.Response:
       <div class="value" style="font-size:.8rem" id="last_sig">{es['last_signal_time']} — {es['last_signal_detail']}</div></div>
   </div>
 
-  <h2><span class="dot"></span>📊 Posiciones Reales Abiertas</h2>
+  <h2>
+    <span class="dot"></span>📊 Posiciones Reales Abiertas
+    <button class="btn-close-all" id="close_all_btn" onclick="closeAllTrades()" {"disabled" if not em.open_trades else ""}>🛑 Cerrar TODO</button>
+  </h2>
   <p id="ws_sym" style="color:#484f58;font-size:.72rem;margin-bottom:.4rem">
-    WS activo: {", ".join(sorted(em.active_symbols)) or "ninguno"}
+    WS activo (ws.py): {", ".join(sorted(em.active_symbols)) or "ninguno"}
   </p>
   <div class="wrap"><table>
     <thead><tr>
       <th>ID</th><th>Par</th><th>Dirección</th><th>Lev</th>
       <th>Entrada</th><th>Precio actual</th>
-      <th>PnL (USDT)</th><th>ROI%</th><th>Notional</th><th>Qty</th><th>Abierto</th>
+      <th>PnL (USDT)</th><th>ROI%</th><th>Notional</th><th>Qty</th><th>Abierto</th><th>Acción</th>
     </tr></thead>
     <tbody id="open_body">
-      <tr><td colspan="11" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones abiertas</td></tr>
+      <tr><td colspan="12" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones abiertas</td></tr>
     </tbody>
   </table></div>
 
@@ -1022,12 +1177,12 @@ async def dashboard_handler(request: web.Request) -> web.Response:
   </table></div>
 
   <p style="color:#484f58;margin-top:.6rem;font-size:.7rem">
-    Futures Executor v3 | Leverage: {LEVERAGE}x | Poll: {POSITION_POLL_S}s |
+    Futures Executor v4 | Leverage: {LEVERAGE}x | Alerta cierre externo: {POSITION_POLL_S}s |
     Iniciado: {es['started_at']} |
     Actualizado: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
   </p>
 
-  {DASHBOARD_JS}
+  {dashboard_js}
 </body>
 </html>"""
     return web.Response(text=html, content_type="text/html")
@@ -1038,10 +1193,12 @@ async def dashboard_handler(request: web.Request) -> web.Response:
 # ══════════════════════════════════════════════════════════
 async def start_http_server():
     app = web.Application()
-    app.router.add_post("/signal",    signal_handler)
-    app.router.add_get("/",           dashboard_handler)
-    app.router.add_get("/health",     dashboard_handler)
-    app.router.add_get("/api/state",  api_state_handler)
+    app.router.add_post("/signal",           signal_handler)
+    app.router.add_post("/manual/close",     manual_close_handler)
+    app.router.add_post("/manual/close_all", manual_close_all_handler)
+    app.router.add_get("/",          dashboard_handler)
+    app.router.add_get("/health",    dashboard_handler)
+    app.router.add_get("/api/state", api_state_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -1057,9 +1214,9 @@ async def main():
 
     env_tag = "TESTNET 🧪" if USE_TESTNET else "REAL 🔴"
     log.info("╔══════════════════════════════════════════════════════╗")
-    log.info("║   Futures Executor v3 — Binance USDT Perpetuos        ║")
+    log.info("║   Futures Executor v4 — Binance USDT Perpetuos        ║")
     log.info(f"║   Entorno: {env_tag:<44}║")
-    log.info(f"║   Leverage: {LEVERAGE}x | Poll: {POSITION_POLL_S}s                       ║")
+    log.info(f"║   Leverage: {LEVERAGE}x | Alerta cierre ext.: {POSITION_POLL_S}s              ║")
     log.info("╚══════════════════════════════════════════════════════╝")
 
     try:
@@ -1068,16 +1225,26 @@ async def main():
         log.critical("No se puede importar BinanceAPI desde binance_api_mejorado.py")
         return
 
+    try:
+        from ws import SymbolWebSocketPriceCache
+    except ImportError:
+        log.critical("No se puede importar SymbolWebSocketPriceCache desde ws.py")
+        return
+
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         log.critical("BINANCE_API_KEY y BINANCE_API_SECRET son obligatorias")
         return
 
     try:
         api = BinanceAPI(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=USE_TESTNET)
-        execution_manager = ExecutionManager(api)
+        # Arranca sin símbolos: se suscribe dinámicamente sólo a los
+        # símbolos con posición abierta (ver ExecutionManager._sync_ws_symbols)
+        price_ws = SymbolWebSocketPriceCache([])
+        price_ws.start()
+        execution_manager = ExecutionManager(api, price_ws)
         log.info(f"BinanceAPI inicializada | Testnet: {USE_TESTNET}")
     except Exception as e:
-        log.critical(f"Error inicializando BinanceAPI: {e}")
+        log.critical(f"Error inicializando BinanceAPI / WS: {e}")
         return
 
     await execution_manager.refresh_balance()
@@ -1086,12 +1253,13 @@ async def main():
     async with aiohttp.ClientSession() as sess:
         await send_telegram(
             sess,
-            f"⚡ <b>Futures Executor v3 — {('TESTNET' if USE_TESTNET else 'REAL')} INICIADO</b>\n"
+            f"⚡ <b>Futures Executor v4 — {('TESTNET' if USE_TESTNET else 'REAL')} INICIADO</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 <b>Balance USDT:</b> <code>{execution_manager.balance:.2f} USDT</code>\n"
             f"⚡ <b>Leverage:</b> <code>{LEVERAGE}x</code>\n"
-            f"⏱ <b>Poll posiciones:</b> cada <b>{POSITION_POLL_S}s</b>\n"
+            f"📡 <b>Precios:</b> WebSocket (ws.py) — sin polling\n"
             f"📡 <b>Método apertura:</b> Algo Order → Market Order (fallback)\n"
+            f"🔒 <b>Cierre:</b> sólo por señal de app.py o botón manual del dashboard\n"
             f"🔒 <b>Secreto compartido:</b> configurado ✅\n"
             f"⚠️ <b>Error -2019:</b> posición se registra como asumida",
         )
@@ -1099,7 +1267,7 @@ async def main():
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(
             start_http_server(),
-            ws_price_loop(session),
+            price_sync_loop(),
             position_monitor_loop(session),
         )
 
