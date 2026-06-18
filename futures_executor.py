@@ -41,6 +41,14 @@ WS_API_URL = os.environ.get(
     "wss://testnet.binancefuture.com/ws-fapi/v1" if USE_TESTNET else "wss://ws-fapi.binance.com/ws-fapi/v1",
 )
 
+# La WS API de Binance Futures NO tiene método para cambiar leverage
+# (solo order.place / cancel / query / position*). Cambiar leverage
+# es exclusivamente REST: POST /fapi/v1/leverage.
+REST_FAPI_URL = os.environ.get(
+    "BINANCE_REST_FAPI_URL",
+    "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com",
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -124,6 +132,11 @@ class BinanceAPI:
             and self._reader_task and not self._reader_task.done()
         )
 
+    async def _ensure_http_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        return self._session
+
     async def connect(self):
         if self._ws_alive():
             return
@@ -144,8 +157,7 @@ class BinanceAPI:
             if self._reader_task is not None and not self._reader_task.done():
                 self._reader_task.cancel()
 
-            if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            await self._ensure_http_session()
 
             log.info(f"Conectando Binance WS API → {self.ws_url}")
             self._ws = await self._session.ws_connect(
@@ -254,9 +266,34 @@ class BinanceAPI:
         result = await self._request("account.position", params=params, signed=True)
         return result if isinstance(result, list) else []
 
-    async def set_leverage(self, symbol: str, leverage: int) -> None:
-        # Binance documenta el cambio de leverage como REST; no se usa aquí.
-        log.warning(f"Leverage {leverage}x no se cambia por WS para {symbol}; configúralo manualmente en Binance.")
+    async def set_leverage(self, symbol: str, leverage: int) -> dict:
+        """
+        Cambia el leverage inicial de un símbolo. Esto es exclusivamente
+        REST en Binance (POST /fapi/v1/leverage) — la WS API no expone
+        ningún método equivalente.
+        """
+        session = await self._ensure_http_session()
+        params = {
+            "symbol": symbol,
+            "leverage": int(leverage),
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "recvWindow": 5000,
+        }
+        query = self._payload_string(params)
+        signature = self._sign(params)
+        url = f"{REST_FAPI_URL}/fapi/v1/leverage?{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"REST set_leverage error {resp.status}: {text}")
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {"raw": text}
+            log.info(f"Leverage REST OK: {symbol} → {data.get('leverage', leverage)}x")
+            return data
 
     async def create_market_order(
         self,
@@ -354,6 +391,7 @@ class ExecutionManager:
         self._lock = asyncio.Lock()
         self._balance: float = 0.0
         self._paper_id_map: dict[int, str] = {}
+        self.trading_enabled: bool = True
 
     async def refresh_balance(self):
         try:
@@ -419,10 +457,10 @@ class ExecutionManager:
         side = "BUY" if direction == "LONG" else "SELL"
         position_side = direction if HEDGE_MODE else "BOTH"
 
-        async with self._lock:
-            if symbol in self._trades:
-                log.warning(f"open_trade: {symbol} ya tiene posición registrada — ignorando")
-                return None
+        # Ya NO se bloquea si el símbolo ya tiene una posición abierta: la
+        # señal se manda siempre. Si ya existía una posición en ese símbolo,
+        # se fusiona con la nueva al registrar el trade (ver más abajo),
+        # igual que hace Binance internamente con el neto por símbolo.
 
         order_assumed = False
         entry_order_id = ""
@@ -463,35 +501,78 @@ class ExecutionManager:
                 return None
 
         async with self._lock:
-            if symbol in self._trades:
-                log.warning(f"open_trade: race condition — {symbol} ya registrado")
-                return None
+            existing = self._trades.get(symbol)
 
-            self._counter += 1
-            trade = Trade(
-                id=self._counter,
-                symbol=symbol,
-                direction=direction,
-                entry_price=filled_price,
-                quantity=quantity,
-                open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                leverage=LEVERAGE,
-                paper_trade_id=paper_trade_id,
-                entry_order_id=entry_order_id,
-                current_price=filled_price,
-                order_assumed=order_assumed,
-            )
-            self._trades[symbol] = trade
-            self._paper_id_map[paper_trade_id] = symbol
+            if existing is None:
+                self._counter += 1
+                trade = Trade(
+                    id=self._counter,
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=filled_price,
+                    quantity=quantity,
+                    open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    leverage=LEVERAGE,
+                    paper_trade_id=paper_trade_id,
+                    entry_order_id=entry_order_id,
+                    current_price=filled_price,
+                    order_assumed=order_assumed,
+                )
+                self._trades[symbol] = trade
+                self._paper_id_map[paper_trade_id] = symbol
+                action_tag = "ABIERTO"
+            else:
+                # Ya había una posición en este símbolo: se fusiona usando
+                # cantidad con signo (+ LONG / - SHORT), igual que el neto
+                # real que mantiene Binance por símbolo.
+                old_signed = existing.quantity if existing.direction == "LONG" else -existing.quantity
+                delta_signed = quantity if direction == "LONG" else -quantity
+                new_signed = old_signed + delta_signed
+
+                if abs(new_signed) < 1e-9:
+                    # La señal opuesta neteó la posición a cero -> queda cerrada
+                    existing.status = "NETTED"
+                    existing.close_price = filled_price
+                    existing.close_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    existing.update_unrealized(filled_price)
+                    del self._trades[symbol]
+                    self._paper_id_map.pop(existing.paper_trade_id, None)
+                    self._closed.append(existing)
+                    log.info(f"open_trade: {symbol} neteado a 0 con esta señal — posición cerrada")
+                    trade = None
+                    action_tag = "NETEADO"
+                else:
+                    new_direction = "LONG" if new_signed > 0 else "SHORT"
+                    new_qty = abs(new_signed)
+                    if new_direction == existing.direction:
+                        # Misma dirección: se promedia el precio de entrada
+                        existing.entry_price = (
+                            (existing.entry_price * existing.quantity) + (filled_price * quantity)
+                        ) / new_qty
+                        action_tag = "AMPLIADO"
+                    else:
+                        # Dirección invertida: el remanente entra al precio nuevo
+                        existing.entry_price = filled_price
+                        action_tag = "INVERTIDO"
+                    existing.direction = new_direction
+                    existing.quantity = new_qty
+                    existing.entry_order_id = entry_order_id
+                    existing.order_assumed = existing.order_assumed or order_assumed
+                    self._paper_id_map[paper_trade_id] = symbol
+                    trade = existing
 
         self._sync_ws_symbols()
+        await self.refresh_balance()
+
+        if trade is None:
+            return None
 
         assumed_tag = " [ASUMIDA — MARGIN INSUF]" if order_assumed else ""
         log.info(
-            f"[REAL #{trade.id}] ABIERTO {direction} {symbol} @ ${filled_price} | Qty: {quantity} | Lev: {LEVERAGE}x | "
-            f"OrderId: {entry_order_id} | Paper#{paper_trade_id}{assumed_tag}"
+            f"[REAL #{trade.id}] {action_tag} {trade.direction} {symbol} @ ${filled_price} | "
+            f"Qty total: {trade.quantity} | Lev: {LEVERAGE}x | OrderId: {entry_order_id} | "
+            f"Paper#{paper_trade_id}{assumed_tag}"
         )
-        await self.refresh_balance()
         return trade
 
     async def close_trade(self, trade: Trade, close_price: float, reason: str) -> bool:
@@ -660,6 +741,7 @@ def build_close_message(trade: Trade) -> str:
         "MAIN_BOT": ("🔄", "CIERRE SEÑAL PRINCIPAL"),
         "CLOSE_ALL": ("🛑", "CIERRE GLOBAL (SEÑAL)"),
         "MANUAL": ("🖐", "CIERRE MANUAL (DASHBOARD)"),
+        "NETTED": ("➖", "NETEADA POR SEÑAL OPUESTA"),
     }
     emoji, reason_str = reason_map.get(trade.status, ("⚠️", trade.status))
     dir_str = "🟢 LONG" if trade.direction == "LONG" else "🔴 SHORT"
@@ -771,6 +853,11 @@ async def signal_handler(request: web.Request) -> web.Response:
             executor_status["signals_rejected"] += 1
             return web.json_response({"ok": False, "error": "missing or invalid open params"}, status=400)
 
+        if not execution_manager.trading_enabled:
+            executor_status["signals_rejected"] += 1
+            log.warning(f"Señal OPEN ignorada para {symbol} — trading pausado manualmente desde el dashboard")
+            return web.json_response({"ok": False, "error": "trading pausado manualmente desde el dashboard"}, status=200)
+
         async def _do_open():
             trade = await execution_manager.open_trade(symbol, direction, price, quantity, paper_trade_id=trade_id)
             if trade:
@@ -879,6 +966,35 @@ async def manual_close_all_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "action": "manual_close_all", "positions_targeted": total_open})
 
 
+async def manual_toggle_trading_handler(request: web.Request) -> web.Response:
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    execution_manager.trading_enabled = not execution_manager.trading_enabled
+    state = "ACTIVADO 🟢" if execution_manager.trading_enabled else "PAUSADO 🔴 (no se enviarán nuevas posiciones)"
+    log.warning(f"Trading {state} manualmente desde el dashboard")
+    return web.json_response({"ok": True, "trading_enabled": execution_manager.trading_enabled})
+
+
+async def manual_set_leverage_handler(request: web.Request) -> web.Response:
+    global LEVERAGE
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        data = await request.json()
+        new_lev = int(data.get("leverage", 0))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if new_lev < 1 or new_lev > 125:
+        return web.json_response({"ok": False, "error": "leverage debe estar entre 1 y 125"}, status=400)
+
+    LEVERAGE = new_lev
+    log.warning(f"Leverage por defecto cambiado desde el dashboard a {LEVERAGE}x (aplica a próximas posiciones)")
+    return web.json_response({"ok": True, "leverage": LEVERAGE})
+
+
 async def api_state_handler(request: web.Request) -> web.Response:
     em = execution_manager
 
@@ -923,6 +1039,7 @@ async def api_state_handler(request: web.Request) -> web.Response:
         "executor_status": executor_status,
         "ws_symbols": ", ".join(sorted(em.active_symbols)) or "ninguno",
         "leverage": LEVERAGE,
+        "trading_enabled": em.trading_enabled,
         "testnet": USE_TESTNET,
     })
 
@@ -950,6 +1067,14 @@ async function refresh() {
     q('last_sig').textContent = d.executor_status.last_signal_time + ' — ' + d.executor_status.last_signal_detail;
     q('ws_sym').textContent = 'WS activo (ws api): ' + d.ws_symbols;
     q('close_all_btn').disabled = d.open_count === 0;
+
+    const tState = q('trading_state');
+    const tBtn = q('trading_toggle_btn');
+    if (tState && tBtn) {
+      tState.textContent = d.trading_enabled ? '🟢 ACTIVO' : '🔴 PAUSADO';
+      tState.style.color = d.trading_enabled ? '#3fb950' : '#f85149';
+      tBtn.textContent = d.trading_enabled ? '⏸ Pausar nuevas posiciones' : '▶ Reactivar nuevas posiciones';
+    }
 
     const ob = document.getElementById('open_body');
     if (!d.open_trades.length) {
@@ -1017,6 +1142,39 @@ async function closeAllTrades() {
   } catch(e) { alert('Error de red al cerrar todas las posiciones'); }
 }
 
+async function toggleTrading() {
+  const active = document.getElementById('trading_state').textContent.includes('ACTIVO');
+  const msg = active
+    ? '¿Pausar el envío de NUEVAS posiciones? Las posiciones ya abiertas seguirán gestionándose con normalidad (cierres, PnL, etc).'
+    : '¿Reactivar el envío de nuevas posiciones?';
+  if (!confirm(msg)) return;
+  try {
+    const r = await fetch('/manual/toggle_trading', {
+      method: 'POST',
+      headers: {'X-Dashboard-Token': DASH_TOKEN}
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    refresh();
+  } catch(e) { alert('Error de red al cambiar el estado de trading'); }
+}
+
+async function setLeverage() {
+  const val = parseInt(document.getElementById('lev_input').value, 10);
+  if (!val || val < 1 || val > 125) { alert('Leverage inválido (debe ser entre 1 y 125)'); return; }
+  if (!confirm('¿Cambiar el leverage por defecto a ' + val + 'x para las próximas posiciones?')) return;
+  try {
+    const r = await fetch('/manual/set_leverage', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify({leverage: val})
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    refresh();
+  } catch(e) { alert('Error de red al cambiar el leverage'); }
+}
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -1061,13 +1219,17 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     .btn-close{{background:#f85149;color:#fff;border:none;border-radius:4px;padding:.25rem .6rem;font-size:.7rem;cursor:pointer}}
     .btn-close-all{{background:#f85149;color:#fff;border:none;border-radius:5px;padding:.4rem .9rem;font-size:.78rem;cursor:pointer;font-weight:bold}}
     .btn-close-all:disabled{{background:#30363d;color:#6e7681;cursor:not-allowed}}
+    .btn-toggle{{border:none;border-radius:5px;padding:.35rem .7rem;font-size:.72rem;cursor:pointer;font-weight:bold;width:100%;margin-top:.4rem;background:#30363d;color:#f0f6fc}}
+    .lev-row{{display:flex;gap:.35rem;margin-top:.4rem}}
+    .lev-row input{{width:55px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:.2rem .3rem;font-size:.8rem}}
+    .lev-row button{{background:#58a6ff;color:#0d1117;border:none;border-radius:4px;padding:.2rem .5rem;font-size:.72rem;cursor:pointer;font-weight:bold}}
   </style>
 </head>
 <body>
   <h1>⚡ Futures Executor WS — Binance USDT Perpetuos [{env}]</h1>
   <div class="info-banner">
     📡 Trading por <b>WebSocket API</b>. Precios en tiempo real vía <b>ws.py</b>. 
-    <b>No hay REST para órdenes.</b> Leverage configurado: <b>{LEVERAGE}x</b>{' | Modo Hedge' if HEDGE_MODE else ' | Modo One-way'}.
+    Cambios de leverage por <b>REST</b> (la WS API no lo soporta). Leverage configurado: <b>{LEVERAGE}x</b>{' | Modo Hedge' if HEDGE_MODE else ' | Modo One-way'}.
   </div>
 
   <div class="grid">
@@ -1077,7 +1239,18 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     <div class="card"><div class="label">PnL no realizado</div><div class="value" id="upnl" style="color:{up_col}">{em.unrealized_pnl:+.4f} USDT</div></div>
     <div class="card"><div class="label">Win Rate</div><div class="value" id="wr">{wr_str} ({wins}✅/{losses}❌)</div></div>
     <div class="card"><div class="label">Posiciones abiertas</div><div class="value" id="pos">{len(em.open_trades)} — {len(em.open_longs)}L / {len(em.open_shorts)}S</div></div>
-    <div class="card"><div class="label">Leverage</div><div class="value" id="lev">{LEVERAGE}x</div></div>
+    <div class="card">
+      <div class="label">Leverage</div><div class="value" id="lev">{LEVERAGE}x</div>
+      <div class="lev-row">
+        <input id="lev_input" type="number" min="1" max="125" value="{LEVERAGE}">
+        <button onclick="setLeverage()">Aplicar</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Trading</div>
+      <div class="value" id="trading_state" style="color:{'#3fb950' if em.trading_enabled else '#f85149'}">{'🟢 ACTIVO' if em.trading_enabled else '🔴 PAUSADO'}</div>
+      <button class="btn-toggle" id="trading_toggle_btn" onclick="toggleTrading()">{'⏸ Pausar nuevas posiciones' if em.trading_enabled else '▶ Reactivar nuevas posiciones'}</button>
+    </div>
   </div>
 
   <h2>📡 Señales Recibidas</h2>
@@ -1128,6 +1301,8 @@ async def start_http_server():
     app.router.add_post("/signal", signal_handler)
     app.router.add_post("/manual/close", manual_close_handler)
     app.router.add_post("/manual/close_all", manual_close_all_handler)
+    app.router.add_post("/manual/toggle_trading", manual_toggle_trading_handler)
+    app.router.add_post("/manual/set_leverage", manual_set_leverage_handler)
     app.router.add_get("/", dashboard_handler)
     app.router.add_get("/health", dashboard_handler)
     app.router.add_get("/api/state", api_state_handler)
