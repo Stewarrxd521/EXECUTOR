@@ -11,6 +11,7 @@ import asyncio
 import aiohttp
 from aiohttp import web
 import logging
+import math
 from datetime import datetime, timezone
 import os
 import json
@@ -36,6 +37,17 @@ HEDGE_MODE      = os.environ.get("HEDGE_MODE", "false").lower() == "true"
 PORT            = int(os.environ.get("PORT", "10000"))
 POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
 
+# Notional mínimo (en USDT) que Binance Futures exige por orden. Aunque
+# muchos símbolos reportan 5.0 en su filtro NOTIONAL/MIN_NOTIONAL, dejamos
+# 5.1 como piso de seguridad (igual que pide el usuario) para no quedar
+# justo en el límite y que un mínimo desliz de precio la rechace.
+MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
+
+# Colchón extra (%) que se suma al notional mínimo al recalcular la
+# cantidad, para absorber el movimiento de precio entre el momento en que
+# se calcula la orden y el momento en que Binance la matchea.
+NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
+
 WS_API_URL = os.environ.get(
     "BINANCE_WS_FAPI_URL",
     "wss://testnet.binancefuture.com/ws-fapi/v1" if USE_TESTNET else "wss://ws-fapi.binance.com/ws-fapi/v1",
@@ -55,6 +67,89 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("Executor")
+
+
+# ══════════════════════════════════════════════════════════
+#  AJUSTE DE CANTIDAD / NOTIONAL MÍNIMO
+# ══════════════════════════════════════════════════════════
+def _step_decimals(step: float) -> int:
+    """Cantidad de decimales implicada por un stepSize (p.ej. 0.001 -> 3)."""
+    if step <= 0:
+        return 8
+    s = f"{step:.10f}".rstrip("0")
+    if "." not in s:
+        return 0
+    return len(s.split(".")[1])
+
+
+def floor_to_step(value: float, step: float) -> float:
+    """Redondea `value` hacia abajo al múltiplo de `step` más cercano,
+    evitando los errores típicos de coma flotante (0.1 + 0.2, etc.)."""
+    if step <= 0:
+        return value
+    decimals = _step_decimals(step)
+    units = math.floor(round(value / step, 8))
+    return round(units * step, decimals)
+
+
+def ceil_to_step(value: float, step: float) -> float:
+    """Redondea `value` hacia arriba al múltiplo de `step` más cercano."""
+    if step <= 0:
+        return value
+    decimals = _step_decimals(step)
+    units = math.ceil(round(value / step, 8))
+    return round(units * step, decimals)
+
+
+def format_qty(value: float, step: float) -> str:
+    """Formatea la cantidad con la cantidad de decimales del stepSize,
+    sin notación científica ni decimales innecesarios."""
+    decimals = _step_decimals(step)
+    return f"{value:.{decimals}f}" if decimals > 0 else str(int(value))
+
+
+def resolve_safe_quantity(
+    desired_notional: float,
+    price: float,
+    filters: dict,
+    extra_buffer_pct: float = 0.0,
+) -> tuple[float, float]:
+    """
+    Calcula la cantidad final a enviar a Binance a partir de un notional
+    (tamaño de orden en USDT) objetivo y el precio de referencia, en vez
+    de confiar ciegamente en la `quantity` que llega en la señal.
+
+    - Convierte notional -> quantity con el precio más fresco disponible.
+    - Redondea al stepSize (LOT_SIZE) del símbolo para evitar -1111/-1013.
+    - Si el notional resultante queda por debajo del mínimo exigido
+      (MIN_NOTIONAL_USDT, con colchón opcional), sube la cantidad al
+      siguiente múltiplo de stepSize que sí lo cumpla.
+
+    Devuelve (quantity, notional_final).
+    """
+    if price <= 0:
+        raise ValueError("price debe ser > 0 para calcular la cantidad")
+
+    step = float(filters.get("stepSize", 0.001)) or 0.001
+    min_qty = float(filters.get("minQty", step))
+    min_notional = max(float(filters.get("min_notional", MIN_NOTIONAL_USDT)), MIN_NOTIONAL_USDT)
+    min_notional *= (1 + extra_buffer_pct / 100.0)
+
+    raw_qty = desired_notional / price
+    qty = floor_to_step(raw_qty, step)
+    if qty < min_qty:
+        qty = min_qty
+
+    notional = qty * price
+    if notional < min_notional:
+        # Subimos al siguiente múltiplo de step que cubra el notional mínimo.
+        needed_qty = min_notional / price
+        qty = ceil_to_step(needed_qty, step)
+        if qty < min_qty:
+            qty = min_qty
+        notional = qty * price
+
+    return qty, notional
 
 
 # ══════════════════════════════════════════════════════════
@@ -113,6 +208,12 @@ class BinanceAPI:
         self._connect_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future] = {}
         self._closed = False
+
+        # Cache de filtros por símbolo (stepSize/minQty/minNotional) leídos
+        # de /fapi/v1/exchangeInfo. Se usa para calcular la cantidad real a
+        # enviar a partir del tamaño de orden deseado en USDT.
+        self._symbol_filters_cache: dict[str, dict] = {}
+        self._symbol_filters_lock = asyncio.Lock()
 
     @staticmethod
     def _payload_string(params: dict) -> str:
@@ -295,11 +396,75 @@ class BinanceAPI:
             log.info(f"Leverage REST OK: {symbol} → {data.get('leverage', leverage)}x")
             return data
 
+    async def get_symbol_filters(self, symbol: str, force_refresh: bool = False) -> dict:
+        """
+        Devuelve (y cachea en memoria) los filtros LOT_SIZE / NOTIONAL del
+        símbolo desde /fapi/v1/exchangeInfo (REST — la WS API no expone
+        exchangeInfo). Indispensable para no enviar una `quantity` que
+        Binance rechace por precisión o por quedar debajo del notional
+        mínimo (5.1 USDT).
+
+        Si la consulta falla (red caída, etc.) se devuelven valores por
+        defecto conservadores en vez de lanzar, para no bloquear el envío
+        de órdenes por un problema de exchangeInfo.
+        """
+        if not force_refresh:
+            cached = self._symbol_filters_cache.get(symbol)
+            if cached:
+                return cached
+
+        async with self._symbol_filters_lock:
+            if not force_refresh:
+                cached = self._symbol_filters_cache.get(symbol)
+                if cached:
+                    return cached
+
+            defaults = {
+                "stepSize": 0.001,
+                "minQty": 0.001,
+                "qty_precision": 3,
+                "min_notional": MIN_NOTIONAL_USDT,
+            }
+
+            try:
+                session = await self._ensure_http_session()
+                url = f"{REST_FAPI_URL}/fapi/v1/exchangeInfo"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        raise RuntimeError(f"REST exchangeInfo error {resp.status}: {text}")
+                    data = json.loads(text)
+
+                result = dict(defaults)
+                for s in data.get("symbols", []):
+                    if s.get("symbol") != symbol:
+                        continue
+                    result["qty_precision"] = int(s.get("quantityPrecision", result["qty_precision"]))
+                    for f in s.get("filters", []):
+                        ftype = f.get("filterType")
+                        if ftype == "LOT_SIZE":
+                            result["stepSize"] = float(f.get("stepSize", result["stepSize"]))
+                            result["minQty"] = float(f.get("minQty", result["minQty"]))
+                        elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
+                            notional = f.get("notional") or f.get("minNotional")
+                            if notional is not None:
+                                result["min_notional"] = float(notional)
+                    break
+
+                # Piso de seguridad: nunca operar por debajo de MIN_NOTIONAL_USDT
+                # aunque exchangeInfo reporte un valor menor.
+                result["min_notional"] = max(result["min_notional"], MIN_NOTIONAL_USDT)
+                self._symbol_filters_cache[symbol] = result
+                return result
+            except Exception as e:
+                log.warning(f"get_symbol_filters: no se pudo leer exchangeInfo para {symbol} ({e}); usando valores por defecto")
+                return defaults
+
     async def create_market_order(
         self,
         symbol: str,
         side: str,
-        quantity: float,
+        quantity,
         position_side: Optional[str] = None,
         reduce_only: bool = False,
         new_order_resp_type: str = "RESULT",
@@ -308,7 +473,10 @@ class BinanceAPI:
             "symbol": symbol,
             "side": side,
             "type": "MARKET",
-            "quantity": quantity,
+            # Binance WS API exige los DECIMAL (price, quantity, etc.) como
+            # strings, no como floats — enviar float puede introducir
+            # ruido de precisión (p.ej. 0.1 + 0.2) que dispara -1111/-1013.
+            "quantity": str(quantity),
             "newOrderRespType": new_order_resp_type,
         }
         if position_side:
@@ -445,6 +613,65 @@ class ExecutionManager:
         except Exception as e:
             log.error(f"_sync_ws_symbols: {e}")
 
+    async def _place_market_order_safe(
+        self,
+        symbol: str,
+        side: str,
+        qty_str: str,
+        position_side: Optional[str],
+        filters: dict,
+        ref_price: float,
+        reduce_only: bool = False,
+    ) -> dict:
+        """
+        Envía la orden MARKET con la quantity ya calculada. Si Binance la
+        rechaza específicamente por notional insuficiente (-4164) o por
+        precisión/stepSize (-1013 / -1111) — típico cuando el precio se
+        movió justo entre el cálculo y el envío — se recalcula la
+        cantidad con un colchón de seguridad mayor sobre el notional
+        mínimo y se reintenta UNA sola vez con un precio fresco.
+        """
+        try:
+            return await self.api.create_market_order(
+                symbol=symbol,
+                side=side,
+                quantity=qty_str,
+                position_side=position_side,
+                reduce_only=reduce_only,
+                new_order_resp_type="RESULT",
+            )
+        except Exception as e:
+            err = str(e)
+            is_notional_or_precision = any(code in err for code in ("-4164", "-1013", "-1111", "Notional", "precision"))
+            if not is_notional_or_precision:
+                raise
+
+            log.warning(f"_place_market_order_safe: {symbol} rechazada ({err}); recalculando con colchón mayor y reintentando una vez")
+
+            try:
+                fresh_price = float(self.price_ws.get_price(symbol) or 0.0) or ref_price
+            except Exception:
+                fresh_price = ref_price
+
+            # Doble colchón de seguridad en el reintento (p.ej. 2% -> ~10%).
+            retry_buffer = max(NOTIONAL_SAFETY_BUFFER_PCT * 5, 10.0)
+            min_notional = max(float(filters.get("min_notional", MIN_NOTIONAL_USDT)), MIN_NOTIONAL_USDT)
+            target_notional = min_notional * (1 + retry_buffer / 100.0)
+
+            retry_qty, retry_notional = resolve_safe_quantity(target_notional, fresh_price, filters)
+            retry_qty_str = format_qty(retry_qty, filters.get("stepSize", 0.001))
+
+            log.info(f"_place_market_order_safe: reintento {symbol} qty={retry_qty_str} (notional≈${retry_notional:.4f}, precio={fresh_price})")
+
+            return await self.api.create_market_order(
+                symbol=symbol,
+                side=side,
+                quantity=retry_qty_str,
+                position_side=position_side,
+                reduce_only=reduce_only,
+                new_order_resp_type="RESULT",
+            )
+
     async def open_trade(
         self,
         symbol: str,
@@ -466,20 +693,61 @@ class ExecutionManager:
         entry_order_id = ""
         filled_price = price
 
+        # ── Cálculo de la cantidad real a enviar ──────────────────────
+        # La señal trae price + quantity, que en conjunto definen el
+        # TAMAÑO DE ORDEN deseado en USDT (notional = price * quantity).
+        # Por liquidez/velocidad del precio, para cuando la orden se
+        # envía ese precio puede haberse movido, dejando la quantity
+        # original por debajo del notional mínimo que exige Binance
+        # (5.1 USDT). En vez de enviar la quantity tal cual, recalculamos
+        # la cantidad a partir del notional deseado y del precio más
+        # fresco disponible (caché WS de precios), y la ajustamos al
+        # stepSize del símbolo garantizando que el notional final nunca
+        # quede por debajo del mínimo.
+        desired_notional = price * quantity
+        live_price = 0.0
+        try:
+            live_price = float(self.price_ws.get_price(symbol) or 0.0)
+        except Exception:
+            live_price = 0.0
+        ref_price = live_price if live_price > 0 else price
+
+        try:
+            filters = await self.api.get_symbol_filters(symbol)
+        except Exception as e:
+            log.warning(f"open_trade: no se pudieron leer filtros de {symbol}, usando defaults ({e})")
+            filters = {"stepSize": 0.001, "minQty": 0.001, "min_notional": MIN_NOTIONAL_USDT}
+
+        try:
+            send_qty, send_notional = resolve_safe_quantity(
+                desired_notional, ref_price, filters, extra_buffer_pct=NOTIONAL_SAFETY_BUFFER_PCT
+            )
+        except Exception as e:
+            log.error(f"open_trade: no se pudo calcular quantity segura para {symbol}: {e}")
+            return None
+
+        if abs(send_qty - quantity) > 1e-12:
+            log.info(
+                f"open_trade: quantity ajustada para {symbol} → señal={quantity} (notional≈${desired_notional:.4f}) "
+                f"→ enviada={send_qty} (notional≈${send_notional:.4f}, precio_ref={ref_price})"
+            )
+        quantity = send_qty
+
         try:
             await self.api.set_leverage(symbol, LEVERAGE)
         except Exception as e:
             log.warning(f"open_trade: no se pudo aplicar leverage para {symbol}: {e}")
 
-        log.info(f"open_trade: enviando MARKET por WS → {symbol} {side} qty={quantity}")
+        qty_str = format_qty(quantity, filters.get("stepSize", 0.001))
+        log.info(f"open_trade: enviando MARKET por WS → {symbol} {side} qty={qty_str} (notional≈${send_notional:.4f})")
         try:
-            result = await self.api.create_market_order(
+            result = await self._place_market_order_safe(
                 symbol=symbol,
                 side=side,
-                quantity=quantity,
+                qty_str=qty_str,
                 position_side=position_side,
-                reduce_only=False,
-                new_order_resp_type="RESULT",
+                filters=filters,
+                ref_price=ref_price,
             )
             entry_order_id = str(result.get("orderId", result.get("clientOrderId", "WS_ORDER")))
             avg = result.get("avgPrice") or result.get("price")
@@ -487,6 +755,14 @@ class ExecutionManager:
                 avg_f = float(avg)
                 if avg_f > 0:
                     filled_price = avg_f
+            except Exception:
+                pass
+            # Si la cantidad final se ajustó en el reintento, refleja el valor
+            # realmente ejecutado en el trade que se registra.
+            try:
+                executed_qty = float(result.get("origQty") or result.get("executedQty") or quantity)
+                if executed_qty > 0:
+                    quantity = executed_qty
             except Exception:
                 pass
             log.info(f"MARKET WS OK: {symbol} {side} qty={quantity} id={entry_order_id} avg={filled_price}")
