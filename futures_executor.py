@@ -1,4 +1,3 @@
-
 """
 futures_executor_ws.py — Executor de Futuros Binance 100% WebSocket para trading
 
@@ -119,13 +118,31 @@ class BinanceAPI:
         payload = self._payload_string(params)
         return hmac.new(self.api_secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
+    def _ws_alive(self) -> bool:
+        return bool(
+            self._ws and not self._ws.closed
+            and self._reader_task and not self._reader_task.done()
+        )
+
     async def connect(self):
-        if self._ws and not self._ws.closed:
+        if self._ws_alive():
             return
 
         async with self._connect_lock:
-            if self._ws and not self._ws.closed:
+            if self._ws_alive():
                 return
+
+            # Limpiar conexión muerta (el reader pudo haber terminado sin
+            # cerrar el socket explícitamente — quedaba "zombie")
+            if self._ws is not None:
+                try:
+                    if not self._ws.closed:
+                        await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+            if self._reader_task is not None and not self._reader_task.done():
+                self._reader_task.cancel()
 
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -135,7 +152,6 @@ class BinanceAPI:
                 self.ws_url,
                 autoping=True,
                 heartbeat=30,
-                receive_timeout=30,
                 max_msg_size=0,
             )
             self._reader_task = asyncio.create_task(self._reader())
@@ -180,7 +196,7 @@ class BinanceAPI:
                 fut.set_exception(err)
         self._pending.clear()
 
-    async def _request(self, method: str, params: Optional[dict] = None, signed: bool = False, timeout: float = 20.0) -> dict:
+    async def _request(self, method: str, params: Optional[dict] = None, signed: bool = False, timeout: float = 20.0, _retry: bool = True) -> dict:
         await self.connect()
 
         params = dict(params or {})
@@ -202,14 +218,24 @@ class BinanceAPI:
         try:
             assert self._ws is not None
             await self._ws.send_json(payload)
-        except Exception:
+        except Exception as e:
             self._pending.pop(req_id, None)
+            if _retry:
+                log.warning(f"_request: fallo enviando ({e!r}); reconectando y reintentando una vez")
+                return await self._request(method, params, signed=False, timeout=timeout, _retry=False)
             raise
 
         try:
             response = await asyncio.wait_for(fut, timeout=timeout)
-        except Exception:
+        except Exception as e:
             self._pending.pop(req_id, None)
+            # Si el future nunca se resolvió, lo más probable es que el
+            # reader haya muerto sin que connect() lo detectara a tiempo.
+            # Forzamos a considerar muerta la conexión y reintentamos
+            # una vez con una conexión nueva, en vez de fallar en silencio.
+            if _retry and not self._ws_alive():
+                log.warning(f"_request: sin respuesta ({e!r}); conexión muerta, reconectando y reintentando una vez")
+                return await self._request(method, params, signed=False, timeout=timeout, _retry=False)
             raise
 
         if response.get("status") != 200:
