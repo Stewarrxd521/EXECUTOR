@@ -75,7 +75,7 @@ log = logging.getLogger("Executor")
 def _step_decimals(step: float) -> int:
     """Cantidad de decimales implicada por un stepSize (p.ej. 0.001 -> 3)."""
     if step <= 0:
-        return 8
+        return 6
     s = f"{step:.10f}".rstrip("0")
     if "." not in s:
         return 0
@@ -88,7 +88,7 @@ def floor_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
     decimals = _step_decimals(step)
-    units = math.floor(round(value / step, 8))
+    units = math.floor(round(value / step, 6))
     return round(units * step, decimals)
 
 
@@ -97,7 +97,7 @@ def ceil_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
     decimals = _step_decimals(step)
-    units = math.ceil(round(value / step, 8))
+    units = math.ceil(round(value / step, 6))
     return round(units * step, decimals)
 
 
