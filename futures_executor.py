@@ -75,7 +75,7 @@ log = logging.getLogger("Executor")
 def _step_decimals(step: float) -> int:
     """Cantidad de decimales implicada por un stepSize (p.ej. 0.001 -> 3)."""
     if step <= 0:
-        return 0
+        return 8
     s = f"{step:.10f}".rstrip("0")
     if "." not in s:
         return 0
@@ -88,7 +88,7 @@ def floor_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
     decimals = _step_decimals(step)
-    units = math.floor(round(value / step, 0))
+    units = math.floor(round(value / step, 8))
     return round(units * step, decimals)
 
 
@@ -97,7 +97,7 @@ def ceil_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
     decimals = _step_decimals(step)
-    units = math.ceil(round(value / step, 0))
+    units = math.ceil(round(value / step, 8))
     return round(units * step, decimals)
 
 
@@ -414,15 +414,25 @@ class BinanceAPI:
 
     async def get_symbol_filters(self, symbol: str, force_refresh: bool = False) -> dict:
         """
-        Devuelve (y cachea en memoria) los filtros LOT_SIZE / NOTIONAL del
+        Devuelve (y cachea en memoria) los filtros de cantidad/notional del
         símbolo desde /fapi/v1/exchangeInfo (REST — la WS API no expone
         exchangeInfo). Indispensable para no enviar una `quantity` que
         Binance rechace por precisión o por quedar debajo del notional
         mínimo (5.1 USDT).
 
-        Si la consulta falla (red caída, etc.) se devuelven valores por
-        defecto conservadores en vez de lanzar, para no bloquear el envío
-        de órdenes por un problema de exchangeInfo.
+        Para órdenes MARKET (que es el único tipo que usa este executor),
+        Binance valida la cantidad contra el filtro MARKET_LOT_SIZE, que en
+        algunos símbolos es distinto (más grueso) que LOT_SIZE. Por eso se
+        prioriza MARKET_LOT_SIZE; si no existe, se usa LOT_SIZE; y si
+        ninguno aparece, se deriva el step a partir de quantityPrecision
+        (siempre presente), en vez de asumir un default genérico de 0.001
+        que rompe a los símbolos que exigen cantidades enteras.
+
+        Solo se cachea el resultado si el símbolo realmente se encontró en
+        exchangeInfo. Si no se encuentra o la consulta falla, se devuelven
+        valores por defecto SIN cachearlos, para que la próxima señal de
+        ese símbolo vuelva a intentarlo en vez de quedar con datos
+        incorrectos de forma permanente.
         """
         if not force_refresh:
             cached = self._symbol_filters_cache.get(symbol)
@@ -451,26 +461,52 @@ class BinanceAPI:
                         raise RuntimeError(f"REST exchangeInfo error {resp.status}: {text}")
                     data = json.loads(text)
 
+                symbol_found = False
                 result = dict(defaults)
                 for s in data.get("symbols", []):
                     if s.get("symbol") != symbol:
                         continue
-                    result["qty_precision"] = int(s.get("quantityPrecision", result["qty_precision"]))
+                    symbol_found = True
+
+                    qty_precision = int(s.get("quantityPrecision", result["qty_precision"]))
+                    result["qty_precision"] = qty_precision
+                    # Fallback derivado de quantityPrecision: si ningún
+                    # filtro de lote aparece más abajo, este es el step
+                    # correcto (10^-precision), no el default genérico.
+                    result["stepSize"] = round(10 ** (-qty_precision), 10)
+                    result["minQty"] = result["stepSize"]
+
+                    lot_size_filter = None
+                    market_lot_size_filter = None
                     for f in s.get("filters", []):
                         ftype = f.get("filterType")
                         if ftype == "LOT_SIZE":
-                            result["stepSize"] = float(f.get("stepSize", result["stepSize"]))
-                            result["minQty"] = float(f.get("minQty", result["minQty"]))
+                            lot_size_filter = f
+                        elif ftype == "MARKET_LOT_SIZE":
+                            market_lot_size_filter = f
                         elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
                             notional = f.get("notional") or f.get("minNotional")
                             if notional is not None:
                                 result["min_notional"] = float(notional)
+
+                    # Las órdenes que envía este executor son siempre MARKET,
+                    # así que MARKET_LOT_SIZE es el filtro que Binance
+                    # realmente valida; LOT_SIZE queda como respaldo.
+                    chosen = market_lot_size_filter or lot_size_filter
+                    if chosen:
+                        result["stepSize"] = float(chosen.get("stepSize", result["stepSize"]))
+                        result["minQty"] = float(chosen.get("minQty", result["minQty"]))
                     break
+
+                if not symbol_found:
+                    log.error(f"get_symbol_filters: símbolo {symbol} no encontrado en exchangeInfo — usando defaults SIN cachear, se reintentará en la próxima señal")
+                    return defaults
 
                 # Piso de seguridad: nunca operar por debajo de MIN_NOTIONAL_USDT
                 # aunque exchangeInfo reporte un valor menor.
                 result["min_notional"] = max(result["min_notional"], MIN_NOTIONAL_USDT)
                 self._symbol_filters_cache[symbol] = result
+                log.info(f"get_symbol_filters: {symbol} → stepSize={result['stepSize']} minQty={result['minQty']} min_notional={result['min_notional']}")
                 return result
             except Exception as e:
                 log.warning(f"get_symbol_filters: no se pudo leer exchangeInfo para {symbol} ({e}); usando valores por defecto")
