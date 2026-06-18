@@ -215,6 +215,10 @@ class BinanceAPI:
         self._symbol_filters_cache: dict[str, dict] = {}
         self._symbol_filters_lock = asyncio.Lock()
 
+        # Cache de leverage aplicado por símbolo, para no repetir la
+        # llamada REST de set_leverage si el valor no cambió (velocidad).
+        self._leverage_cache: dict[str, int] = {}
+
     @staticmethod
     def _payload_string(params: dict) -> str:
         return "&".join(
@@ -367,16 +371,27 @@ class BinanceAPI:
         result = await self._request("account.position", params=params, signed=True)
         return result if isinstance(result, list) else []
 
-    async def set_leverage(self, symbol: str, leverage: int) -> dict:
+    async def set_leverage(self, symbol: str, leverage: int, force: bool = False) -> dict:
         """
         Cambia el leverage inicial de un símbolo. Esto es exclusivamente
         REST en Binance (POST /fapi/v1/leverage) — la WS API no expone
         ningún método equivalente.
+
+        Por velocidad: si el leverage solicitado es el mismo que ya está
+        cacheado para este símbolo (porque ya se aplicó en una operación
+        anterior), se omite la llamada REST por completo en vez de
+        repetirla en cada señal — ese round-trip de red no aporta nada si
+        el valor no cambió, y es puro tiempo perdido en el camino crítico
+        de cada orden.
         """
+        leverage = int(leverage)
+        if not force and self._leverage_cache.get(symbol) == leverage:
+            return {"symbol": symbol, "leverage": leverage, "cached": True}
+
         session = await self._ensure_http_session()
         params = {
             "symbol": symbol,
-            "leverage": int(leverage),
+            "leverage": leverage,
             "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
             "recvWindow": 5000,
         }
@@ -394,6 +409,7 @@ class BinanceAPI:
             except Exception:
                 data = {"raw": text}
             log.info(f"Leverage REST OK: {symbol} → {data.get('leverage', leverage)}x")
+            self._leverage_cache[symbol] = leverage
             return data
 
     async def get_symbol_filters(self, symbol: str, force_refresh: bool = False) -> dict:
@@ -712,11 +728,26 @@ class ExecutionManager:
             live_price = 0.0
         ref_price = live_price if live_price > 0 else price
 
-        try:
-            filters = await self.api.get_symbol_filters(symbol)
-        except Exception as e:
-            log.warning(f"open_trade: no se pudieron leer filtros de {symbol}, usando defaults ({e})")
+        # get_symbol_filters (exchangeInfo) y set_leverage son dos llamadas
+        # REST independientes entre sí: se disparan en paralelo en vez de
+        # una tras otra para no sumar sus latencias en el camino crítico.
+        # En la práctica casi siempre son "gratis": filters queda cacheado
+        # tras la primera vez por símbolo, y set_leverage se omite por
+        # completo si el leverage no cambió (ver BinanceAPI.set_leverage).
+        filters_result, leverage_result = await asyncio.gather(
+            self.api.get_symbol_filters(symbol),
+            self.api.set_leverage(symbol, LEVERAGE),
+            return_exceptions=True,
+        )
+
+        if isinstance(filters_result, Exception):
+            log.warning(f"open_trade: no se pudieron leer filtros de {symbol}, usando defaults ({filters_result})")
             filters = {"stepSize": 0.001, "minQty": 0.001, "min_notional": MIN_NOTIONAL_USDT}
+        else:
+            filters = filters_result
+
+        if isinstance(leverage_result, Exception):
+            log.warning(f"open_trade: no se pudo aplicar leverage para {symbol}: {leverage_result}")
 
         try:
             send_qty, send_notional = resolve_safe_quantity(
@@ -732,11 +763,6 @@ class ExecutionManager:
                 f"→ enviada={send_qty} (notional≈${send_notional:.4f}, precio_ref={ref_price})"
             )
         quantity = send_qty
-
-        try:
-            await self.api.set_leverage(symbol, LEVERAGE)
-        except Exception as e:
-            log.warning(f"open_trade: no se pudo aplicar leverage para {symbol}: {e}")
 
         qty_str = format_qty(quantity, filters.get("stepSize", 0.001))
         log.info(f"open_trade: enviando MARKET por WS → {symbol} {side} qty={qty_str} (notional≈${send_notional:.4f})")
