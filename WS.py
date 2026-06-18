@@ -45,6 +45,12 @@ class SymbolWebSocketPriceCache:
     Streams activos por símbolo:
       • @markPrice@1s  → precio mark en tiempo real
       • @ticker        → cambio 24h, high/low, volumen
+
+    NOVEDAD: la lista de símbolos puede actualizarse en caliente con
+    `update_symbols()` (p.ej. desde futures_executor.py, que sólo necesita
+    escuchar los símbolos con posición abierta en cada momento). Al llamar
+    a `update_symbols()` se fuerza la reconexión de ambos streams para que
+    el cambio se aplique de inmediato — es seguro llamarlo desde otro hilo.
     """
 
     _WS_MAX_SIZE  = 131_072   # 128 KB — con 570 símbolos los msgs siguen siendo < 2 KB c/u
@@ -60,7 +66,7 @@ class SymbolWebSocketPriceCache:
                 f"todos los símbolos van en 1 conexión por stream (límite Binance: 1024)."
             )
 
-        self.symbols = [s.upper() for s in symbols]
+        self.symbols = sorted({s.upper() for s in symbols})
 
         if len(self.symbols) > _BINANCE_MAX_STREAMS:
             # Si superas 1024 símbolos Binance rechaza la conexión;
@@ -79,7 +85,12 @@ class SymbolWebSocketPriceCache:
         self.tasks:   list  = []
         self.lock           = threading.Lock()
         self.running        = False
-        self._loop          = None
+        self._loop           = None
+
+        # Referencias a las conexiones activas (para poder forzar reconexión
+        # desde update_symbols, incluso desde otro hilo)
+        self._markprice_ws = None
+        self._ticker_ws    = None
 
         # Estadísticas simples por stream (solo 2 keys: "markprice", "ticker")
         self.connection_stats: dict[str, dict] = {
@@ -92,8 +103,12 @@ class SymbolWebSocketPriceCache:
     # ──────────────────────────────────────────────────────────────────────
 
     def _build_url(self, stream_suffix: str) -> str:
-        """URL combinada con todos los símbolos para un tipo de stream."""
-        streams = "/".join(f"{s.lower()}{stream_suffix}" for s in self.symbols)
+        """URL combinada con todos los símbolos actuales para un tipo de stream.
+        Se reconstruye en cada intento de conexión, así que siempre refleja
+        la lista de símbolos más reciente (ver update_symbols)."""
+        with self.lock:
+            symbols_snapshot = list(self.symbols)
+        streams = "/".join(f"{s.lower()}{stream_suffix}" for s in symbols_snapshot)
         return f"wss://fstream.binance.com/market/stream?streams={streams}"
 
     # ──────────────────────────────────────────────────────────────────────
@@ -137,40 +152,53 @@ class SymbolWebSocketPriceCache:
     # ──────────────────────────────────────────────────────────────────────
 
     async def _ws_markprice(self):
-        url = self._build_url("@markPrice@1s")
 
         async def _connect():
+            with self.lock:
+                symbols_snapshot = list(self.symbols)
+
+            if not symbols_snapshot:
+                # Sin símbolos activos (p.ej. executor sin posiciones abiertas):
+                # no hay nada que escuchar todavía, esperar a que se asignen.
+                await asyncio.sleep(2)
+                return
+
+            url = self._build_url("@markPrice@1s")
             async with self._ws_connect(url) as ws:
-                print(f"✅ [markPrice] Conectado — {len(self.symbols)} símbolos en 1 conexión")
+                self._markprice_ws = ws
+                print(f"✅ [markPrice] Conectado — {len(symbols_snapshot)} símbolos en 1 conexión")
                 last_ping = time.time()
 
-                while self.running:
-                    try:
-                        msg  = await asyncio.wait_for(ws.recv(), timeout=45)
-                        data = json.loads(msg)
+                try:
+                    while self.running:
+                        try:
+                            msg  = await asyncio.wait_for(ws.recv(), timeout=45)
+                            data = json.loads(msg)
 
-                        if "data" in data:
-                            pd     = data["data"]
-                            symbol = pd.get("s", "").upper()
-                            price  = float(pd.get("p", 0.0))
+                            if "data" in data:
+                                pd     = data["data"]
+                                symbol = pd.get("s", "").upper()
+                                price  = float(pd.get("p", 0.0))
 
-                            if symbol and math.isfinite(price) and price > 0:
-                                with self.lock:
-                                    self.price_cache[symbol] = (price, time.time())
+                                if symbol and math.isfinite(price) and price > 0:
+                                    with self.lock:
+                                        self.price_cache[symbol] = (price, time.time())
 
-                        now = time.time()
-                        if now - last_ping > 30:
+                            now = time.time()
+                            if now - last_ping > 30:
+                                await ws.ping()
+                                last_ping = now
+
+                        except asyncio.TimeoutError:
+                            print("⏰ [markPrice] Timeout, enviando ping…")
                             await ws.ping()
-                            last_ping = now
+                            last_ping = time.time()
 
-                    except asyncio.TimeoutError:
-                        print("⏰ [markPrice] Timeout, enviando ping…")
-                        await ws.ping()
-                        last_ping = time.time()
-
-                    except websockets.ConnectionClosed as e:
-                        print(f"🔶 [markPrice] Conexión cerrada: {e}")
-                        raise
+                        except websockets.ConnectionClosed as e:
+                            print(f"🔶 [markPrice] Conexión cerrada: {e}")
+                            raise
+                finally:
+                    self._markprice_ws = None
 
         await self._reconnect_loop("markprice", _connect)
 
@@ -179,49 +207,60 @@ class SymbolWebSocketPriceCache:
     # ──────────────────────────────────────────────────────────────────────
 
     async def _ws_ticker(self):
-        url = self._build_url("@ticker")
 
         async def _connect():
+            with self.lock:
+                symbols_snapshot = list(self.symbols)
+
+            if not symbols_snapshot:
+                await asyncio.sleep(2)
+                return
+
+            url = self._build_url("@ticker")
             async with self._ws_connect(url) as ws:
-                print(f"✅ [ticker24h] Conectado — {len(self.symbols)} símbolos en 1 conexión")
+                self._ticker_ws = ws
+                print(f"✅ [ticker24h] Conectado — {len(symbols_snapshot)} símbolos en 1 conexión")
                 last_ping = time.time()
 
-                while self.running:
-                    try:
-                        msg  = await asyncio.wait_for(ws.recv(), timeout=45)
-                        data = json.loads(msg)
+                try:
+                    while self.running:
+                        try:
+                            msg  = await asyncio.wait_for(ws.recv(), timeout=45)
+                            data = json.loads(msg)
 
-                        if "data" in data:
-                            d      = data["data"]
-                            symbol = d.get("s", "").upper()
-                            if not symbol:
-                                continue
+                            if "data" in data:
+                                d      = data["data"]
+                                symbol = d.get("s", "").upper()
+                                if not symbol:
+                                    continue
 
-                            with self.lock:
-                                self.ticker_cache[symbol] = TickerData(
-                                    change_pct = _safe_float(d, "P"),
-                                    change_abs = _safe_float(d, "p"),
-                                    last_price = _safe_float(d, "c"),
-                                    high_24h   = _safe_float(d, "h"),
-                                    low_24h    = _safe_float(d, "l"),
-                                    volume_24h = _safe_float(d, "v"),
-                                    quote_vol  = _safe_float(d, "q"),
-                                    ts         = time.time(),
-                                )
+                                with self.lock:
+                                    self.ticker_cache[symbol] = TickerData(
+                                        change_pct = _safe_float(d, "P"),
+                                        change_abs = _safe_float(d, "p"),
+                                        last_price = _safe_float(d, "c"),
+                                        high_24h   = _safe_float(d, "h"),
+                                        low_24h    = _safe_float(d, "l"),
+                                        volume_24h = _safe_float(d, "v"),
+                                        quote_vol  = _safe_float(d, "q"),
+                                        ts         = time.time(),
+                                    )
 
-                        now = time.time()
-                        if now - last_ping > 30:
+                            now = time.time()
+                            if now - last_ping > 30:
+                                await ws.ping()
+                                last_ping = now
+
+                        except asyncio.TimeoutError:
+                            print("⏰ [ticker24h] Timeout, enviando ping…")
                             await ws.ping()
-                            last_ping = now
+                            last_ping = time.time()
 
-                    except asyncio.TimeoutError:
-                        print("⏰ [ticker24h] Timeout, enviando ping…")
-                        await ws.ping()
-                        last_ping = time.time()
-
-                    except websockets.ConnectionClosed as e:
-                        print(f"🔶 [ticker24h] Conexión cerrada: {e}")
-                        raise
+                        except websockets.ConnectionClosed as e:
+                            print(f"🔶 [ticker24h] Conexión cerrada: {e}")
+                            raise
+                finally:
+                    self._ticker_ws = None
 
         await self._reconnect_loop("ticker", _connect)
 
@@ -238,7 +277,8 @@ class SymbolWebSocketPriceCache:
             stale_ticker = []
 
             with self.lock:
-                for symbol in self.symbols:
+                symbols_snapshot = list(self.symbols)
+                for symbol in symbols_snapshot:
                     entry = self.price_cache.get(symbol)
                     if entry is None or now - entry[1] > 120:
                         stale_price.append(symbol)
@@ -253,6 +293,59 @@ class SymbolWebSocketPriceCache:
             if stale_ticker:
                 print(f"⚠️ [ticker24h] Sin actualización ({len(stale_ticker)} símbolos): "
                       f"{stale_ticker[:5]}{'…' if len(stale_ticker) > 5 else ''}")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Actualización dinámica de símbolos
+    # ──────────────────────────────────────────────────────────────────────
+
+    def update_symbols(self, symbols: list[str]):
+        """Reemplaza la lista de símbolos suscritos y fuerza la reconexión
+        de ambos streams para que el cambio se aplique de inmediato.
+
+        Pensado para consumidores como futures_executor.py, que sólo
+        necesitan precios de los símbolos con posición abierta en cada
+        momento (en vez de un set fijo de cientos de símbolos).
+
+        Seguro de llamar desde otro hilo/loop distinto al que corre esta
+        instancia (usa asyncio.run_coroutine_threadsafe internamente).
+        """
+        new_symbols = sorted({s.upper() for s in symbols})
+
+        if len(new_symbols) > _BINANCE_MAX_STREAMS:
+            raise ValueError(
+                f"Binance permite máximo {_BINANCE_MAX_STREAMS} streams por conexión. "
+                f"Se solicitaron {len(new_symbols)} símbolos."
+            )
+
+        with self.lock:
+            if new_symbols == self.symbols:
+                return
+            self.symbols = new_symbols
+
+        preview = new_symbols[:5]
+        print(
+            f"🔄 [WS] Símbolos actualizados → {len(new_symbols)} "
+            f"({preview}{'…' if len(new_symbols) > 5 else ''})"
+        )
+        self._force_reconnect()
+
+    def _force_reconnect(self):
+        """Cierra las conexiones activas; _reconnect_loop las reabre de
+        inmediato usando la lista de símbolos ya actualizada (o, si la
+        lista quedó vacía, simplemente las deja en espera)."""
+        if not self.running or self._loop is None:
+            return
+        for attr in ("_markprice_ws", "_ticker_ws"):
+            ws_obj = getattr(self, attr, None)
+            if ws_obj is not None:
+                asyncio.run_coroutine_threadsafe(self._safe_close(ws_obj), self._loop)
+
+    @staticmethod
+    async def _safe_close(ws_obj):
+        try:
+            await ws_obj.close()
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────────────────────────────
     # Ciclo de vida
@@ -371,9 +464,10 @@ class SymbolWebSocketPriceCache:
         with self.lock:
             active_prices  = len(self.price_cache)
             active_tickers = len(self.ticker_cache)
+            total_symbols  = len(self.symbols)
 
         return {
-            "total_symbols":    len(self.symbols),
+            "total_symbols":    total_symbols,
             "active_prices":    active_prices,
             "active_tickers":   active_tickers,
             "stale_symbols":    len(self.get_stale_symbols()),
