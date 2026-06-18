@@ -12,6 +12,7 @@ import aiohttp
 from aiohttp import web
 import logging
 import math
+import re
 from datetime import datetime, timezone
 import os
 import json
@@ -103,9 +104,11 @@ def ceil_to_step(value: float, step: float) -> float:
 
 def format_qty(value: float, step: float) -> str:
     """Formatea la cantidad con la cantidad de decimales del stepSize,
-    sin notación científica ni decimales innecesarios."""
+    sin notación científica ni decimales innecesarios. Para cantidades
+    enteras usa round() en vez de int() truncado, para no perder una
+    unidad por ruido de coma flotante (p.ej. 26.999999999 -> 26)."""
     decimals = _step_decimals(step)
-    return f"{value:.{decimals}f}" if decimals > 0 else str(int(value))
+    return f"{value:.{decimals}f}" if decimals > 0 else str(int(round(value)))
 
 
 def resolve_safe_quantity(
@@ -130,19 +133,28 @@ def resolve_safe_quantity(
     if price <= 0:
         raise ValueError("price debe ser > 0 para calcular la cantidad")
 
-    step = float(filters.get("stepSize", 0.001)) or 0.001
+    # Default seguro: si no sabemos el stepSize real, asumimos cantidad
+    # entera (stepSize=1) en vez de 0.001. Un entero SIEMPRE es múltiplo
+    # válido de cualquier stepSize más fino (0.1, 0.01, 0.001...), así que
+    # es el fallback universalmente seguro — al revés (asumir decimales en
+    # un símbolo que en realidad exige enteros) es lo que dispara -1111.
+    step = float(filters.get("stepSize", 1.0)) or 1.0
     min_qty = float(filters.get("minQty", step))
     min_notional = max(float(filters.get("min_notional", MIN_NOTIONAL_USDT)), MIN_NOTIONAL_USDT)
     min_notional *= (1 + extra_buffer_pct / 100.0)
 
     raw_qty = desired_notional / price
-    qty = floor_to_step(raw_qty, step)
+    # Redondeo SIEMPRE hacia arriba (ceil), nunca hacia abajo: así jamás
+    # nos quedamos por debajo del notional mínimo por culpa del redondeo
+    # — en el peor caso gastamos unos centavos más, no rechazo de Binance.
+    qty = ceil_to_step(raw_qty, step)
     if qty < min_qty:
         qty = min_qty
 
     notional = qty * price
     if notional < min_notional:
-        # Subimos al siguiente múltiplo de step que cubra el notional mínimo.
+        # El notional deseado por la señal ya estaba por debajo del mínimo:
+        # subimos al siguiente múltiplo de step que sí lo cubra.
         needed_qty = min_notional / price
         qty = ceil_to_step(needed_qty, step)
         if qty < min_qty:
@@ -211,13 +223,23 @@ class BinanceAPI:
 
         # Cache de filtros por símbolo (stepSize/minQty/minNotional) leídos
         # de /fapi/v1/exchangeInfo. Se usa para calcular la cantidad real a
-        # enviar a partir del tamaño de orden deseado en USDT.
+        # enviar a partir del tamaño de orden deseado en USDT. Se carga
+        # de UNA SOLA VEZ para todos los símbolos (no uno por símbolo) y
+        # se refresca cada EXCHANGE_INFO_TTL_S, para minimizar peso REST.
         self._symbol_filters_cache: dict[str, dict] = {}
         self._symbol_filters_lock = asyncio.Lock()
+        self._exchange_info_loaded_at: float = 0.0
 
         # Cache de leverage aplicado por símbolo, para no repetir la
         # llamada REST de set_leverage si el valor no cambió (velocidad).
         self._leverage_cache: dict[str, int] = {}
+        self._leverage_lock = asyncio.Lock()
+
+        # Freno de bloqueo de IP (Binance -1003 / HTTP 418): si Binance ya
+        # nos banea por exceso de requests, dejamos de pegarle a REST hasta
+        # que pase el tiempo indicado en el propio mensaje de error, en vez
+        # de seguir reintentando y empeorar/alargar el bloqueo.
+        self._rest_ban_until_ms: float = 0.0
 
     @staticmethod
     def _payload_string(params: dict) -> str:
@@ -230,6 +252,37 @@ class BinanceAPI:
     def _sign(self, params: dict) -> str:
         payload = self._payload_string(params)
         return hmac.new(self.api_secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _is_rest_banned(self) -> bool:
+        return self._rest_ban_until_ms > datetime.now(timezone.utc).timestamp() * 1000
+
+    def _rest_ban_remaining_s(self) -> float:
+        return max(0.0, self._rest_ban_until_ms / 1000 - datetime.now(timezone.utc).timestamp())
+
+    def _note_possible_ip_ban(self, response_text: str):
+        """
+        Si la respuesta de Binance indica -1003 (demasiadas requests, IP
+        baneada), guarda el timestamp hasta el que dura el bloqueo para
+        que las próximas llamadas REST se omitan en vez de seguir
+        golpeando la API y alargar/empeorar el bloqueo.
+        """
+        if "-1003" not in response_text:
+            return
+        match = re.search(r"banned until (\d+)", response_text)
+        if not match:
+            return
+        until_ms = float(match.group(1))
+        if until_ms > self._rest_ban_until_ms:
+            self._rest_ban_until_ms = until_ms
+            until_dt = datetime.fromtimestamp(until_ms / 1000, tz=timezone.utc)
+            log.error(
+                f"⛔ IP bloqueada por Binance (rate limit -1003) hasta {until_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} "
+                f"(~{self._rest_ban_remaining_s():.0f}s) — se omitirán llamadas REST hasta entonces"
+            )
+
+    def _check_rest_ban_or_raise(self):
+        if self._is_rest_banned():
+            raise RuntimeError(f"REST omitida: IP bloqueada por Binance (-1003), quedan ~{self._rest_ban_remaining_s():.0f}s")
 
     def _ws_alive(self) -> bool:
         return bool(
@@ -383,134 +436,151 @@ class BinanceAPI:
         repetirla en cada señal — ese round-trip de red no aporta nada si
         el valor no cambió, y es puro tiempo perdido en el camino crítico
         de cada orden.
+
+        El chequeo+llamada va dentro de un lock para evitar que dos
+        señales concurrentes del mismo símbolo disparen la misma llamada
+        REST duplicada (ambas pasarían el chequeo de cache antes de que
+        ninguna la haya escrito todavía).
         """
         leverage = int(leverage)
         if not force and self._leverage_cache.get(symbol) == leverage:
             return {"symbol": symbol, "leverage": leverage, "cached": True}
 
-        session = await self._ensure_http_session()
-        params = {
-            "symbol": symbol,
-            "leverage": leverage,
-            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-            "recvWindow": 5000,
-        }
-        query = self._payload_string(params)
-        signature = self._sign(params)
-        url = f"{REST_FAPI_URL}/fapi/v1/leverage?{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": self.api_key}
+        async with self._leverage_lock:
+            if not force and self._leverage_cache.get(symbol) == leverage:
+                return {"symbol": symbol, "leverage": leverage, "cached": True}
 
-        async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"REST set_leverage error {resp.status}: {text}")
-            try:
-                data = json.loads(text)
-            except Exception:
-                data = {"raw": text}
-            log.info(f"Leverage REST OK: {symbol} → {data.get('leverage', leverage)}x")
-            self._leverage_cache[symbol] = leverage
-            return data
+            self._check_rest_ban_or_raise()
 
-    async def get_symbol_filters(self, symbol: str, force_refresh: bool = False) -> dict:
+            session = await self._ensure_http_session()
+            params = {
+                "symbol": symbol,
+                "leverage": leverage,
+                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "recvWindow": 5000,
+            }
+            query = self._payload_string(params)
+            signature = self._sign(params)
+            url = f"{REST_FAPI_URL}/fapi/v1/leverage?{query}&signature={signature}"
+            headers = {"X-MBX-APIKEY": self.api_key}
+
+            async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    self._note_possible_ip_ban(text)
+                    raise RuntimeError(f"REST set_leverage error {resp.status}: {text}")
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = {"raw": text}
+                log.info(f"Leverage REST OK: {symbol} → {data.get('leverage', leverage)}x")
+                self._leverage_cache[symbol] = leverage
+                return data
+
+    EXCHANGE_INFO_TTL_S = 6 * 3600  # los filtros de lote casi nunca cambian; refrescar cada 6h basta
+
+    async def _load_all_symbol_filters(self, force_refresh: bool = False) -> None:
         """
-        Devuelve (y cachea en memoria) los filtros de cantidad/notional del
-        símbolo desde /fapi/v1/exchangeInfo (REST — la WS API no expone
-        exchangeInfo). Indispensable para no enviar una `quantity` que
-        Binance rechace por precisión o por quedar debajo del notional
-        mínimo (5.1 USDT).
-
-        Para órdenes MARKET (que es el único tipo que usa este executor),
-        Binance valida la cantidad contra el filtro MARKET_LOT_SIZE, que en
-        algunos símbolos es distinto (más grueso) que LOT_SIZE. Por eso se
-        prioriza MARKET_LOT_SIZE; si no existe, se usa LOT_SIZE; y si
-        ninguno aparece, se deriva el step a partir de quantityPrecision
-        (siempre presente), en vez de asumir un default genérico de 0.001
-        que rompe a los símbolos que exigen cantidades enteras.
-
-        Solo se cachea el resultado si el símbolo realmente se encontró en
-        exchangeInfo. Si no se encuentra o la consulta falla, se devuelven
-        valores por defecto SIN cachearlos, para que la próxima señal de
-        ese símbolo vuelva a intentarlo en vez de quedar con datos
-        incorrectos de forma permanente.
+        Carga TODOS los símbolos de /fapi/v1/exchangeInfo en UNA sola
+        llamada REST y cachea sus filtros (en vez de una llamada por
+        símbolo por señal, que es lo que terminó disparando el bloqueo de
+        IP -1003 de Binance). El cache se reutiliza durante
+        EXCHANGE_INFO_TTL_S, ya que estos filtros prácticamente no
+        cambian día a día.
         """
-        if not force_refresh:
-            cached = self._symbol_filters_cache.get(symbol)
-            if cached:
-                return cached
+        now = datetime.now(timezone.utc).timestamp()
+        if not force_refresh and self._symbol_filters_cache and (now - self._exchange_info_loaded_at) < self.EXCHANGE_INFO_TTL_S:
+            return
 
         async with self._symbol_filters_lock:
-            if not force_refresh:
-                cached = self._symbol_filters_cache.get(symbol)
-                if cached:
-                    return cached
+            now = datetime.now(timezone.utc).timestamp()
+            if not force_refresh and self._symbol_filters_cache and (now - self._exchange_info_loaded_at) < self.EXCHANGE_INFO_TTL_S:
+                return
 
-            defaults = {
-                "stepSize": 0.001,
-                "minQty": 0.001,
-                "qty_precision": 3,
-                "min_notional": MIN_NOTIONAL_USDT,
-            }
+            self._check_rest_ban_or_raise()
 
-            try:
-                session = await self._ensure_http_session()
-                url = f"{REST_FAPI_URL}/fapi/v1/exchangeInfo"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    text = await resp.text()
-                    if resp.status != 200:
-                        raise RuntimeError(f"REST exchangeInfo error {resp.status}: {text}")
-                    data = json.loads(text)
+            session = await self._ensure_http_session()
+            url = f"{REST_FAPI_URL}/fapi/v1/exchangeInfo"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    self._note_possible_ip_ban(text)
+                    raise RuntimeError(f"REST exchangeInfo error {resp.status}: {text}")
+                data = json.loads(text)
 
-                symbol_found = False
-                result = dict(defaults)
-                for s in data.get("symbols", []):
-                    if s.get("symbol") != symbol:
-                        continue
-                    symbol_found = True
+            new_cache: dict[str, dict] = {}
+            for s in data.get("symbols", []):
+                sym = s.get("symbol")
+                if not sym:
+                    continue
 
-                    qty_precision = int(s.get("quantityPrecision", result["qty_precision"]))
-                    result["qty_precision"] = qty_precision
-                    # Fallback derivado de quantityPrecision: si ningún
-                    # filtro de lote aparece más abajo, este es el step
-                    # correcto (10^-precision), no el default genérico.
-                    result["stepSize"] = round(10 ** (-qty_precision), 10)
-                    result["minQty"] = result["stepSize"]
+                qty_precision = int(s.get("quantityPrecision", 0))
+                entry = {
+                    # Fallback derivado de quantityPrecision si el símbolo
+                    # no trae LOT_SIZE/MARKET_LOT_SIZE más abajo.
+                    "stepSize": round(10 ** (-qty_precision), 10),
+                    "minQty": round(10 ** (-qty_precision), 10),
+                    "qty_precision": qty_precision,
+                    "min_notional": MIN_NOTIONAL_USDT,
+                }
 
-                    lot_size_filter = None
-                    market_lot_size_filter = None
-                    for f in s.get("filters", []):
-                        ftype = f.get("filterType")
-                        if ftype == "LOT_SIZE":
-                            lot_size_filter = f
-                        elif ftype == "MARKET_LOT_SIZE":
-                            market_lot_size_filter = f
-                        elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
-                            notional = f.get("notional") or f.get("minNotional")
-                            if notional is not None:
-                                result["min_notional"] = float(notional)
+                lot_size_filter = None
+                market_lot_size_filter = None
+                for f in s.get("filters", []):
+                    ftype = f.get("filterType")
+                    if ftype == "LOT_SIZE":
+                        lot_size_filter = f
+                    elif ftype == "MARKET_LOT_SIZE":
+                        market_lot_size_filter = f
+                    elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
+                        notional = f.get("notional") or f.get("minNotional")
+                        if notional is not None:
+                            entry["min_notional"] = float(notional)
 
-                    # Las órdenes que envía este executor son siempre MARKET,
-                    # así que MARKET_LOT_SIZE es el filtro que Binance
-                    # realmente valida; LOT_SIZE queda como respaldo.
-                    chosen = market_lot_size_filter or lot_size_filter
-                    if chosen:
-                        result["stepSize"] = float(chosen.get("stepSize", result["stepSize"]))
-                        result["minQty"] = float(chosen.get("minQty", result["minQty"]))
-                    break
-
-                if not symbol_found:
-                    log.error(f"get_symbol_filters: símbolo {symbol} no encontrado en exchangeInfo — usando defaults SIN cachear, se reintentará en la próxima señal")
-                    return defaults
+                # Las órdenes que envía este executor son siempre MARKET,
+                # así que MARKET_LOT_SIZE es el filtro que Binance
+                # realmente valida; LOT_SIZE queda como respaldo.
+                chosen = market_lot_size_filter or lot_size_filter
+                if chosen:
+                    entry["stepSize"] = float(chosen.get("stepSize", entry["stepSize"]))
+                    entry["minQty"] = float(chosen.get("minQty", entry["minQty"]))
 
                 # Piso de seguridad: nunca operar por debajo de MIN_NOTIONAL_USDT
                 # aunque exchangeInfo reporte un valor menor.
-                result["min_notional"] = max(result["min_notional"], MIN_NOTIONAL_USDT)
-                self._symbol_filters_cache[symbol] = result
-                log.info(f"get_symbol_filters: {symbol} → stepSize={result['stepSize']} minQty={result['minQty']} min_notional={result['min_notional']}")
-                return result
-            except Exception as e:
-                log.warning(f"get_symbol_filters: no se pudo leer exchangeInfo para {symbol} ({e}); usando valores por defecto")
-                return defaults
+                entry["min_notional"] = max(entry["min_notional"], MIN_NOTIONAL_USDT)
+                new_cache[sym] = entry
+
+            self._symbol_filters_cache = new_cache
+            self._exchange_info_loaded_at = now
+            log.info(f"exchangeInfo cargado de una sola vez: {len(new_cache)} símbolos cacheados")
+
+    async def get_symbol_filters(self, symbol: str, force_refresh: bool = False) -> dict:
+        """
+        Devuelve los filtros de cantidad/notional del símbolo, usando el
+        cache global poblado por _load_all_symbol_filters (una sola
+        llamada REST para todos los símbolos en vez de una por símbolo).
+
+        Si la carga falla (red caída, IP bloqueada por -1003, etc.) o el
+        símbolo no aparece en exchangeInfo, se devuelve un default SEGURO
+        de cantidad entera (stepSize=1): un entero siempre es múltiplo
+        válido de cualquier stepSize más fino, así que es la opción que
+        menos rechazos provoca cuando no tenemos el dato real — al revés
+        (asumir decimales) es lo que dispara -1111.
+        """
+        safe_default = {"stepSize": 1.0, "minQty": 1.0, "qty_precision": 0, "min_notional": MIN_NOTIONAL_USDT}
+
+        try:
+            await self._load_all_symbol_filters(force_refresh=force_refresh)
+        except Exception as e:
+            log.warning(f"get_symbol_filters: no se pudo cargar exchangeInfo ({e}); usando default seguro (entero) para {symbol}")
+            return safe_default
+
+        cached = self._symbol_filters_cache.get(symbol)
+        if cached:
+            return cached
+
+        log.error(f"get_symbol_filters: símbolo {symbol} no encontrado en exchangeInfo cacheado — usando default seguro (entero)")
+        return safe_default
 
     async def create_market_order(
         self,
@@ -778,7 +848,7 @@ class ExecutionManager:
 
         if isinstance(filters_result, Exception):
             log.warning(f"open_trade: no se pudieron leer filtros de {symbol}, usando defaults ({filters_result})")
-            filters = {"stepSize": 0.001, "minQty": 0.001, "min_notional": MIN_NOTIONAL_USDT}
+            filters = {"stepSize": 1.0, "minQty": 1.0, "min_notional": MIN_NOTIONAL_USDT}
         else:
             filters = filters_result
 
