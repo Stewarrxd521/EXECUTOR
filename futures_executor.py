@@ -1226,7 +1226,7 @@ async def main():
         return
 
     try:
-        from ws import SymbolWebSocketPriceCache
+        from WS import SymbolWebSocketPriceCache
     except ImportError:
         log.critical("No se puede importar SymbolWebSocketPriceCache desde ws.py")
         return
