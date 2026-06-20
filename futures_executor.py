@@ -33,20 +33,12 @@ SIGNAL_SECRET      = os.environ.get("SIGNAL_SECRET", "cambiar-por-secreto-seguro
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-LEVERAGE        = int(os.environ.get("LEVERAGE", "1"))
+LEVERAGE        = int(os.environ.get("LEVERAGE", "4"))
 HEDGE_MODE      = os.environ.get("HEDGE_MODE", "false").lower() == "true"
 PORT            = int(os.environ.get("PORT", "10000"))
 POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
 
-# Notional mínimo (en USDT) que Binance Futures exige por orden. Aunque
-# muchos símbolos reportan 5.0 en su filtro NOTIONAL/MIN_NOTIONAL, dejamos
-# 5.1 como piso de seguridad (igual que pide el usuario) para no quedar
-# justo en el límite y que un mínimo desliz de precio la rechace.
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
-
-# Colchón extra (%) que se suma al notional mínimo al recalcular la
-# cantidad, para absorber el movimiento de precio entre el momento en que
-# se calcula la orden y el momento en que Binance la matchea.
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
 
 WS_API_URL = os.environ.get(
@@ -54,9 +46,6 @@ WS_API_URL = os.environ.get(
     "wss://testnet.binancefuture.com/ws-fapi/v1" if USE_TESTNET else "wss://ws-fapi.binance.com/ws-fapi/v1",
 )
 
-# La WS API de Binance Futures NO tiene método para cambiar leverage
-# (solo order.place / cancel / query / position*). Cambiar leverage
-# es exclusivamente REST: POST /fapi/v1/leverage.
 REST_FAPI_URL = os.environ.get(
     "BINANCE_REST_FAPI_URL",
     "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com",
@@ -144,17 +133,12 @@ def resolve_safe_quantity(
     min_notional *= (1 + extra_buffer_pct / 100.0)
 
     raw_qty = desired_notional / price
-    # Redondeo SIEMPRE hacia arriba (ceil), nunca hacia abajo: así jamás
-    # nos quedamos por debajo del notional mínimo por culpa del redondeo
-    # — en el peor caso gastamos unos centavos más, no rechazo de Binance.
     qty = ceil_to_step(raw_qty, step)
     if qty < min_qty:
         qty = min_qty
 
     notional = qty * price
     if notional < min_notional:
-        # El notional deseado por la señal ya estaba por debajo del mínimo:
-        # subimos al siguiente múltiplo de step que sí lo cubra.
         needed_qty = min_notional / price
         qty = ceil_to_step(needed_qty, step)
         if qty < min_qty:
@@ -399,10 +383,6 @@ class BinanceAPI:
             response = await asyncio.wait_for(fut, timeout=timeout)
         except Exception as e:
             self._pending.pop(req_id, None)
-            # Si el future nunca se resolvió, lo más probable es que el
-            # reader haya muerto sin que connect() lo detectara a tiempo.
-            # Forzamos a considerar muerta la conexión y reintentamos
-            # una vez con una conexión nueva, en vez de fallar en silencio.
             if _retry and not self._ws_alive():
                 log.warning(f"_request: sin respuesta ({e!r}); conexión muerta, reconectando y reintentando una vez")
                 return await self._request(method, params, signed=False, timeout=timeout, _retry=False)
@@ -429,18 +409,6 @@ class BinanceAPI:
         Cambia el leverage inicial de un símbolo. Esto es exclusivamente
         REST en Binance (POST /fapi/v1/leverage) — la WS API no expone
         ningún método equivalente.
-
-        Por velocidad: si el leverage solicitado es el mismo que ya está
-        cacheado para este símbolo (porque ya se aplicó en una operación
-        anterior), se omite la llamada REST por completo en vez de
-        repetirla en cada señal — ese round-trip de red no aporta nada si
-        el valor no cambió, y es puro tiempo perdido en el camino crítico
-        de cada orden.
-
-        El chequeo+llamada va dentro de un lock para evitar que dos
-        señales concurrentes del mismo símbolo disparen la misma llamada
-        REST duplicada (ambas pasarían el chequeo de cache antes de que
-        ninguna la haya escrito todavía).
         """
         leverage = int(leverage)
         if not force and self._leverage_cache.get(symbol) == leverage:
@@ -516,8 +484,6 @@ class BinanceAPI:
 
                 qty_precision = int(s.get("quantityPrecision", 0))
                 entry = {
-                    # Fallback derivado de quantityPrecision si el símbolo
-                    # no trae LOT_SIZE/MARKET_LOT_SIZE más abajo.
                     "stepSize": round(10 ** (-qty_precision), 10),
                     "minQty": round(10 ** (-qty_precision), 10),
                     "qty_precision": qty_precision,
