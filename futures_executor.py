@@ -4,7 +4,6 @@ futures_executor_ws.py — Executor de Futuros Binance 100% WebSocket para tradi
 - Órdenes de apertura/cierre por Binance USDⓈ-M Futures WebSocket API.
 - Consultas de balance y posiciones por WebSocket API.
 - Precios de mercado desde SymbolWebSocketPriceCache (ws.py / WS.py).
-- Sin REST para operaciones de trading.
 """
 
 import asyncio
