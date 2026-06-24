@@ -778,7 +778,6 @@ class ExecutionManager:
 
         order_assumed = False
         entry_order_id = ""
-        filled_price = price
 
         # ── Cálculo de la cantidad real a enviar ──────────────────────
         # La señal trae price + quantity, que en conjunto definen el
@@ -798,6 +797,17 @@ class ExecutionManager:
         except Exception:
             live_price = 0.0
         ref_price = live_price if live_price > 0 else price
+
+        # SIEMPRE usar el precio del WebSocket como precio de entrada
+        # de referencia, ignorando el precio que llega en la señal.
+        # Si la señal manda price=1000 pero el WS reporta 1.2, se usa
+        # 1.2 tanto para calcular la cantidad como para registrar la
+        # entrada — así la posición refleja la realidad del mercado.
+        filled_price = ref_price
+        if live_price > 0 and abs(live_price - price) / max(price, 1e-9) > 0.01:
+            log.info(
+                f"open_trade: precio señal={price} IGNORADO — usando precio WS={live_price} para {symbol}"
+            )
 
         # get_symbol_filters (exchangeInfo) y set_leverage son dos llamadas
         # REST independientes entre sí: se disparan en paralelo en vez de
@@ -1368,6 +1378,28 @@ async def manual_set_leverage_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "leverage": LEVERAGE})
 
 
+async def manual_clear_history_handler(request: web.Request) -> web.Response:
+    """Borra el historial de operaciones cerradas y reinicia el PnL realizado."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    em = execution_manager
+    count = len(em._closed)
+    em._closed.clear()
+
+    # Reinicia también los contadores de señales para coherencia visual
+    executor_status["signals_open"] = 0
+    executor_status["signals_close"] = 0
+    executor_status["signals_received"] = 0
+    executor_status["signals_rejected"] = 0
+    executor_status["manual_closes"] = 0
+    executor_status["last_signal_time"] = "Historial borrado"
+    executor_status["last_signal_detail"] = ""
+
+    log.warning(f"Historial de operaciones cerradas borrado desde el dashboard ({count} operaciones eliminadas)")
+    return web.json_response({"ok": True, "cleared": count})
+
+
 async def api_state_handler(request: web.Request) -> web.Response:
     em = execution_manager
 
@@ -1548,6 +1580,20 @@ async function setLeverage() {
   } catch(e) { alert('Error de red al cambiar el leverage'); }
 }
 
+async function clearHistory() {
+  if (!confirm('¿Borrar TODO el historial de operaciones cerradas y reiniciar el PnL realizado? Esta acción no se puede deshacer.')) return;
+  try {
+    const r = await fetch('/manual/clear_history', {
+      method: 'POST',
+      headers: {'X-Dashboard-Token': DASH_TOKEN}
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    alert('Historial borrado (' + d.cleared + ' operaciones eliminadas). PnL realizado reiniciado a 0.');
+    refresh();
+  } catch(e) { alert('Error de red al borrar historial'); }
+}
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -1649,7 +1695,9 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     </tbody>
   </table></div>
 
-  <h2>📋 Operaciones Cerradas (últimas 30)</h2>
+  <h2>📋 Operaciones Cerradas (últimas 30)
+    <button class="btn-close-all" style="background:#8b949e;font-size:.72rem;padding:.3rem .7rem" onclick="clearHistory()">🗑 Borrar historial y PnL</button>
+  </h2>
   <div class="wrap"><table>
     <thead><tr>
       <th>#</th><th>Par</th><th>Dir</th><th>Lev</th><th>Entrada</th><th>Salida</th><th>PnL</th><th>ROI%</th><th>Resultado</th>
@@ -1676,6 +1724,7 @@ async def start_http_server():
     app.router.add_post("/manual/close_all", manual_close_all_handler)
     app.router.add_post("/manual/toggle_trading", manual_toggle_trading_handler)
     app.router.add_post("/manual/set_leverage", manual_set_leverage_handler)
+    app.router.add_post("/manual/clear_history", manual_clear_history_handler)
     app.router.add_get("/", dashboard_handler)
     app.router.add_get("/health", dashboard_handler)
     app.router.add_get("/api/state", api_state_handler)
