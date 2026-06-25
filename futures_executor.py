@@ -403,38 +403,6 @@ class BinanceAPI:
         result = await self._request("account.position", params=params, signed=True)
         return result if isinstance(result, list) else []
 
-    async def _has_open_position(self, symbol: str, position_side: Optional[str] = None) -> bool:
-        """
-        Devuelve True si Binance reporta una posición abierta real para el
-        símbolo. Sirve para evitar enviar TP/SL closePosition=true cuando
-        la posición ya no existe.
-        """
-        try:
-            positions = await self.position_information(symbol)
-        except Exception as e:
-            log.warning(f"_has_open_position: no se pudo consultar posición para {symbol}: {e}")
-            return False
-
-        if not positions:
-            return False
-
-        wanted_side = (position_side or "BOTH").upper()
-        for p in positions:
-            if str(p.get("symbol", "")).upper() != symbol.upper():
-                continue
-            try:
-                amt = float(p.get("positionAmt", 0))
-            except Exception:
-                continue
-            if abs(amt) <= 0:
-                continue
-
-            side = str(p.get("positionSide", "BOTH")).upper()
-            if wanted_side not in ("", "BOTH") and side != wanted_side:
-                continue
-            return True
-        return False
-
     async def set_leverage(self, symbol: str, leverage: int, force: bool = False) -> dict:
         """
         Cambia el leverage inicial de un símbolo. Esto es exclusivamente
@@ -567,41 +535,49 @@ class BinanceAPI:
         time_in_force: str = "GTC",
     ) -> dict:
         """
-        TP/SL de Binance Futures.
+        TP/SL de Binance Futures. -4120 confirma que la WS API
+        (order.place) NO acepta STOP_MARKET/TAKE_PROFIT_MARKET con
+        closePosition — exige el endpoint dedicado de Algo Order
+        (POST /fapi/v1/algoOrder), así que se envían por ahí.
 
-        Antes de enviar la algo order se verifica que exista una posición
-        abierta real; de lo contrario Binance puede responder con -4509.
-        Para cierres totales no se envía timeInForce, porque esa combinación
-        puede provocar rechazos como el de GTE.
+        FIX -4509 "Time in Force (TIF) GTE can only be used with open
+        positions": closePosition=true usa internamente el TIF especial
+        GTE_GTC, y Binance SOLO lo acepta si en el instante exacto de la
+        request ya existe una posición (o una orden) registrada en su
+        lado para ese símbolo. Si el TP/SL se manda justo después de la
+        entrada (o sin posición todavía), aparece esa carrera y la
+        request se rechaza aunque la posición exista un instante después.
+
+        Para no depender de ese timing, en cuanto se conoce la cantidad
+        de la posición NUNCA se usa closePosition=true: se manda
+        STOP_MARKET/TAKE_PROFIT_MARKET con `quantity` + `reduceOnly`
+        (o solo `quantity` + `positionSide` en Hedge Mode, donde
+        reduceOnly no está permitido). Esa combinación no depende de que
+        ya exista posición — Binance simplemente deja la orden
+        condicional en NEW hasta que haya algo que reducir cuando se
+        dispare el trigger. closePosition=true queda solo como fallback
+        para cuando no se tiene la cantidad exacta a mano.
         """
-        pos_side = (position_side or "BOTH").upper()
+        use_close_position = close_position and quantity is None
 
-        if close_position and not await self._has_open_position(symbol, pos_side):
-            raise RuntimeError(
-                f"No hay posición abierta real para {symbol} ({pos_side}); no se envía TP/SL closePosition"
-            )
-
-        extra = {
-            "triggerPrice": str(trigger_price),
-            "positionSide": pos_side,
-            "closePosition": "true" if close_position else None,
-            "quantity": None if close_position else (str(quantity) if quantity is not None else None),
-            "reduceOnly": None if close_position else "true",
-            "workingType": "MARK_PRICE",
-        }
-
-        if not close_position:
-            extra["timeInForce"] = time_in_force
-        elif str(time_in_force).upper() == "GTE":
-            log.warning(
-                f"create_tp_sl_order: se ignoró timeInForce=GTE para {symbol} porque closePosition=true"
-            )
+        reduce_only = None
+        if not use_close_position and not HEDGE_MODE:
+            # En Hedge Mode, reduceOnly no se puede enviar (Binance lo
+            # rechaza): side + positionSide ya implica reducción. En
+            # One-way Mode sí hace falta para no abrir posición nueva.
+            reduce_only = "true"
 
         return await self.create_algo_order(
             symbol=symbol,
             side=side,
             order_type=order_type,
-            **extra,
+            triggerPrice=str(trigger_price),
+            positionSide=position_side or "BOTH",
+            closePosition="true" if use_close_position else None,
+            quantity=None if use_close_position else (str(quantity) if quantity is not None else None),
+            reduceOnly=reduce_only,
+            timeInForce=time_in_force,
+            workingType="MARK_PRICE",
         )
 
     async def create_limit_order(
@@ -632,33 +608,17 @@ class BinanceAPI:
 
     async def create_algo_order(self, symbol: str, side: str, order_type: str, **extra) -> dict:
         """
-        Algo Order condicional (POST /fapi/v1/algoOrder).
-
-        Si closePosition=true, Binance exige que exista una posición
-        abierta real. En esa rama también se elimina timeInForce para
-        evitar combinaciones inválidas como GTE.
+        Algo Order condicional (POST /fapi/v1/algoOrder) — endpoint
+        obligatorio para STOP_MARKET/TAKE_PROFIT_MARKET con
+        closePosition (la WS API los rechaza con -4120). `extra` admite
+        cualquier param adicional (triggerPrice, positionSide,
+        closePosition, quantity, reduceOnly, timeInForce, price,
+        workingType...); las claves con valor None se omiten.
         """
         params = {"symbol": symbol, "side": side, "algoType": "CONDITIONAL", "type": order_type}
         for k, v in extra.items():
             if v is not None:
                 params[k] = v
-
-        close_position = str(params.get("closePosition", "")).lower() == "true"
-        pos_side = str(params.get("positionSide", "BOTH")).upper()
-
-        if close_position and not await self._has_open_position(symbol, pos_side):
-            raise RuntimeError(
-                f"No hay posición abierta real para {symbol} ({pos_side}); Binance rechazaría esta algo order"
-            )
-
-        if close_position:
-            tif = str(params.get("timeInForce", "")).upper()
-            params.pop("timeInForce", None)
-            if tif == "GTE":
-                log.warning(
-                    f"create_algo_order: se eliminó timeInForce=GTE para {symbol} con closePosition=true"
-                )
-
         return await self._rest_signed("POST", "/fapi/v1/algoOrder", params)
 
     async def get_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict]:
@@ -1640,8 +1600,11 @@ def _position_side_for(direction: str) -> Optional[str]:
 
 
 async def manual_set_tp_handler(request: web.Request) -> web.Response:
-    """Crea un TAKE_PROFIT_MARKET closePosition=true vía Algo Order API
-    (la WS API rechaza este tipo con -4120: 'use Algo Order endpoints')."""
+    """Crea un TAKE_PROFIT_MARKET vía Algo Order API (POST /fapi/v1/algoOrder
+    — la WS API rechaza este tipo con -4120: 'use Algo Order endpoints').
+    Se envía con quantity+reduceOnly (no closePosition=true) para evitar
+    el -4509 'TIF GTE can only be used with open positions': ver detalle
+    en BinanceAPI.create_tp_sl_order."""
     if not _check_dashboard_token(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     try:
@@ -1671,9 +1634,12 @@ async def manual_set_tp_handler(request: web.Request) -> web.Response:
         log.warning(f"manual_set_tp: no se pudo limpiar TP previo de {symbol}: {e}")
 
     try:
+        filters = await execution_manager.api.get_symbol_filters(symbol)
+        qty_for_tp = float(format_qty(trade.quantity, filters.get("stepSize", 0.001)))
         result = await execution_manager.api.create_tp_sl_order(
             symbol=symbol, side=close_side, trigger_price=trigger_price,
-            order_type="TAKE_PROFIT_MARKET", position_side=pos_side, close_position=True,
+            order_type="TAKE_PROFIT_MARKET", position_side=pos_side,
+            quantity=qty_for_tp,
         )
         return web.json_response({"ok": True, "symbol": symbol, "tp": trigger_price, "result": result})
     except Exception as e:
@@ -1682,7 +1648,10 @@ async def manual_set_tp_handler(request: web.Request) -> web.Response:
 
 
 async def manual_set_sl_handler(request: web.Request) -> web.Response:
-    """Crea un STOP_MARKET closePosition=true vía Algo Order API."""
+    """Crea un STOP_MARKET vía Algo Order API. Se envía con
+    quantity+reduceOnly (no closePosition=true) para evitar el -4509
+    'TIF GTE can only be used with open positions': ver detalle en
+    BinanceAPI.create_tp_sl_order."""
     if not _check_dashboard_token(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     try:
@@ -1710,9 +1679,12 @@ async def manual_set_sl_handler(request: web.Request) -> web.Response:
         log.warning(f"manual_set_sl: no se pudo limpiar SL previo de {symbol}: {e}")
 
     try:
+        filters = await execution_manager.api.get_symbol_filters(symbol)
+        qty_for_sl = float(format_qty(trade.quantity, filters.get("stepSize", 0.001)))
         result = await execution_manager.api.create_tp_sl_order(
             symbol=symbol, side=close_side, trigger_price=trigger_price,
-            order_type="STOP_MARKET", position_side=pos_side, close_position=True,
+            order_type="STOP_MARKET", position_side=pos_side,
+            quantity=qty_for_sl,
         )
         return web.json_response({"ok": True, "symbol": symbol, "sl": trigger_price, "result": result})
     except Exception as e:
