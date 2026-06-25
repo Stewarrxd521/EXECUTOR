@@ -444,6 +444,173 @@ class BinanceAPI:
                 self._leverage_cache[symbol] = leverage
                 return data
 
+    # ── Escalera de leverage de respaldo ───────────────────────────────
+    # Algunos símbolos rechazan el leverage configurado por defecto
+    # (cada símbolo tiene su propio límite máximo según el notional, y
+    # no podemos conocerlos todos de antemano, menos aún con limitaciones
+    # de IP que impiden golpear /leverageBracket por cada símbolo). En
+    # vez de abortar la apertura, se prueba esta escalera 10x→4x hasta
+    # que Binance acepte uno.
+    LEVERAGE_FALLBACK_LADDER = [10, 9, 8, 7, 6, 5, 4]
+
+    async def set_leverage_with_fallback(self, symbol: str, preferred: int) -> int:
+        """
+        Intenta aplicar `preferred`; si Binance lo rechaza (p.ej. -4028
+        "Leverage X is not valid", típico en símbolos con límite propio
+        más bajo), recorre LEVERAGE_FALLBACK_LADDER (excluyendo el ya
+        intentado) hasta encontrar uno aceptado. Devuelve el leverage
+        que finalmente quedó aplicado en el símbolo.
+        """
+        ladder = [preferred] + [lv for lv in self.LEVERAGE_FALLBACK_LADDER if lv != preferred]
+        last_err: Optional[Exception] = None
+        for lv in ladder:
+            try:
+                await self.set_leverage(symbol, lv)
+                if lv != preferred:
+                    log.warning(f"set_leverage_with_fallback: {symbol} rechazó {preferred}x — aplicado {lv}x en su lugar")
+                return lv
+            except Exception as e:
+                last_err = e
+                log.warning(f"set_leverage_with_fallback: {symbol} rechazó {lv}x ({e}); probando siguiente de la escalera")
+        log.error(f"set_leverage_with_fallback: {symbol} rechazó TODA la escalera de leverage ({ladder}): {last_err}")
+        return preferred
+
+    # ── REST firmado genérico (para endpoints sin equivalente en la WS API) ──
+    async def _rest_signed(self, http_method: str, path: str, params: dict, timeout: float = 10.0) -> dict:
+        self._check_rest_ban_or_raise()
+        session = await self._ensure_http_session()
+        params = dict(params or {})
+        params.setdefault("timestamp", int(datetime.now(timezone.utc).timestamp() * 1000))
+        params.setdefault("recvWindow", 5000)
+        query = self._payload_string(params)
+        signature = self._sign(params)
+        url = f"{REST_FAPI_URL}{path}?{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        async with session.request(http_method, url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                self._note_possible_ip_ban(text)
+                raise RuntimeError(f"REST {http_method} {path} error {resp.status}: {text}")
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"raw": text}
+
+    async def get_rest_price(self, symbol: str) -> float:
+        """Último recurso para obtener precio cuando el WS no tiene el dato
+        a tiempo: GET /fapi/v1/ticker/price (público, no firmado)."""
+        self._check_rest_ban_or_raise()
+        session = await self._ensure_http_session()
+        url = f"{REST_FAPI_URL}/fapi/v1/ticker/price?symbol={symbol}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                self._note_possible_ip_ban(text)
+                raise RuntimeError(f"REST ticker/price error {resp.status}: {text}")
+            data = json.loads(text)
+            return float(data.get("price", 0))
+
+    async def get_open_orders(self, symbol: Optional[str] = None) -> list[dict]:
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        result = await self._rest_signed("GET", "/fapi/v1/openOrders", params)
+        return result if isinstance(result, list) else []
+
+    async def cancel_order(self, symbol: str, order_id) -> dict:
+        return await self._rest_signed("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+
+    async def cancel_all_open_orders(self, symbol: str) -> dict:
+        return await self._rest_signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+
+    async def create_tp_sl_order(
+        self,
+        symbol: str,
+        side: str,
+        stop_price: float,
+        order_type: str,  # "STOP_MARKET" (SL) o "TAKE_PROFIT_MARKET" (TP)
+        position_side: Optional[str] = None,
+        close_position: bool = True,
+        quantity: Optional[float] = None,
+    ) -> dict:
+        """
+        TP/SL nativos de Binance Futures, enviados por la WS API
+        (order.place) igual que las órdenes MARKET — más simples y
+        fiables que un Algo Order condicional para este caso de uso.
+        Con closePosition=true Binance cierra toda la posición al
+        disparar el trigger, sin necesitar quantity exacta.
+        """
+        params: dict = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "stopPrice": str(stop_price),
+            "workingType": "MARK_PRICE",
+            "newOrderRespType": "RESULT",
+        }
+        if position_side:
+            params["positionSide"] = position_side
+        if close_position:
+            params["closePosition"] = "true"
+        elif quantity is not None:
+            params["quantity"] = str(quantity)
+            params["reduceOnly"] = "true"
+        result = await self._request("order.place", params=params, signed=True)
+        return result if isinstance(result, dict) else {"raw": result}
+
+    async def create_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity,
+        price: float,
+        position_side: Optional[str] = None,
+        reduce_only: bool = False,
+        time_in_force: str = "GTC",
+    ) -> dict:
+        params: dict = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "quantity": str(quantity),
+            "price": str(price),
+            "timeInForce": time_in_force,
+            "newOrderRespType": "RESULT",
+        }
+        if position_side:
+            params["positionSide"] = position_side
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        result = await self._request("order.place", params=params, signed=True)
+        return result if isinstance(result, dict) else {"raw": result}
+
+    async def create_algo_order(self, symbol: str, side: str, order_type: str, **extra) -> dict:
+        """
+        Algo Order condicional (POST /fapi/v1/algoOrder) — se mantiene
+        como respaldo para casos donde la WS API no acepte un tipo de
+        orden particular (p.ej. ciertos TWAP/iceberg). Para TP/SL normal
+        usar create_tp_sl_order, que es más simple y fiable.
+        """
+        params = {"symbol": symbol, "side": side, "algoType": "CONDITIONAL", "type": order_type, **extra}
+        return await self._rest_signed("POST", "/fapi/v1/algoOrder", params)
+
+    async def cancel_all_algo_orders(self, symbol: str) -> dict:
+        return await self._rest_signed("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+
+    async def set_margin_type(self, symbol: str, margin_type: str) -> dict:
+        """margin_type: 'ISOLATED' o 'CROSSED'."""
+        return await self._rest_signed("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type})
+
+    async def modify_position_margin(self, symbol: str, amount: float, position_side: str = "BOTH", add: bool = True) -> dict:
+        """type=1 añade margen, type=2 lo retira (solo válido en ISOLATED)."""
+        params = {
+            "symbol": symbol,
+            "amount": str(abs(amount)),
+            "type": 1 if add else 2,
+            "positionSide": position_side,
+        }
+        return await self._rest_signed("POST", "/fapi/v1/positionMargin", params)
+
     EXCHANGE_INFO_TTL_S = 6 * 3600  # los filtros de lote casi nunca cambian; refrescar cada 6h basta
 
     async def _load_all_symbol_filters(self, force_refresh: bool = False) -> None:
@@ -700,6 +867,55 @@ class ExecutionManager:
         except Exception as e:
             log.error(f"_sync_ws_symbols: {e}")
 
+    async def get_entry_reference_price(self, symbol: str, extra_symbols: Optional[list[str]] = None) -> float:
+        """
+        Resuelve el precio REAL de entrada — NUNCA confía en el `price`
+        que llega en la señal, que es solo informativo/de cuando se
+        generó la señal y puede llevar segundos de desfase.
+
+        Orden de preferencia (siempre WS antes que REST):
+        1. Caché WS ya activa para el símbolo (instantáneo, sin RTT).
+        2. Si el símbolo aún no estaba suscrito, se suscribe al WS de
+           precios y se espera un breve instante a que llegue el primer
+           tick — en vez de descartar la apertura por no tenerlo ya.
+        3. Si el WS no entrega nada a tiempo (símbolo nuevo, lag de
+           suscripción, etc.), se cae a REST (ticker/price) como último
+           recurso, nunca al precio de la señal.
+        """
+        try:
+            p = float(self.price_ws.get_price(symbol) or 0.0)
+            if p > 0:
+                return p
+        except Exception:
+            pass
+
+        try:
+            wanted = set(self._trades.keys()) | {symbol}
+            if extra_symbols:
+                wanted |= set(extra_symbols)
+            self.price_ws.update_symbols(list(wanted))
+        except Exception as e:
+            log.warning(f"get_entry_reference_price: no se pudo suscribir {symbol} al WS: {e}")
+
+        for _ in range(15):  # hasta ~3s esperando el primer tick por WS
+            await asyncio.sleep(0.2)
+            try:
+                p = float(self.price_ws.get_price(symbol) or 0.0)
+                if p > 0:
+                    return p
+            except Exception:
+                pass
+
+        try:
+            p = await self.api.get_rest_price(symbol)
+            if p > 0:
+                log.info(f"get_entry_reference_price: {symbol} resuelto por REST (el WS no entregó precio a tiempo)")
+                return p
+        except Exception as e:
+            log.error(f"get_entry_reference_price: REST también falló para {symbol}: {e}")
+
+        return 0.0
+
     async def _place_market_order_safe(
         self,
         symbol: str,
@@ -779,45 +995,32 @@ class ExecutionManager:
         order_assumed = False
         entry_order_id = ""
 
-        # ── Cálculo de la cantidad real a enviar ──────────────────────
-        # La señal trae price + quantity, que en conjunto definen el
-        # TAMAÑO DE ORDEN deseado en USDT (notional = price * quantity).
-        # Por liquidez/velocidad del precio, para cuando la orden se
-        # envía ese precio puede haberse movido, dejando la quantity
-        # original por debajo del notional mínimo que exige Binance
-        # (5.1 USDT). En vez de enviar la quantity tal cual, recalculamos
-        # la cantidad a partir del notional deseado y del precio más
-        # fresco disponible (caché WS de precios), y la ajustamos al
-        # stepSize del símbolo garantizando que el notional final nunca
-        # quede por debajo del mínimo.
-        desired_notional = price * quantity
-        live_price = 0.0
-        try:
-            live_price = float(self.price_ws.get_price(symbol) or 0.0)
-        except Exception:
-            live_price = 0.0
-        ref_price = live_price if live_price > 0 else price
+        # ── Resolución del precio REAL de entrada ──────────────────────
+        # El `price` de la señal es solo orientativo (sirve para calcular
+        # el notional deseado junto con `quantity`), pero NUNCA se usa
+        # como precio de entrada ni se descarta la apertura por su
+        # diferencia con el mercado. Siempre se solicita el precio real
+        # — WS primero, REST como respaldo — y con ESE se calcula la
+        # cantidad final y se registra la entrada.
+        ref_price = await self.get_entry_reference_price(symbol)
+        if ref_price <= 0:
+            log.error(f"open_trade: no se pudo obtener un precio real para {symbol} (ni WS ni REST) — apertura cancelada")
+            return None
 
-        # SIEMPRE usar el precio del WebSocket como precio de entrada
-        # de referencia, ignorando el precio que llega en la señal.
-        # Si la señal manda price=1000 pero el WS reporta 1.2, se usa
-        # 1.2 tanto para calcular la cantidad como para registrar la
-        # entrada — así la posición refleja la realidad del mercado.
-        filled_price = ref_price
-        if live_price > 0 and abs(live_price - price) / max(price, 1e-9) > 0.01:
+        if price > 0 and abs(ref_price - price) / max(price, 1e-9) > 0.01:
             log.info(
-                f"open_trade: precio señal={price} IGNORADO — usando precio WS={live_price} para {symbol}"
+                f"open_trade: precio de señal={price} es solo orientativo — se abre con precio real={ref_price} para {symbol}"
             )
 
-        # get_symbol_filters (exchangeInfo) y set_leverage son dos llamadas
-        # REST independientes entre sí: se disparan en paralelo en vez de
-        # una tras otra para no sumar sus latencias en el camino crítico.
-        # En la práctica casi siempre son "gratis": filters queda cacheado
-        # tras la primera vez por símbolo, y set_leverage se omite por
-        # completo si el leverage no cambió (ver BinanceAPI.set_leverage).
+        desired_notional = price * quantity if price > 0 else ref_price * quantity
+        filled_price = ref_price
+
+        # get_symbol_filters (exchangeInfo) y set_leverage (con escalera
+        # de respaldo) son independientes entre sí: se disparan en
+        # paralelo para no sumar sus latencias en el camino crítico.
         filters_result, leverage_result = await asyncio.gather(
             self.api.get_symbol_filters(symbol),
-            self.api.set_leverage(symbol, LEVERAGE),
+            self.api.set_leverage_with_fallback(symbol, LEVERAGE),
             return_exceptions=True,
         )
 
@@ -828,7 +1031,10 @@ class ExecutionManager:
             filters = filters_result
 
         if isinstance(leverage_result, Exception):
-            log.warning(f"open_trade: no se pudo aplicar leverage para {symbol}: {leverage_result}")
+            log.warning(f"open_trade: no se pudo aplicar NINGÚN leverage de la escalera para {symbol}: {leverage_result}")
+            applied_leverage = LEVERAGE
+        else:
+            applied_leverage = leverage_result
 
         try:
             send_qty, send_notional = resolve_safe_quantity(
@@ -895,7 +1101,7 @@ class ExecutionManager:
                     entry_price=filled_price,
                     quantity=quantity,
                     open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                    leverage=LEVERAGE,
+                    leverage=applied_leverage,
                     paper_trade_id=paper_trade_id,
                     entry_order_id=entry_order_id,
                     current_price=filled_price,
@@ -939,6 +1145,7 @@ class ExecutionManager:
                         action_tag = "INVERTIDO"
                     existing.direction = new_direction
                     existing.quantity = new_qty
+                    existing.leverage = applied_leverage
                     existing.entry_order_id = entry_order_id
                     existing.order_assumed = existing.order_assumed or order_assumed
                     self._paper_id_map[paper_trade_id] = symbol
@@ -953,7 +1160,7 @@ class ExecutionManager:
         assumed_tag = " [ASUMIDA — MARGIN INSUF]" if order_assumed else ""
         log.info(
             f"[REAL #{trade.id}] {action_tag} {trade.direction} {symbol} @ ${filled_price} | "
-            f"Qty total: {trade.quantity} | Lev: {LEVERAGE}x | OrderId: {entry_order_id} | "
+            f"Qty total: {trade.quantity} | Lev: {applied_leverage}x | OrderId: {entry_order_id} | "
             f"Paper#{paper_trade_id}{assumed_tag}"
         )
         return trade
@@ -1349,6 +1556,236 @@ async def manual_close_all_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "action": "manual_close_all", "positions_targeted": total_open})
 
 
+def _position_side_for(direction: str) -> Optional[str]:
+    return direction.upper() if HEDGE_MODE else "BOTH"
+
+
+async def manual_set_tp_handler(request: web.Request) -> web.Response:
+    """Crea (reemplazando el anterior si existía) un TAKE_PROFIT_MARKET
+    closePosition=true para el símbolo, vía WS API."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        trigger_price = float(data.get("trigger_price", 0))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    trade = execution_manager._trades.get(symbol)
+    if not trade:
+        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol}"}, status=404)
+    if trigger_price <= 0:
+        return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
+
+    close_side = "SELL" if trade.direction == "LONG" else "BUY"
+    pos_side = _position_side_for(trade.direction)
+    try:
+        await execution_manager.api.cancel_all_algo_orders(symbol)
+    except Exception:
+        pass
+    try:
+        # Cancela TPs previos (mismo tipo) antes de crear el nuevo, para
+        # no acumular órdenes condicionales duplicadas sobre el símbolo.
+        open_orders = await execution_manager.api.get_open_orders(symbol)
+        for o in open_orders:
+            if o.get("type") == "TAKE_PROFIT_MARKET":
+                await execution_manager.api.cancel_order(symbol, o.get("orderId"))
+    except Exception as e:
+        log.warning(f"manual_set_tp: no se pudo limpiar TP previo de {symbol}: {e}")
+
+    try:
+        result = await execution_manager.api.create_tp_sl_order(
+            symbol=symbol, side=close_side, stop_price=trigger_price,
+            order_type="TAKE_PROFIT_MARKET", position_side=pos_side, close_position=True,
+        )
+        return web.json_response({"ok": True, "symbol": symbol, "tp": trigger_price, "result": result})
+    except Exception as e:
+        log.error(f"manual_set_tp: fallo creando TP para {symbol}: {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def manual_set_sl_handler(request: web.Request) -> web.Response:
+    """Crea (reemplazando el anterior si existía) un STOP_MARKET
+    closePosition=true para el símbolo, vía WS API."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        trigger_price = float(data.get("trigger_price", 0))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    trade = execution_manager._trades.get(symbol)
+    if not trade:
+        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol}"}, status=404)
+    if trigger_price <= 0:
+        return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
+
+    close_side = "SELL" if trade.direction == "LONG" else "BUY"
+    pos_side = _position_side_for(trade.direction)
+    try:
+        open_orders = await execution_manager.api.get_open_orders(symbol)
+        for o in open_orders:
+            if o.get("type") == "STOP_MARKET":
+                await execution_manager.api.cancel_order(symbol, o.get("orderId"))
+    except Exception as e:
+        log.warning(f"manual_set_sl: no se pudo limpiar SL previo de {symbol}: {e}")
+
+    try:
+        result = await execution_manager.api.create_tp_sl_order(
+            symbol=symbol, side=close_side, stop_price=trigger_price,
+            order_type="STOP_MARKET", position_side=pos_side, close_position=True,
+        )
+        return web.json_response({"ok": True, "symbol": symbol, "sl": trigger_price, "result": result})
+    except Exception as e:
+        log.error(f"manual_set_sl: fallo creando SL para {symbol}: {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def manual_cancel_tp_sl_handler(request: web.Request) -> web.Response:
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    try:
+        open_orders = await execution_manager.api.get_open_orders(symbol)
+        cancelled = 0
+        for o in open_orders:
+            if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                await execution_manager.api.cancel_order(symbol, o.get("orderId"))
+                cancelled += 1
+        try:
+            await execution_manager.api.cancel_all_algo_orders(symbol)
+        except Exception:
+            pass
+        return web.json_response({"ok": True, "symbol": symbol, "cancelled": cancelled})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def manual_limit_order_handler(request: web.Request) -> web.Response:
+    """Coloca una orden LIMIT manual (reduceOnly opcional) para el símbolo."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        side = data.get("side", "").upper()  # BUY | SELL
+        price = float(data.get("price", 0))
+        quantity = float(data.get("quantity", 0))
+        reduce_only = bool(data.get("reduce_only", False))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if not symbol or side not in ("BUY", "SELL") or price <= 0 or quantity <= 0:
+        return web.json_response({"ok": False, "error": "parámetros inválidos"}, status=400)
+
+    trade = execution_manager._trades.get(symbol)
+    pos_side = _position_side_for(trade.direction) if trade else ("BOTH" if not HEDGE_MODE else None)
+    try:
+        result = await execution_manager.api.create_limit_order(
+            symbol=symbol, side=side, quantity=quantity, price=price,
+            position_side=pos_side, reduce_only=reduce_only,
+        )
+        return web.json_response({"ok": True, "result": result})
+    except Exception as e:
+        log.error(f"manual_limit_order: fallo en LIMIT {symbol}: {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def manual_set_symbol_leverage_handler(request: web.Request) -> web.Response:
+    """Cambia el leverage de UN símbolo puntual (con escalera de respaldo),
+    sin afectar el leverage global por defecto."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        leverage = int(data.get("leverage", 0))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if not symbol or leverage <= 0:
+        return web.json_response({"ok": False, "error": "parámetros inválidos"}, status=400)
+
+    try:
+        applied = await execution_manager.api.set_leverage_with_fallback(symbol, leverage)
+        trade = execution_manager._trades.get(symbol)
+        if trade:
+            trade.leverage = applied
+        return web.json_response({"ok": True, "symbol": symbol, "requested": leverage, "applied": applied})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def manual_set_margin_type_handler(request: web.Request) -> web.Response:
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        margin_type = data.get("margin_type", "").upper()  # ISOLATED | CROSSED
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    if margin_type not in ("ISOLATED", "CROSSED"):
+        return web.json_response({"ok": False, "error": "margin_type debe ser ISOLATED o CROSSED"}, status=400)
+
+    try:
+        result = await execution_manager.api.set_margin_type(symbol, margin_type)
+        return web.json_response({"ok": True, "symbol": symbol, "margin_type": margin_type, "result": result})
+    except Exception as e:
+        # -4046 = "No need to change margin type" -> ya estaba en ese modo, no es un error real
+        if "-4046" in str(e):
+            return web.json_response({"ok": True, "symbol": symbol, "margin_type": margin_type, "note": "ya estaba en ese modo"})
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def manual_modify_margin_handler(request: web.Request) -> web.Response:
+    """Añade o retira margen aislado de una posición abierta."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        amount = float(data.get("amount", 0))
+        add = bool(data.get("add", True))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    trade = execution_manager._trades.get(symbol)
+    if not trade or amount <= 0:
+        return web.json_response({"ok": False, "error": "posición no encontrada o monto inválido"}, status=400)
+
+    pos_side = _position_side_for(trade.direction)
+    try:
+        result = await execution_manager.api.modify_position_margin(symbol, amount, position_side=pos_side, add=add)
+        return web.json_response({"ok": True, "symbol": symbol, "amount": amount, "add": add, "result": result})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
+async def manual_get_orders_handler(request: web.Request) -> web.Response:
+    """Devuelve las órdenes abiertas (incluye TP/SL activos) de un símbolo,
+    usado por el modal de gestión de posición del dashboard."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    symbol = request.query.get("symbol", "").upper()
+    if not symbol:
+        return web.json_response({"ok": False, "error": "symbol requerido"}, status=400)
+    try:
+        orders = await execution_manager.api.get_open_orders(symbol)
+        return web.json_response({"ok": True, "symbol": symbol, "orders": orders})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+
 async def manual_toggle_trading_handler(request: web.Request) -> web.Response:
     if not _check_dashboard_token(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
@@ -1496,7 +1933,8 @@ async function refresh() {
           <td>${pnl}</td><td>${roi}</td>
           <td>${t.notional.toFixed(4)} USDT</td><td>${t.quantity}</td>
           <td>${t.open_time}${assum}</td>
-          <td><button class="btn-close" onclick="closeTrade('${t.symbol}')">Cerrar</button></td>
+          <td><button class="btn-close" onclick="closeTrade('${t.symbol}')">Cerrar</button>
+              <button class="btn-manage" onclick="openManageModal('${t.symbol}','${t.direction}',${t.entry_price},${t.quantity},${t.leverage})">⚙</button></td>
         </tr>`;
       }).join('');
     }
@@ -1594,6 +2032,107 @@ async function clearHistory() {
   } catch(e) { alert('Error de red al borrar historial'); }
 }
 
+let manageSymbol = null, manageDirection = null, manageEntry = 0, manageQty = 0;
+
+function openManageModal(symbol, direction, entry, qty, lev) {
+  manageSymbol = symbol; manageDirection = direction; manageEntry = entry; manageQty = qty;
+  document.getElementById('mm_title').textContent = '⚙ Gestionar ' + symbol + ' (' + direction + ')';
+  document.getElementById('mm_lev_input').value = lev;
+  showManageTab('tp');
+  document.getElementById('manage_modal').style.display = 'flex';
+  loadManageOrders();
+}
+
+function closeManageModal() { document.getElementById('manage_modal').style.display = 'none'; }
+
+function showManageTab(tab) {
+  ['tp','sl','limit','margin','lev'].forEach(t => {
+    document.getElementById('mm_tab_' + t).style.display = (t === tab ? 'block' : 'none');
+    document.getElementById('mm_btn_' + t).classList.toggle('active', t === tab);
+  });
+}
+
+async function mmFetch(path, body) {
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return null; }
+    return d;
+  } catch(e) { alert('Error de red'); return null; }
+}
+
+async function loadManageOrders() {
+  try {
+    const r = await fetch('/manual/orders?symbol=' + manageSymbol, {headers: {'X-Dashboard-Token': DASH_TOKEN}});
+    const d = await r.json();
+    const box = document.getElementById('mm_orders_box');
+    if (!d.ok || !d.orders.length) { box.textContent = 'Sin órdenes TP/SL/LIMIT activas.'; return; }
+    box.innerHTML = d.orders.map(o =>
+      `<div>${o.type} ${o.side} @ ${o.stopPrice && o.stopPrice !== '0' ? o.stopPrice : o.price} ` +
+      `<button class="btn-mini-close" onclick="mmCancelOrder(${o.orderId})">✕</button></div>`
+    ).join('');
+  } catch(e) {}
+}
+
+async function mmCancelOrder(orderId) {
+  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});  // cancela todos TP/SL del símbolo
+  if (r) { loadManageOrders(); }
+}
+
+async function mmSetTP() {
+  const p = parseFloat(document.getElementById('mm_tp_price').value);
+  if (!p || p <= 0) { alert('Precio de TP inválido'); return; }
+  const d = await mmFetch('/manual/set_tp', {symbol: manageSymbol, trigger_price: p});
+  if (d) { alert('TP configurado en $' + p); loadManageOrders(); }
+}
+
+async function mmSetSL() {
+  const p = parseFloat(document.getElementById('mm_sl_price').value);
+  if (!p || p <= 0) { alert('Precio de SL inválido'); return; }
+  const d = await mmFetch('/manual/set_sl', {symbol: manageSymbol, trigger_price: p});
+  if (d) { alert('SL configurado en $' + p); loadManageOrders(); }
+}
+
+async function mmCancelAllTpSl() {
+  if (!confirm('¿Cancelar TODOS los TP/SL activos de ' + manageSymbol + '?')) return;
+  const d = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});
+  if (d) { alert('TP/SL cancelados (' + d.cancelled + ')'); loadManageOrders(); }
+}
+
+async function mmLimitOrder() {
+  const side = document.getElementById('mm_limit_side').value;
+  const price = parseFloat(document.getElementById('mm_limit_price').value);
+  const qty = parseFloat(document.getElementById('mm_limit_qty').value);
+  const reduceOnly = document.getElementById('mm_limit_reduce').checked;
+  if (!price || !qty) { alert('Precio/cantidad inválidos'); return; }
+  const d = await mmFetch('/manual/limit_order', {symbol: manageSymbol, side, price, quantity: qty, reduce_only: reduceOnly});
+  if (d) alert('Orden LIMIT enviada');
+}
+
+async function mmModifyMargin(add) {
+  const amount = parseFloat(document.getElementById('mm_margin_amount').value);
+  if (!amount || amount <= 0) { alert('Monto inválido'); return; }
+  const d = await mmFetch('/manual/modify_margin', {symbol: manageSymbol, amount, add});
+  if (d) alert((add ? 'Margen añadido' : 'Margen retirado') + ': ' + amount + ' USDT');
+}
+
+async function mmSetMarginType(type) {
+  if (!confirm('¿Cambiar tipo de margen de ' + manageSymbol + ' a ' + type + '?')) return;
+  const d = await mmFetch('/manual/set_margin_type', {symbol: manageSymbol, margin_type: type});
+  if (d) alert('Tipo de margen: ' + type);
+}
+
+async function mmSetSymbolLeverage() {
+  const val = parseInt(document.getElementById('mm_lev_input').value, 10);
+  if (!val || val < 1 || val > 125) { alert('Leverage inválido'); return; }
+  const d = await mmFetch('/manual/set_symbol_leverage', {symbol: manageSymbol, leverage: val});
+  if (d) { alert('Leverage aplicado: ' + d.applied + 'x' + (d.applied !== val ? ' (rechazado ' + val + 'x, se usó la escalera de respaldo)' : '')); refresh(); }
+}
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -1642,6 +2181,21 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     .lev-row{{display:flex;gap:.35rem;margin-top:.4rem}}
     .lev-row input{{width:55px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:.2rem .3rem;font-size:.8rem}}
     .lev-row button{{background:#58a6ff;color:#0d1117;border:none;border-radius:4px;padding:.2rem .5rem;font-size:.72rem;cursor:pointer;font-weight:bold}}
+    .btn-manage{{background:#30363d;color:#f0f6fc;border:none;border-radius:4px;padding:.25rem .5rem;font-size:.7rem;cursor:pointer;margin-left:.3rem}}
+    .modal-overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center}}
+    .modal-box{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1rem 1.2rem;width:min(480px,92vw);max-height:85vh;overflow-y:auto}}
+    .modal-box h3{{color:#f0883e;margin:0 0 .7rem;font-size:1.05rem;display:flex;justify-content:space-between}}
+    .mm-tabs{{display:flex;gap:.3rem;margin-bottom:.8rem;flex-wrap:wrap}}
+    .mm-tab-btn{{background:#0d1117;color:#8b949e;border:1px solid #30363d;border-radius:6px;padding:.3rem .6rem;font-size:.72rem;cursor:pointer}}
+    .mm-tab-btn.active{{background:#58a6ff;color:#0d1117;border-color:#58a6ff}}
+    .mm-field{{margin-bottom:.6rem}}
+    .mm-field label{{display:block;color:#8b949e;font-size:.72rem;margin-bottom:.2rem}}
+    .mm-field input,.mm-field select{{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:.35rem .5rem;font-size:.85rem;box-sizing:border-box}}
+    .mm-field input[type=checkbox]{{width:auto}}
+    .mm-action{{background:#3fb950;color:#0d1117;border:none;border-radius:5px;padding:.4rem .8rem;font-size:.8rem;cursor:pointer;font-weight:bold;margin-right:.4rem;margin-top:.2rem}}
+    .mm-action.danger{{background:#f85149}}
+    .btn-mini-close{{background:#f85149;color:#fff;border:none;border-radius:3px;padding:0 .35rem;font-size:.68rem;cursor:pointer;margin-left:.4rem}}
+    #mm_orders_box{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.5rem;font-size:.74rem;margin-bottom:.8rem;color:#c9d1d9}}
   </style>
 </head>
 <body>
@@ -1711,6 +2265,53 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     Executor WS | Iniciado: {es['started_at']} | Actualizado: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
   </p>
 
+  <div class="modal-overlay" id="manage_modal">
+    <div class="modal-box">
+      <h3><span id="mm_title">⚙ Gestionar</span><span style="cursor:pointer" onclick="closeManageModal()">✕</span></h3>
+      <div id="mm_orders_box">Cargando órdenes...</div>
+      <div class="mm-tabs">
+        <button class="mm-tab-btn" id="mm_btn_tp" onclick="showManageTab('tp')">🎯 TP</button>
+        <button class="mm-tab-btn" id="mm_btn_sl" onclick="showManageTab('sl')">🛡 SL</button>
+        <button class="mm-tab-btn" id="mm_btn_limit" onclick="showManageTab('limit')">📋 Limit</button>
+        <button class="mm-tab-btn" id="mm_btn_margin" onclick="showManageTab('margin')">💰 Margen</button>
+        <button class="mm-tab-btn" id="mm_btn_lev" onclick="showManageTab('lev')">⚡ Leverage</button>
+      </div>
+
+      <div id="mm_tab_tp">
+        <div class="mm-field"><label>Precio de disparo (Take Profit)</label><input type="number" id="mm_tp_price" step="any"></div>
+        <button class="mm-action" onclick="mmSetTP()">Establecer TP</button>
+      </div>
+      <div id="mm_tab_sl" style="display:none">
+        <div class="mm-field"><label>Precio de disparo (Stop Loss)</label><input type="number" id="mm_sl_price" step="any"></div>
+        <button class="mm-action danger" onclick="mmSetSL()">Establecer SL</button>
+        <button class="mm-action" style="background:#8b949e" onclick="mmCancelAllTpSl()">Cancelar TP/SL</button>
+      </div>
+      <div id="mm_tab_limit" style="display:none">
+        <div class="mm-field"><label>Lado</label>
+          <select id="mm_limit_side"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
+        </div>
+        <div class="mm-field"><label>Precio</label><input type="number" id="mm_limit_price" step="any"></div>
+        <div class="mm-field"><label>Cantidad</label><input type="number" id="mm_limit_qty" step="any"></div>
+        <div class="mm-field"><label><input type="checkbox" id="mm_limit_reduce"> Reduce Only (cerrar parcial)</label></div>
+        <button class="mm-action" onclick="mmLimitOrder()">Enviar LIMIT</button>
+      </div>
+      <div id="mm_tab_margin" style="display:none">
+        <div class="mm-field"><label>Monto (USDT)</label><input type="number" id="mm_margin_amount" step="any"></div>
+        <button class="mm-action" onclick="mmModifyMargin(true)">➕ Añadir margen</button>
+        <button class="mm-action danger" onclick="mmModifyMargin(false)">➖ Retirar margen</button>
+        <div class="mm-field" style="margin-top:.8rem"><label>Tipo de margen (símbolo sin posición abierta)</label></div>
+        <button class="mm-action" onclick="mmSetMarginType('ISOLATED')">ISOLATED</button>
+        <button class="mm-action" onclick="mmSetMarginType('CROSSED')">CROSSED</button>
+      </div>
+      <div id="mm_tab_lev" style="display:none">
+        <div class="mm-field"><label>Leverage para este símbolo (con escalera de respaldo 10x→4x)</label>
+          <input type="number" id="mm_lev_input" min="1" max="125">
+        </div>
+        <button class="mm-action" onclick="mmSetSymbolLeverage()">Aplicar Leverage</button>
+      </div>
+    </div>
+  </div>
+
   {dashboard_js}
 </body>
 </html>"""
@@ -1725,6 +2326,14 @@ async def start_http_server():
     app.router.add_post("/manual/toggle_trading", manual_toggle_trading_handler)
     app.router.add_post("/manual/set_leverage", manual_set_leverage_handler)
     app.router.add_post("/manual/clear_history", manual_clear_history_handler)
+    app.router.add_post("/manual/set_tp", manual_set_tp_handler)
+    app.router.add_post("/manual/set_sl", manual_set_sl_handler)
+    app.router.add_post("/manual/cancel_tp_sl", manual_cancel_tp_sl_handler)
+    app.router.add_post("/manual/limit_order", manual_limit_order_handler)
+    app.router.add_post("/manual/set_symbol_leverage", manual_set_symbol_leverage_handler)
+    app.router.add_post("/manual/set_margin_type", manual_set_margin_type_handler)
+    app.router.add_post("/manual/modify_margin", manual_modify_margin_handler)
+    app.router.add_get("/manual/orders", manual_get_orders_handler)
     app.router.add_get("/", dashboard_handler)
     app.router.add_get("/health", dashboard_handler)
     app.router.add_get("/api/state", api_state_handler)
