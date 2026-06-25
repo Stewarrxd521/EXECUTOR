@@ -527,36 +527,31 @@ class BinanceAPI:
         self,
         symbol: str,
         side: str,
-        stop_price: float,
+        trigger_price: float,
         order_type: str,  # "STOP_MARKET" (SL) o "TAKE_PROFIT_MARKET" (TP)
         position_side: Optional[str] = None,
         close_position: bool = True,
         quantity: Optional[float] = None,
+        time_in_force: str = "GTC",
     ) -> dict:
         """
-        TP/SL nativos de Binance Futures, enviados por la WS API
-        (order.place) igual que las órdenes MARKET — más simples y
-        fiables que un Algo Order condicional para este caso de uso.
-        Con closePosition=true Binance cierra toda la posición al
-        disparar el trigger, sin necesitar quantity exacta.
+        TP/SL de Binance Futures. -4120 confirma que la WS API
+        (order.place) NO acepta STOP_MARKET/TAKE_PROFIT_MARKET con
+        closePosition — exige el endpoint dedicado de Algo Order
+        (POST /fapi/v1/algoOrder), así que se envían por ahí.
         """
-        params: dict = {
-            "symbol": symbol,
-            "side": side,
-            "type": order_type,
-            "stopPrice": str(stop_price),
-            "workingType": "MARK_PRICE",
-            "newOrderRespType": "RESULT",
-        }
-        if position_side:
-            params["positionSide"] = position_side
-        if close_position:
-            params["closePosition"] = "true"
-        elif quantity is not None:
-            params["quantity"] = str(quantity)
-            params["reduceOnly"] = "true"
-        result = await self._request("order.place", params=params, signed=True)
-        return result if isinstance(result, dict) else {"raw": result}
+        return await self.create_algo_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            triggerPrice=str(trigger_price),
+            positionSide=position_side or "BOTH",
+            closePosition="true" if close_position else None,
+            quantity=None if close_position else (str(quantity) if quantity is not None else None),
+            reduceOnly=None if close_position else "true",
+            timeInForce=time_in_force,
+            workingType="MARK_PRICE",
+        )
 
     async def create_limit_order(
         self,
@@ -586,13 +581,30 @@ class BinanceAPI:
 
     async def create_algo_order(self, symbol: str, side: str, order_type: str, **extra) -> dict:
         """
-        Algo Order condicional (POST /fapi/v1/algoOrder) — se mantiene
-        como respaldo para casos donde la WS API no acepte un tipo de
-        orden particular (p.ej. ciertos TWAP/iceberg). Para TP/SL normal
-        usar create_tp_sl_order, que es más simple y fiable.
+        Algo Order condicional (POST /fapi/v1/algoOrder) — endpoint
+        obligatorio para STOP_MARKET/TAKE_PROFIT_MARKET con
+        closePosition (la WS API los rechaza con -4120). `extra` admite
+        cualquier param adicional (triggerPrice, positionSide,
+        closePosition, quantity, reduceOnly, timeInForce, price,
+        workingType...); las claves con valor None se omiten.
         """
-        params = {"symbol": symbol, "side": side, "algoType": "CONDITIONAL", "type": order_type, **extra}
+        params = {"symbol": symbol, "side": side, "algoType": "CONDITIONAL", "type": order_type}
+        for k, v in extra.items():
+            if v is not None:
+                params[k] = v
         return await self._rest_signed("POST", "/fapi/v1/algoOrder", params)
+
+    async def get_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict]:
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        result = await self._rest_signed("GET", "/fapi/v1/algoOpenOrders", params)
+        if isinstance(result, dict):
+            return result.get("orders") or result.get("algoOrders") or []
+        return result if isinstance(result, list) else []
+
+    async def cancel_algo_order(self, algo_id) -> dict:
+        return await self._rest_signed("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
 
     async def cancel_all_algo_orders(self, symbol: str) -> dict:
         return await self._rest_signed("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
@@ -1561,8 +1573,8 @@ def _position_side_for(direction: str) -> Optional[str]:
 
 
 async def manual_set_tp_handler(request: web.Request) -> web.Response:
-    """Crea (reemplazando el anterior si existía) un TAKE_PROFIT_MARKET
-    closePosition=true para el símbolo, vía WS API."""
+    """Crea un TAKE_PROFIT_MARKET closePosition=true vía Algo Order API
+    (la WS API rechaza este tipo con -4120: 'use Algo Order endpoints')."""
     if not _check_dashboard_token(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     try:
@@ -1580,23 +1592,20 @@ async def manual_set_tp_handler(request: web.Request) -> web.Response:
 
     close_side = "SELL" if trade.direction == "LONG" else "BUY"
     pos_side = _position_side_for(trade.direction)
+
     try:
-        await execution_manager.api.cancel_all_algo_orders(symbol)
-    except Exception:
-        pass
-    try:
-        # Cancela TPs previos (mismo tipo) antes de crear el nuevo, para
-        # no acumular órdenes condicionales duplicadas sobre el símbolo.
-        open_orders = await execution_manager.api.get_open_orders(symbol)
-        for o in open_orders:
+        # Cancela TP previo (mismo tipo) antes de crear el nuevo, para no
+        # acumular Algo Orders condicionales duplicadas sobre el símbolo.
+        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
+        for o in algo_orders:
             if o.get("type") == "TAKE_PROFIT_MARKET":
-                await execution_manager.api.cancel_order(symbol, o.get("orderId"))
+                await execution_manager.api.cancel_algo_order(o.get("algoId"))
     except Exception as e:
         log.warning(f"manual_set_tp: no se pudo limpiar TP previo de {symbol}: {e}")
 
     try:
         result = await execution_manager.api.create_tp_sl_order(
-            symbol=symbol, side=close_side, stop_price=trigger_price,
+            symbol=symbol, side=close_side, trigger_price=trigger_price,
             order_type="TAKE_PROFIT_MARKET", position_side=pos_side, close_position=True,
         )
         return web.json_response({"ok": True, "symbol": symbol, "tp": trigger_price, "result": result})
@@ -1606,8 +1615,7 @@ async def manual_set_tp_handler(request: web.Request) -> web.Response:
 
 
 async def manual_set_sl_handler(request: web.Request) -> web.Response:
-    """Crea (reemplazando el anterior si existía) un STOP_MARKET
-    closePosition=true para el símbolo, vía WS API."""
+    """Crea un STOP_MARKET closePosition=true vía Algo Order API."""
     if not _check_dashboard_token(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     try:
@@ -1625,17 +1633,18 @@ async def manual_set_sl_handler(request: web.Request) -> web.Response:
 
     close_side = "SELL" if trade.direction == "LONG" else "BUY"
     pos_side = _position_side_for(trade.direction)
+
     try:
-        open_orders = await execution_manager.api.get_open_orders(symbol)
-        for o in open_orders:
+        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
+        for o in algo_orders:
             if o.get("type") == "STOP_MARKET":
-                await execution_manager.api.cancel_order(symbol, o.get("orderId"))
+                await execution_manager.api.cancel_algo_order(o.get("algoId"))
     except Exception as e:
         log.warning(f"manual_set_sl: no se pudo limpiar SL previo de {symbol}: {e}")
 
     try:
         result = await execution_manager.api.create_tp_sl_order(
-            symbol=symbol, side=close_side, stop_price=trigger_price,
+            symbol=symbol, side=close_side, trigger_price=trigger_price,
             order_type="STOP_MARKET", position_side=pos_side, close_position=True,
         )
         return web.json_response({"ok": True, "symbol": symbol, "sl": trigger_price, "result": result})
@@ -1654,16 +1663,12 @@ async def manual_cancel_tp_sl_handler(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
 
     try:
-        open_orders = await execution_manager.api.get_open_orders(symbol)
+        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
         cancelled = 0
-        for o in open_orders:
+        for o in algo_orders:
             if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
-                await execution_manager.api.cancel_order(symbol, o.get("orderId"))
+                await execution_manager.api.cancel_algo_order(o.get("algoId"))
                 cancelled += 1
-        try:
-            await execution_manager.api.cancel_all_algo_orders(symbol)
-        except Exception:
-            pass
         return web.json_response({"ok": True, "symbol": symbol, "cancelled": cancelled})
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=502)
@@ -1772,16 +1777,24 @@ async def manual_modify_margin_handler(request: web.Request) -> web.Response:
 
 
 async def manual_get_orders_handler(request: web.Request) -> web.Response:
-    """Devuelve las órdenes abiertas (incluye TP/SL activos) de un símbolo,
-    usado por el modal de gestión de posición del dashboard."""
+    """Devuelve las órdenes LIMIT abiertas + los Algo Orders (TP/SL)
+    activos de un símbolo, usado por el modal de gestión del dashboard."""
     if not _check_dashboard_token(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     symbol = request.query.get("symbol", "").upper()
     if not symbol:
         return web.json_response({"ok": False, "error": "symbol requerido"}, status=400)
     try:
-        orders = await execution_manager.api.get_open_orders(symbol)
-        return web.json_response({"ok": True, "symbol": symbol, "orders": orders})
+        normal_orders, algo_orders = await asyncio.gather(
+            execution_manager.api.get_open_orders(symbol),
+            execution_manager.api.get_open_algo_orders(symbol),
+            return_exceptions=True,
+        )
+        normal_orders = normal_orders if isinstance(normal_orders, list) else []
+        algo_orders = algo_orders if isinstance(algo_orders, list) else []
+        for o in algo_orders:
+            o["_algo"] = True
+        return web.json_response({"ok": True, "symbol": symbol, "orders": normal_orders + algo_orders})
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=502)
 
@@ -2032,12 +2045,14 @@ async function clearHistory() {
   } catch(e) { alert('Error de red al borrar historial'); }
 }
 
-let manageSymbol = null, manageDirection = null, manageEntry = 0, manageQty = 0;
+let manageSymbol = null, manageDirection = null, manageEntry = 0, manageQty = 0, manageLev = 1;
 
 function openManageModal(symbol, direction, entry, qty, lev) {
-  manageSymbol = symbol; manageDirection = direction; manageEntry = entry; manageQty = qty;
+  manageSymbol = symbol; manageDirection = direction; manageEntry = entry; manageQty = qty; manageLev = lev || 1;
   document.getElementById('mm_title').textContent = '⚙ Gestionar ' + symbol + ' (' + direction + ')';
   document.getElementById('mm_lev_input').value = lev;
+  document.getElementById('mm_entry_info').textContent =
+    'Entrada: $' + entry + ' | Cantidad: ' + qty + ' | Margen ≈ ' + (entry * qty / (lev || 1)).toFixed(2) + ' USDT (' + lev + 'x)';
   showManageTab('tp');
   document.getElementById('manage_modal').style.display = 'flex';
   loadManageOrders();
@@ -2071,16 +2086,60 @@ async function loadManageOrders() {
     const d = await r.json();
     const box = document.getElementById('mm_orders_box');
     if (!d.ok || !d.orders.length) { box.textContent = 'Sin órdenes TP/SL/LIMIT activas.'; return; }
-    box.innerHTML = d.orders.map(o =>
-      `<div>${o.type} ${o.side} @ ${o.stopPrice && o.stopPrice !== '0' ? o.stopPrice : o.price} ` +
-      `<button class="btn-mini-close" onclick="mmCancelOrder(${o.orderId})">✕</button></div>`
-    ).join('');
+    box.innerHTML = d.orders.map(o => {
+      const priceShown = o.triggerPrice || o.stopPrice || o.price;
+      const id = o._algo ? o.algoId : o.orderId;
+      const cancelFn = o._algo ? 'mmCancelAlgoOrder' : 'mmCancelOrder';
+      return `<div>${o.type} ${o.side} @ ${priceShown} ` +
+        `<button class="btn-mini-close" onclick="${cancelFn}('${id}')">✕</button></div>`;
+    }).join('');
   } catch(e) {}
 }
 
 async function mmCancelOrder(orderId) {
-  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});  // cancela todos TP/SL del símbolo
+  // Cancela TODOS los TP/SL (algo orders) del símbolo de un golpe.
+  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});
   if (r) { loadManageOrders(); }
+}
+
+async function mmCancelAlgoOrder(algoId) {
+  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});
+  if (r) { loadManageOrders(); }
+}
+
+// ── Calculadora de precio TP/SL a partir de ganancia($) o ROI(%) ──
+// LONG: precio_objetivo = entrada + ganancia/qty
+// SHORT: precio_objetivo = entrada - ganancia/qty
+// ganancia (a partir de ROI%) = (roi/100) * margen = (roi/100) * entrada*qty/leverage
+function mmCalcPriceFromUsdt(profitUsdt) {
+  const signedProfit = manageDirection === 'LONG' ? profitUsdt : -profitUsdt;
+  return manageEntry + (signedProfit / manageQty);
+}
+function mmCalcPriceFromRoi(roiPct) {
+  const margin = (manageEntry * manageQty) / (manageLev || 1);
+  const profitUsdt = (roiPct / 100) * margin;
+  return mmCalcPriceFromUsdt(profitUsdt);
+}
+
+function mmCalcTPFromUsdt() {
+  const v = parseFloat(document.getElementById('mm_tp_usdt').value);
+  if (!v) { alert('Ingresa una ganancia en USDT'); return; }
+  document.getElementById('mm_tp_price').value = mmCalcPriceFromUsdt(Math.abs(v)).toFixed(8);
+}
+function mmCalcTPFromRoi() {
+  const v = parseFloat(document.getElementById('mm_tp_roi').value);
+  if (!v) { alert('Ingresa un ROI % objetivo'); return; }
+  document.getElementById('mm_tp_price').value = mmCalcPriceFromRoi(Math.abs(v)).toFixed(8);
+}
+function mmCalcSLFromUsdt() {
+  const v = parseFloat(document.getElementById('mm_sl_usdt').value);
+  if (!v) { alert('Ingresa la pérdida máxima en USDT'); return; }
+  document.getElementById('mm_sl_price').value = mmCalcPriceFromUsdt(-Math.abs(v)).toFixed(8);
+}
+function mmCalcSLFromRoi() {
+  const v = parseFloat(document.getElementById('mm_sl_roi').value);
+  if (!v) { alert('Ingresa la pérdida máxima en ROI %'); return; }
+  document.getElementById('mm_sl_price').value = mmCalcPriceFromRoi(-Math.abs(v)).toFixed(8);
 }
 
 async function mmSetTP() {
@@ -2268,6 +2327,7 @@ async def dashboard_handler(request: web.Request) -> web.Response:
   <div class="modal-overlay" id="manage_modal">
     <div class="modal-box">
       <h3><span id="mm_title">⚙ Gestionar</span><span style="cursor:pointer" onclick="closeManageModal()">✕</span></h3>
+      <p id="mm_entry_info" style="color:#8b949e;font-size:.74rem;margin:-.3rem 0 .6rem"></p>
       <div id="mm_orders_box">Cargando órdenes...</div>
       <div class="mm-tabs">
         <button class="mm-tab-btn" id="mm_btn_tp" onclick="showManageTab('tp')">🎯 TP</button>
@@ -2278,10 +2338,34 @@ async def dashboard_handler(request: web.Request) -> web.Response:
       </div>
 
       <div id="mm_tab_tp">
+        <div class="mm-field"><label>Calcular por ganancia deseada (USDT)</label>
+          <div style="display:flex;gap:.4rem">
+            <input type="number" id="mm_tp_usdt" step="any" placeholder="ej. 7">
+            <button class="mm-action" style="margin:0" onclick="mmCalcTPFromUsdt()">Calcular</button>
+          </div>
+        </div>
+        <div class="mm-field"><label>Calcular por ROI % deseado (sobre el margen)</label>
+          <div style="display:flex;gap:.4rem">
+            <input type="number" id="mm_tp_roi" step="any" placeholder="ej. 50">
+            <button class="mm-action" style="margin:0" onclick="mmCalcTPFromRoi()">Calcular</button>
+          </div>
+        </div>
         <div class="mm-field"><label>Precio de disparo (Take Profit)</label><input type="number" id="mm_tp_price" step="any"></div>
         <button class="mm-action" onclick="mmSetTP()">Establecer TP</button>
       </div>
       <div id="mm_tab_sl" style="display:none">
+        <div class="mm-field"><label>Calcular por pérdida máxima (USDT)</label>
+          <div style="display:flex;gap:.4rem">
+            <input type="number" id="mm_sl_usdt" step="any" placeholder="ej. 5">
+            <button class="mm-action" style="margin:0" onclick="mmCalcSLFromUsdt()">Calcular</button>
+          </div>
+        </div>
+        <div class="mm-field"><label>Calcular por ROI % de pérdida máxima (sobre el margen)</label>
+          <div style="display:flex;gap:.4rem">
+            <input type="number" id="mm_sl_roi" step="any" placeholder="ej. 20">
+            <button class="mm-action" style="margin:0" onclick="mmCalcSLFromRoi()">Calcular</button>
+          </div>
+        </div>
         <div class="mm-field"><label>Precio de disparo (Stop Loss)</label><input type="number" id="mm_sl_price" step="any"></div>
         <button class="mm-action danger" onclick="mmSetSL()">Establecer SL</button>
         <button class="mm-action" style="background:#8b949e" onclick="mmCancelAllTpSl()">Cancelar TP/SL</button>
