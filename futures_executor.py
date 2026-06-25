@@ -1319,6 +1319,10 @@ executor_status = {
     "signals_close": 0,
     "signals_rejected": 0,
     "manual_closes": 0,
+    "signals_tp_set": 0,
+    "signals_tp_closed": 0,
+    "signals_sl_set": 0,
+    "signals_sl_closed": 0,
     "last_signal_time": "Esperando señales...",
     "last_signal_detail": "",
     "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -1539,6 +1543,60 @@ async def signal_handler(request: web.Request) -> web.Response:
         executor_status["signals_close"] += total_open
         return web.json_response({"ok": True, "action": "close_all", "positions_targeted": total_open})
 
+    # ── TP/SL vía REST — funcionalidad NUEVA, independiente de
+    # open/close/close_all (posiciones). Usa los mismos helpers que el
+    # dashboard manual (_algo_set_tp_sl / _algo_cancel_tp_sl).
+    if action in ("open_tp", "open_sl"):
+        order_type = "TAKE_PROFIT_MARKET" if action == "open_tp" else "STOP_MARKET"
+        trigger_price = float(data.get("trigger_price", 0))
+        trade = execution_manager._trades.get(symbol)
+
+        if not trade or trigger_price <= 0:
+            executor_status["signals_rejected"] += 1
+            return web.json_response(
+                {"ok": False, "error": f"{action}: sin posición abierta para {symbol} o trigger_price inválido"},
+                status=400,
+            )
+
+        async def _do_open_algo():
+            try:
+                await _algo_set_tp_sl(trade, trigger_price, order_type)
+                key = "signals_tp_set" if action == "open_tp" else "signals_sl_set"
+                executor_status[key] += 1
+                emoji = "🎯" if action == "open_tp" else "🛑"
+                label = "TP" if action == "open_tp" else "SL"
+                async with aiohttp.ClientSession() as sess:
+                    await send_telegram(sess, f"{emoji} <b>{label} actualizado</b>\n<code>{symbol}</code> @ {trigger_price}")
+            except Exception as e:
+                executor_status["signals_rejected"] += 1
+                log.error(f"signal {action}: fallo para {symbol}: {e}")
+
+        asyncio.create_task(_do_open_algo())
+        return web.json_response({"ok": True, "action": action, "symbol": symbol, "trigger_price": trigger_price})
+
+    if action in ("close_tp", "close_sl"):
+        order_type = "TAKE_PROFIT_MARKET" if action == "close_tp" else "STOP_MARKET"
+
+        if not symbol:
+            executor_status["signals_rejected"] += 1
+            return web.json_response({"ok": False, "error": f"{action}: falta symbol"}, status=400)
+
+        async def _do_close_algo():
+            try:
+                n = await _algo_cancel_tp_sl(symbol, order_type)
+                key = "signals_tp_closed" if action == "close_tp" else "signals_sl_closed"
+                executor_status[key] += 1
+                emoji = "🎯" if action == "close_tp" else "🛑"
+                label = "TP" if action == "close_tp" else "SL"
+                async with aiohttp.ClientSession() as sess:
+                    await send_telegram(sess, f"{emoji} <b>{label} cancelado</b>\n<code>{symbol}</code> — {n} orden(es)")
+            except Exception as e:
+                executor_status["signals_rejected"] += 1
+                log.error(f"signal {action}: fallo para {symbol}: {e}")
+
+        asyncio.create_task(_do_close_algo())
+        return web.json_response({"ok": True, "action": action, "symbol": symbol})
+
     executor_status["signals_rejected"] += 1
     return web.json_response({"ok": False, "error": f"unknown action: {action}"}, status=400)
 
@@ -1599,6 +1657,52 @@ def _position_side_for(direction: str) -> Optional[str]:
     return direction.upper() if HEDGE_MODE else "BOTH"
 
 
+# ══════════════════════════════════════════════════════════
+#  ALGO ORDERS TP/SL — FUNCIONALIDAD NUEVA E INDEPENDIENTE
+#  (no toca open_trade/close_trade/force_close_*; la usan tanto el
+#  dashboard manual como las nuevas acciones REST open_tp/close_tp/
+#  open_sl/close_sl de signal_handler).
+# ══════════════════════════════════════════════════════════
+async def _algo_set_tp_sl(trade: "Trade", trigger_price: float, order_type: str) -> dict:
+    """
+    Crea un algo order STOP_MARKET (SL) o TAKE_PROFIT_MARKET (TP) para
+    `trade`, cancelando primero cualquier algo order previo del MISMO
+    tipo sobre ese símbolo (para no acumular condicionales duplicadas).
+    Usa quantity+reduceOnly vía create_tp_sl_order (no closePosition)
+    para evitar el -4509 'TIF GTE can only be used with open positions'.
+    """
+    symbol = trade.symbol
+    close_side = "SELL" if trade.direction == "LONG" else "BUY"
+    pos_side = _position_side_for(trade.direction)
+
+    try:
+        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
+        for o in algo_orders:
+            if o.get("type") == order_type:
+                await execution_manager.api.cancel_algo_order(o.get("algoId"))
+    except Exception as e:
+        log.warning(f"_algo_set_tp_sl: no se pudo limpiar {order_type} previo de {symbol}: {e}")
+
+    filters = await execution_manager.api.get_symbol_filters(symbol)
+    qty = float(format_qty(trade.quantity, filters.get("stepSize", 0.001)))
+    return await execution_manager.api.create_tp_sl_order(
+        symbol=symbol, side=close_side, trigger_price=trigger_price,
+        order_type=order_type, position_side=pos_side, quantity=qty,
+    )
+
+
+async def _algo_cancel_tp_sl(symbol: str, order_type: str) -> int:
+    """Cancela solo los algo orders del tipo indicado (TAKE_PROFIT_MARKET
+    o STOP_MARKET) para `symbol`. Devuelve cuántos se cancelaron."""
+    algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
+    cancelled = 0
+    for o in algo_orders:
+        if o.get("type") == order_type:
+            await execution_manager.api.cancel_algo_order(o.get("algoId"))
+            cancelled += 1
+    return cancelled
+
+
 async def manual_set_tp_handler(request: web.Request) -> web.Response:
     """Crea un TAKE_PROFIT_MARKET vía Algo Order API (POST /fapi/v1/algoOrder
     — la WS API rechaza este tipo con -4120: 'use Algo Order endpoints').
@@ -1620,27 +1724,8 @@ async def manual_set_tp_handler(request: web.Request) -> web.Response:
     if trigger_price <= 0:
         return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
 
-    close_side = "SELL" if trade.direction == "LONG" else "BUY"
-    pos_side = _position_side_for(trade.direction)
-
     try:
-        # Cancela TP previo (mismo tipo) antes de crear el nuevo, para no
-        # acumular Algo Orders condicionales duplicadas sobre el símbolo.
-        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
-        for o in algo_orders:
-            if o.get("type") == "TAKE_PROFIT_MARKET":
-                await execution_manager.api.cancel_algo_order(o.get("algoId"))
-    except Exception as e:
-        log.warning(f"manual_set_tp: no se pudo limpiar TP previo de {symbol}: {e}")
-
-    try:
-        filters = await execution_manager.api.get_symbol_filters(symbol)
-        qty_for_tp = float(format_qty(trade.quantity, filters.get("stepSize", 0.001)))
-        result = await execution_manager.api.create_tp_sl_order(
-            symbol=symbol, side=close_side, trigger_price=trigger_price,
-            order_type="TAKE_PROFIT_MARKET", position_side=pos_side,
-            quantity=qty_for_tp,
-        )
+        result = await _algo_set_tp_sl(trade, trigger_price, "TAKE_PROFIT_MARKET")
         return web.json_response({"ok": True, "symbol": symbol, "tp": trigger_price, "result": result})
     except Exception as e:
         log.error(f"manual_set_tp: fallo creando TP para {symbol}: {e}")
@@ -1667,25 +1752,8 @@ async def manual_set_sl_handler(request: web.Request) -> web.Response:
     if trigger_price <= 0:
         return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
 
-    close_side = "SELL" if trade.direction == "LONG" else "BUY"
-    pos_side = _position_side_for(trade.direction)
-
     try:
-        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
-        for o in algo_orders:
-            if o.get("type") == "STOP_MARKET":
-                await execution_manager.api.cancel_algo_order(o.get("algoId"))
-    except Exception as e:
-        log.warning(f"manual_set_sl: no se pudo limpiar SL previo de {symbol}: {e}")
-
-    try:
-        filters = await execution_manager.api.get_symbol_filters(symbol)
-        qty_for_sl = float(format_qty(trade.quantity, filters.get("stepSize", 0.001)))
-        result = await execution_manager.api.create_tp_sl_order(
-            symbol=symbol, side=close_side, trigger_price=trigger_price,
-            order_type="STOP_MARKET", position_side=pos_side,
-            quantity=qty_for_sl,
-        )
+        result = await _algo_set_tp_sl(trade, trigger_price, "STOP_MARKET")
         return web.json_response({"ok": True, "symbol": symbol, "sl": trigger_price, "result": result})
     except Exception as e:
         log.error(f"manual_set_sl: fallo creando SL para {symbol}: {e}")
@@ -1882,6 +1950,10 @@ async def manual_clear_history_handler(request: web.Request) -> web.Response:
     executor_status["signals_received"] = 0
     executor_status["signals_rejected"] = 0
     executor_status["manual_closes"] = 0
+    executor_status["signals_tp_set"] = 0
+    executor_status["signals_tp_closed"] = 0
+    executor_status["signals_sl_set"] = 0
+    executor_status["signals_sl_closed"] = 0
     executor_status["last_signal_time"] = "Historial borrado"
     executor_status["last_signal_detail"] = ""
 
