@@ -39,6 +39,7 @@ POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
 
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
+MIN_VALID_PRICE = 0.00001
 
 WS_API_URL = os.environ.get(
     "BINANCE_WS_FAPI_URL",
@@ -88,6 +89,16 @@ def ceil_to_step(value: float, step: float) -> float:
     decimals = _step_decimals(step)
     units = math.ceil(round(value / step, 8))
     return round(units * step, decimals)
+
+def clamp_price(value: float, minimum: float = MIN_VALID_PRICE) -> float:
+    """Asegura que un precio nunca quede por debajo del mínimo válido."""
+    try:
+        price = float(value)
+    except Exception:
+        return 0.0
+    if not math.isfinite(price):
+        return 0.0
+    return max(minimum, price)
 
 
 def format_qty(value: float, step: float) -> str:
@@ -558,6 +569,10 @@ class BinanceAPI:
         dispare el trigger. closePosition=true queda solo como fallback
         para cuando no se tiene la cantidad exacta a mano.
         """
+        trigger_price = clamp_price(trigger_price)
+        if trigger_price <= 0:
+            raise ValueError("trigger_price inválido")
+
         use_close_position = close_position and quantity is None
 
         reduce_only = None
@@ -635,6 +650,34 @@ class BinanceAPI:
 
     async def cancel_all_algo_orders(self, symbol: str) -> dict:
         return await self._rest_signed("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+
+    async def cancel_symbol_orders(self, symbol: str) -> dict:
+        """
+        Cancela todas las órdenes vivas del símbolo: normales y algo orders.
+        Se usa al cerrar posiciones para evitar que queden órdenes huérfanas.
+        """
+        result: dict = {"symbol": symbol}
+        normal_err = None
+        algo_err = None
+
+        try:
+            result["normal"] = await self.cancel_all_open_orders(symbol)
+        except Exception as e:
+            normal_err = e
+            result["normal_error"] = str(e)
+
+        try:
+            result["algo"] = await self.cancel_all_algo_orders(symbol)
+        except Exception as e:
+            algo_err = e
+            result["algo_error"] = str(e)
+
+        if normal_err and algo_err:
+            raise RuntimeError(
+                f"No se pudieron cancelar órdenes normales ni algo orders para {symbol}: {normal_err}; {algo_err}"
+            )
+
+        return result
 
     async def set_margin_type(self, symbol: str, margin_type: str) -> dict:
         """margin_type: 'ISOLATED' o 'CROSSED'."""
@@ -1169,6 +1212,10 @@ class ExecutionManager:
                     log.info(f"open_trade: {symbol} neteado a 0 con esta señal — posición cerrada")
                     trade = None
                     action_tag = "NETEADO"
+                    try:
+                        await self.api.cancel_symbol_orders(symbol)
+                    except Exception as e:
+                        log.warning(f"open_trade: no se pudieron cancelar órdenes residuales de {symbol} tras neteo a 0: {e}")
                 else:
                     new_direction = "LONG" if new_signed > 0 else "SHORT"
                     new_qty = abs(new_signed)
@@ -1226,6 +1273,11 @@ class ExecutionManager:
             self._paper_id_map.pop(trade.paper_trade_id, None)
             self._closed.append(trade)
 
+        try:
+            await self.api.cancel_symbol_orders(trade.symbol)
+        except Exception as e:
+            log.warning(f"close_trade: no se pudieron cancelar órdenes residuales de {trade.symbol}: {e}")
+
         self._sync_ws_symbols()
 
         log.info(
@@ -1237,6 +1289,10 @@ class ExecutionManager:
 
     async def force_close_trade(self, trade: Trade, reason: str = "MAIN_BOT", close_price: Optional[float] = None) -> bool:
         close_price = close_price if close_price and close_price > 0 else (trade.current_price if trade.current_price > 0 else trade.entry_price)
+        try:
+            await self.api.cancel_symbol_orders(trade.symbol)
+        except Exception as e:
+            log.warning(f"force_close: no se pudieron cancelar órdenes previas de {trade.symbol}: {e}")
         try:
             await self.api.close_position_market(
                 symbol=trade.symbol,
@@ -1251,12 +1307,21 @@ class ExecutionManager:
 
     async def force_close_by_symbol(self, symbol: str) -> bool:
         try:
+            await self.api.cancel_symbol_orders(symbol)
+        except Exception as e:
+            log.warning(f"force_close_by_symbol: no se pudieron cancelar órdenes previas de {symbol}: {e}")
+        try:
             closed = await self.api.close_all_positions(symbol=symbol)
             log.info(f"force_close_by_symbol {symbol}: {closed}")
             return bool(closed)
         except Exception as e:
             log.error(f"force_close_by_symbol {symbol}: {e}")
             return False
+        finally:
+            try:
+                await self.api.cancel_symbol_orders(symbol)
+            except Exception as e:
+                log.warning(f"force_close_by_symbol: no se pudieron cancelar órdenes residuales de {symbol}: {e}")
 
     async def close_all_global(self, reason: str = "CLOSE_ALL") -> list[Trade]:
         async with self._lock:
@@ -2222,11 +2287,19 @@ async function mmCancelAlgoOrder(algoId) {
 // LONG: precio_objetivo = entrada + ganancia/qty
 // SHORT: precio_objetivo = entrada - ganancia/qty
 // ganancia (a partir de ROI%) = (roi/100) * margen = (roi/100) * entrada*qty/leverage
+function mmClampPrice(price) {
+  const n = Number(price);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0.00001, n);
+}
+
 function mmCalcPriceFromUsdt(profitUsdt) {
+  if (!manageQty || manageQty <= 0) return 0;
   const signedProfit = manageDirection === 'LONG' ? profitUsdt : -profitUsdt;
-  return manageEntry + (signedProfit / manageQty);
+  return mmClampPrice(manageEntry + (signedProfit / manageQty));
 }
 function mmCalcPriceFromRoi(roiPct) {
+  if (!manageQty || manageQty <= 0) return 0;
   const margin = (manageEntry * manageQty) / (manageLev || 1);
   const profitUsdt = (roiPct / 100) * margin;
   return mmCalcPriceFromUsdt(profitUsdt);
@@ -2234,23 +2307,31 @@ function mmCalcPriceFromRoi(roiPct) {
 
 function mmCalcTPFromUsdt() {
   const v = parseFloat(document.getElementById('mm_tp_usdt').value);
-  if (!v) { alert('Ingresa una ganancia en USDT'); return; }
-  document.getElementById('mm_tp_price').value = mmCalcPriceFromUsdt(Math.abs(v)).toFixed(8);
+  if (!Number.isFinite(v) || v <= 0) { alert('Ingresa una ganancia en USDT'); return; }
+  const price = mmCalcPriceFromUsdt(Math.abs(v));
+  if (!price) { alert('No se pudo calcular el TP'); return; }
+  document.getElementById('mm_tp_price').value = price.toFixed(8);
 }
 function mmCalcTPFromRoi() {
   const v = parseFloat(document.getElementById('mm_tp_roi').value);
-  if (!v) { alert('Ingresa un ROI % objetivo'); return; }
-  document.getElementById('mm_tp_price').value = mmCalcPriceFromRoi(Math.abs(v)).toFixed(8);
+  if (!Number.isFinite(v) || v <= 0) { alert('Ingresa un ROI % objetivo'); return; }
+  const price = mmCalcPriceFromRoi(Math.abs(v));
+  if (!price) { alert('No se pudo calcular el TP'); return; }
+  document.getElementById('mm_tp_price').value = price.toFixed(8);
 }
 function mmCalcSLFromUsdt() {
   const v = parseFloat(document.getElementById('mm_sl_usdt').value);
-  if (!v) { alert('Ingresa la pérdida máxima en USDT'); return; }
-  document.getElementById('mm_sl_price').value = mmCalcPriceFromUsdt(-Math.abs(v)).toFixed(8);
+  if (!Number.isFinite(v) || v <= 0) { alert('Ingresa la pérdida máxima en USDT'); return; }
+  const price = mmCalcPriceFromUsdt(-Math.abs(v));
+  if (!price) { alert('No se pudo calcular el SL'); return; }
+  document.getElementById('mm_sl_price').value = price.toFixed(8);
 }
 function mmCalcSLFromRoi() {
   const v = parseFloat(document.getElementById('mm_sl_roi').value);
-  if (!v) { alert('Ingresa la pérdida máxima en ROI %'); return; }
-  document.getElementById('mm_sl_price').value = mmCalcPriceFromRoi(-Math.abs(v)).toFixed(8);
+  if (!Number.isFinite(v) || v <= 0) { alert('Ingresa la pérdida máxima en ROI %'); return; }
+  const price = mmCalcPriceFromRoi(-Math.abs(v));
+  if (!price) { alert('No se pudo calcular el SL'); return; }
+  document.getElementById('mm_sl_price').value = price.toFixed(8);
 }
 
 async function mmSetTP() {
