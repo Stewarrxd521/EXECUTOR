@@ -1988,16 +1988,25 @@ async def manual_cancel_tp_sl_handler(request: web.Request) -> web.Response:
     try:
         data = await request.json()
         symbol = data.get("symbol", "").upper()
+        direction = data.get("direction")
     except Exception:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    # En Hedge Mode, cada algo order trae su propio positionSide (LONG/SHORT).
+    # Si el cliente especifica `direction`, sólo se cancelan los TP/SL de ESE
+    # lado, para no tocar accidentalmente el TP/SL de la posición opuesta.
+    wanted_pos_side = direction.upper() if (direction and HEDGE_MODE) else None
 
     try:
         algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
         cancelled = 0
         for o in algo_orders:
-            if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
-                await execution_manager.api.cancel_algo_order(o.get("algoId"))
-                cancelled += 1
+            if o.get("type") not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                continue
+            if wanted_pos_side and o.get("positionSide") not in (wanted_pos_side, None):
+                continue
+            await execution_manager.api.cancel_algo_order(o.get("algoId"))
+            cancelled += 1
         return web.json_response({"ok": True, "symbol": symbol, "cancelled": cancelled})
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=502)
@@ -2303,6 +2312,7 @@ async def api_state_handler(request: web.Request) -> web.Response:
         "leverage": LEVERAGE,
         "trading_enabled": em.trading_enabled,
         "testnet": USE_TESTNET,
+        "hedge_mode": HEDGE_MODE,
     })
 
 
@@ -2353,7 +2363,7 @@ async function refresh() {
           <td>${pnl}</td><td>${roi}</td>
           <td>${t.notional.toFixed(4)} USDT</td><td>${t.quantity}</td>
           <td>${t.open_time}${assum}</td>
-          <td><button class="btn-close" onclick="closeTrade('${t.symbol}')">Cerrar</button>
+          <td><button class="btn-close" onclick="closeTrade('${t.symbol}','${t.direction}')">Cerrar</button>
               <button class="btn-manage" onclick="openManageModal('${t.symbol}','${t.direction}',${t.entry_price},${t.quantity},${t.leverage})">⚙</button></td>
         </tr>`;
       }).join('');
@@ -2378,13 +2388,15 @@ async function refresh() {
   } catch(e) { console.error(e); }
 }
 
-async function closeTrade(symbol) {
-  if (!confirm('¿Cerrar manualmente la posición ' + symbol + '?')) return;
+async function closeTrade(symbol, direction) {
+  if (!confirm('¿Cerrar manualmente la posición ' + symbol + (direction ? ' (' + direction + ')' : '') + '?')) return;
   try {
+    const body = {symbol: symbol};
+    if (direction) body.direction = direction;
     const r = await fetch('/manual/close', {
       method: 'POST',
       headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
-      body: JSON.stringify({symbol: symbol})
+      body: JSON.stringify(body)
     });
     const d = await r.json();
     if (!d.ok) alert('Error al cerrar ' + symbol + ': ' + (d.error || 'desconocido'));
@@ -2520,13 +2532,13 @@ async function loadManageOrders() {
 }
 
 async function mmCancelOrder(orderId) {
-  // Cancela TODOS los TP/SL (algo orders) del símbolo de un golpe.
-  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});
+  // Cancela TODOS los TP/SL (algo orders) del símbolo/dirección de un golpe.
+  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol, direction: manageDirection});
   if (r) { loadManageOrders(); }
 }
 
 async function mmCancelAlgoOrder(algoId) {
-  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});
+  const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol, direction: manageDirection});
   if (r) { loadManageOrders(); }
 }
 
@@ -2584,20 +2596,20 @@ function mmCalcSLFromRoi() {
 async function mmSetTP() {
   const p = parseFloat(document.getElementById('mm_tp_price').value);
   if (!p || p <= 0) { alert('Precio de TP inválido'); return; }
-  const d = await mmFetch('/manual/set_tp', {symbol: manageSymbol, trigger_price: p});
+  const d = await mmFetch('/manual/set_tp', {symbol: manageSymbol, trigger_price: p, direction: manageDirection});
   if (d) { alert('TP configurado en $' + p); loadManageOrders(); }
 }
 
 async function mmSetSL() {
   const p = parseFloat(document.getElementById('mm_sl_price').value);
   if (!p || p <= 0) { alert('Precio de SL inválido'); return; }
-  const d = await mmFetch('/manual/set_sl', {symbol: manageSymbol, trigger_price: p});
+  const d = await mmFetch('/manual/set_sl', {symbol: manageSymbol, trigger_price: p, direction: manageDirection});
   if (d) { alert('SL configurado en $' + p); loadManageOrders(); }
 }
 
 async function mmCancelAllTpSl() {
-  if (!confirm('¿Cancelar TODOS los TP/SL activos de ' + manageSymbol + '?')) return;
-  const d = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol});
+  if (!confirm('¿Cancelar TODOS los TP/SL activos de ' + manageSymbol + ' (' + manageDirection + ')?')) return;
+  const d = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol, direction: manageDirection});
   if (d) { alert('TP/SL cancelados (' + d.cancelled + ')'); loadManageOrders(); }
 }
 
@@ -2607,14 +2619,14 @@ async function mmLimitOrder() {
   const qty = parseFloat(document.getElementById('mm_limit_qty').value);
   const reduceOnly = document.getElementById('mm_limit_reduce').checked;
   if (!price || !qty) { alert('Precio/cantidad inválidos'); return; }
-  const d = await mmFetch('/manual/limit_order', {symbol: manageSymbol, side, price, quantity: qty, reduce_only: reduceOnly});
+  const d = await mmFetch('/manual/limit_order', {symbol: manageSymbol, side, price, quantity: qty, reduce_only: reduceOnly, direction: manageDirection});
   if (d) alert('Orden LIMIT enviada');
 }
 
 async function mmModifyMargin(add) {
   const amount = parseFloat(document.getElementById('mm_margin_amount').value);
   if (!amount || amount <= 0) { alert('Monto inválido'); return; }
-  const d = await mmFetch('/manual/modify_margin', {symbol: manageSymbol, amount, add});
+  const d = await mmFetch('/manual/modify_margin', {symbol: manageSymbol, amount, add, direction: manageDirection});
   if (d) alert((add ? 'Margen añadido' : 'Margen retirado') + ': ' + amount + ' USDT');
 }
 
