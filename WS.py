@@ -320,7 +320,20 @@ class SymbolWebSocketPriceCache:
         with self.lock:
             if new_symbols == self.symbols:
                 return
+            removed = set(self.symbols) - set(new_symbols)
             self.symbols = new_symbols
+            # IMPORTANTE: si un símbolo deja de suscribirse, su precio en
+            # caché queda congelado para siempre (nadie vuelve a
+            # escribirlo). Si luego se reabre una posición en ese mismo
+            # símbolo, get_price() devolvería ese precio VIEJO como si
+            # fuera fresco, produciendo un entry_price completamente
+            # equivocado. Por eso se purga la caché de los símbolos que
+            # salen de la lista — así, si se reabren, se ven forzados a
+            # esperar un tick fresco (o caer a REST) en vez de reusar un
+            # precio obsoleto.
+            for sym in removed:
+                self.price_cache.pop(sym, None)
+                self.ticker_cache.pop(sym, None)
 
         preview = new_symbols[:5]
         print(
@@ -391,10 +404,22 @@ class SymbolWebSocketPriceCache:
     # Getters – markPrice
     # ──────────────────────────────────────────────────────────────────────
 
-    def get_price(self, symbol: str) -> float | None:
+    def get_price(self, symbol: str, max_age_s: float | None = None) -> float | None:
+        """Devuelve el último mark price cacheado para `symbol`.
+
+        Si se pasa `max_age_s`, un precio más viejo que ese umbral se
+        considera no confiable y se devuelve None (en vez de un precio
+        potencialmente obsoleto) — para que el llamador pueda esperar un
+        tick fresco o caer a REST en vez de operar con un dato viejo.
+        """
         with self.lock:
             entry = self.price_cache.get(symbol.upper())
-            return entry[0] if entry else None
+            if not entry:
+                return None
+            price, ts = entry
+            if max_age_s is not None and (time.time() - ts) > max_age_s:
+                return None
+            return price
 
     def get_all_prices(self) -> dict[str, float]:
         with self.lock:
