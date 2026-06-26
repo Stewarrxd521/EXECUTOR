@@ -39,6 +39,10 @@ POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
 
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
+# Edad máxima (segundos) que se acepta para un precio cacheado del WS antes
+# de considerarlo "no confiable" y forzar espera de un tick fresco / REST.
+# Evita el bug de reabrir un símbolo y heredar un precio viejo guardado.
+MAX_PRICE_AGE_S = float(os.environ.get("MAX_PRICE_AGE_S", "5.0"))
 MIN_VALID_PRICE = 0.00001
 
 WS_API_URL = os.environ.get(
@@ -889,12 +893,20 @@ class ExecutionManager:
     def __init__(self, binance_api, price_ws):
         self.api = binance_api
         self.price_ws = price_ws
-        self._trades: dict[str, Trade] = {}
+        # CLAVE: (symbol, direction) y NO solo symbol. Con HEDGE_MODE=true
+        # Binance mantiene posiciones LONG y SHORT independientes para el
+        # mismo símbolo (positionSide=LONG / SHORT). Si el diccionario
+        # local sólo usaba `symbol` como clave, una posición SHORT podía
+        # pisar/mezclarse con una LONG abierta del mismo símbolo (o
+        # viceversa), aunque en Binance fueran dos posiciones separadas.
+        # Con la clave compuesta, cada dirección vive en su propia entrada
+        # y se abre/cierra/promedia de forma independiente.
+        self._trades: dict[tuple[str, str], Trade] = {}
         self._closed: list[Trade] = []
         self._counter: int = 0
         self._lock = asyncio.Lock()
         self._balance: float = 0.0
-        self._paper_id_map: dict[int, str] = {}
+        self._paper_id_map: dict[int, tuple[str, str]] = {}
         self.trading_enabled: bool = True
 
     async def refresh_balance(self):
@@ -929,7 +941,32 @@ class ExecutionManager:
 
     @property
     def active_symbols(self) -> set:
-        return set(self._trades.keys())
+        return {sym for (sym, _direction) in self._trades.keys()}
+
+    def trades_for_symbol(self, symbol: str) -> list[Trade]:
+        """Todas las posiciones abiertas (LONG y/o SHORT) para un símbolo."""
+        symbol = symbol.upper()
+        return [t for (sym, _d), t in self._trades.items() if sym == symbol]
+
+    def get_trade(self, symbol: str, direction: Optional[str] = None) -> Optional[Trade]:
+        """Busca una posición por símbolo (+ dirección opcional).
+
+        Pensado para los endpoints HTTP existentes que sólo mandan
+        `symbol` (compatibilidad hacia atrás): si no se especifica
+        `direction` y hay una sola posición abierta para ese símbolo, la
+        devuelve sin ambigüedad. Si hay DOS (LONG y SHORT simultáneas en
+        Hedge Mode) y no se especificó dirección, no se puede adivinar
+        cuál quiere el llamador — devuelve None para forzar a que el
+        cliente especifique `direction` en vez de operar a ciegas sobre
+        la posición equivocada.
+        """
+        symbol = symbol.upper()
+        if direction:
+            return self._trades.get((symbol, direction.upper()))
+        matches = self.trades_for_symbol(symbol)
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     @property
     def total_realized_pnl(self) -> float:
@@ -945,7 +982,7 @@ class ExecutionManager:
 
     def _sync_ws_symbols(self):
         try:
-            self.price_ws.update_symbols(list(self._trades.keys()))
+            self.price_ws.update_symbols(list(self.active_symbols))
         except Exception as e:
             log.error(f"_sync_ws_symbols: {e}")
 
@@ -956,37 +993,62 @@ class ExecutionManager:
         generó la señal y puede llevar segundos de desfase.
 
         Orden de preferencia (siempre WS antes que REST):
-        1. Caché WS ya activa para el símbolo (instantáneo, sin RTT).
-        2. Si el símbolo aún no estaba suscrito, se suscribe al WS de
-           precios y se espera un breve instante a que llegue el primer
-           tick — en vez de descartar la apertura por no tenerlo ya.
+        1. Caché WS ya activa para el símbolo — pero SÓLO si es reciente
+           (< MAX_PRICE_AGE_S). Un precio cacheado viejo (p.ej. de una
+           posición anterior ya cerrada en ese mismo símbolo, cuyo stream
+           se desuscribió) es PEOR que no tener nada: produce un
+           entry_price completamente fuera de mercado sin ningún error
+           visible. Por eso aquí se exige freshness, no solo presencia.
+        2. Si el símbolo aún no estaba suscrito (o el dato es viejo), se
+           suscribe al WS de precios y se espera a que llegue un tick
+           fresco — en vez de descartar la apertura o reusar algo stale.
         3. Si el WS no entrega nada a tiempo (símbolo nuevo, lag de
            suscripción, etc.), se cae a REST (ticker/price) como último
-           recurso, nunca al precio de la señal.
+           recurso — pero nunca si REST ya está bajo ban de IP (-1003):
+           en ese caso reintentar solo extiende el bloqueo. Si está
+           baneado, se prefiere esperar más tiempo al WS.
         """
         try:
-            p = float(self.price_ws.get_price(symbol) or 0.0)
-            if p > 0:
-                return p
+            p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
+            if p and p > 0:
+                return float(p)
         except Exception:
             pass
 
         try:
-            wanted = set(self._trades.keys()) | {symbol}
+            wanted = self.active_symbols | {symbol}
             if extra_symbols:
                 wanted |= set(extra_symbols)
             self.price_ws.update_symbols(list(wanted))
         except Exception as e:
             log.warning(f"get_entry_reference_price: no se pudo suscribir {symbol} al WS: {e}")
 
-        for _ in range(15):  # hasta ~3s esperando el primer tick por WS
+        rest_banned = False
+        try:
+            rest_banned = self.api._is_rest_banned()
+        except Exception:
+            pass
+
+        # Si REST está baneado, le damos al WS mucho más margen (hasta
+        # ~15s) antes de rendirnos, en vez de caer a REST y empeorar el
+        # bloqueo de IP. Si REST está disponible, el margen normal (~3s)
+        # es suficiente porque hay un respaldo razonable después.
+        wait_iterations = 75 if rest_banned else 15
+        for _ in range(wait_iterations):
             await asyncio.sleep(0.2)
             try:
-                p = float(self.price_ws.get_price(symbol) or 0.0)
-                if p > 0:
-                    return p
+                p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
+                if p and p > 0:
+                    return float(p)
             except Exception:
                 pass
+
+        if rest_banned:
+            log.error(
+                f"get_entry_reference_price: {symbol} sin precio WS tras esperar y REST sigue baneado "
+                f"(~{self.api._rest_ban_remaining_s():.0f}s restantes) — apertura cancelada sin tocar REST"
+            )
+            return 0.0
 
         try:
             p = await self.api.get_rest_price(symbol)
@@ -1172,70 +1234,122 @@ class ExecutionManager:
                 return None
 
         async with self._lock:
-            existing = self._trades.get(symbol)
+            key = (symbol, direction)
 
-            if existing is None:
-                self._counter += 1
-                trade = Trade(
-                    id=self._counter,
-                    symbol=symbol,
-                    direction=direction,
-                    entry_price=filled_price,
-                    quantity=quantity,
-                    open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                    leverage=applied_leverage,
-                    paper_trade_id=paper_trade_id,
-                    entry_order_id=entry_order_id,
-                    current_price=filled_price,
-                    order_assumed=order_assumed,
-                )
-                self._trades[symbol] = trade
-                self._paper_id_map[paper_trade_id] = symbol
-                action_tag = "ABIERTO"
-            else:
-                # Ya había una posición en este símbolo: se fusiona usando
-                # cantidad con signo (+ LONG / - SHORT), igual que el neto
-                # real que mantiene Binance por símbolo.
-                old_signed = existing.quantity if existing.direction == "LONG" else -existing.quantity
-                delta_signed = quantity if direction == "LONG" else -quantity
-                new_signed = old_signed + delta_signed
+            if HEDGE_MODE:
+                # En Hedge Mode, Binance mantiene LONG y SHORT del mismo
+                # símbolo como posiciones TOTALMENTE independientes
+                # (positionSide). No hay neteo entre ellas: una señal LONG
+                # nunca debe tocar la posición SHORT existente del mismo
+                # símbolo, y viceversa. Por eso aquí sólo se busca/actualiza
+                # la entrada con la MISMA clave (symbol, direction); jamás
+                # se mira la dirección contraria.
+                existing = self._trades.get(key)
 
-                if abs(new_signed) < 1e-9:
-                    # La señal opuesta neteó la posición a cero -> queda cerrada
-                    existing.status = "NETTED"
-                    existing.close_price = filled_price
-                    existing.close_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                    existing.update_unrealized(filled_price)
-                    del self._trades[symbol]
-                    self._paper_id_map.pop(existing.paper_trade_id, None)
-                    self._closed.append(existing)
-                    log.info(f"open_trade: {symbol} neteado a 0 con esta señal — posición cerrada")
-                    trade = None
-                    action_tag = "NETEADO"
-                    try:
-                        await self.api.cancel_symbol_orders(symbol)
-                    except Exception as e:
-                        log.warning(f"open_trade: no se pudieron cancelar órdenes residuales de {symbol} tras neteo a 0: {e}")
+                if existing is None:
+                    self._counter += 1
+                    trade = Trade(
+                        id=self._counter,
+                        symbol=symbol,
+                        direction=direction,
+                        entry_price=filled_price,
+                        quantity=quantity,
+                        open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                        leverage=applied_leverage,
+                        paper_trade_id=paper_trade_id,
+                        entry_order_id=entry_order_id,
+                        current_price=filled_price,
+                        order_assumed=order_assumed,
+                    )
+                    self._trades[key] = trade
+                    self._paper_id_map[paper_trade_id] = key
+                    action_tag = "ABIERTO"
                 else:
-                    new_direction = "LONG" if new_signed > 0 else "SHORT"
-                    new_qty = abs(new_signed)
-                    if new_direction == existing.direction:
-                        # Misma dirección: se promedia el precio de entrada
-                        existing.entry_price = (
-                            (existing.entry_price * existing.quantity) + (filled_price * quantity)
-                        ) / new_qty
-                        action_tag = "AMPLIADO"
-                    else:
-                        # Dirección invertida: el remanente entra al precio nuevo
-                        existing.entry_price = filled_price
-                        action_tag = "INVERTIDO"
-                    existing.direction = new_direction
+                    # Misma dirección ya abierta: amplía y promedia precio.
+                    new_qty = existing.quantity + quantity
+                    existing.entry_price = (
+                        (existing.entry_price * existing.quantity) + (filled_price * quantity)
+                    ) / new_qty
                     existing.quantity = new_qty
                     existing.leverage = applied_leverage
                     existing.entry_order_id = entry_order_id
                     existing.order_assumed = existing.order_assumed or order_assumed
-                    self._paper_id_map[paper_trade_id] = symbol
+                    self._paper_id_map[paper_trade_id] = key
                     trade = existing
+                    action_tag = "AMPLIADO"
+            else:
+                # One-way mode (positionSide=BOTH): Binance mantiene UN
+                # único neto por símbolo sin importar qué `side` se mande,
+                # así que aquí también debe haber como máximo una entrada
+                # local por símbolo (cualquiera sea su dirección actual).
+                # Se busca la entrada existente para ESTE símbolo en
+                # cualquier dirección — nunca puede haber dos en one-way.
+                existing = next((t for (sym, _d), t in self._trades.items() if sym == symbol), None)
+
+                if existing is None:
+                    self._counter += 1
+                    trade = Trade(
+                        id=self._counter,
+                        symbol=symbol,
+                        direction=direction,
+                        entry_price=filled_price,
+                        quantity=quantity,
+                        open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                        leverage=applied_leverage,
+                        paper_trade_id=paper_trade_id,
+                        entry_order_id=entry_order_id,
+                        current_price=filled_price,
+                        order_assumed=order_assumed,
+                    )
+                    self._trades[key] = trade
+                    self._paper_id_map[paper_trade_id] = key
+                    action_tag = "ABIERTO"
+                else:
+                    old_key = (existing.symbol, existing.direction)
+                    # Fusión con signo (+ LONG / - SHORT), igual que el
+                    # neto real que mantiene Binance por símbolo.
+                    old_signed = existing.quantity if existing.direction == "LONG" else -existing.quantity
+                    delta_signed = quantity if direction == "LONG" else -quantity
+                    new_signed = old_signed + delta_signed
+
+                    if abs(new_signed) < 1e-9:
+                        existing.status = "NETTED"
+                        existing.close_price = filled_price
+                        existing.close_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                        existing.update_unrealized(filled_price)
+                        del self._trades[old_key]
+                        self._paper_id_map.pop(existing.paper_trade_id, None)
+                        self._closed.append(existing)
+                        log.info(f"open_trade: {symbol} neteado a 0 con esta señal — posición cerrada")
+                        trade = None
+                        action_tag = "NETEADO"
+                        try:
+                            await self.api.cancel_symbol_orders(symbol)
+                        except Exception as e:
+                            log.warning(f"open_trade: no se pudieron cancelar órdenes residuales de {symbol} tras neteo a 0: {e}")
+                    else:
+                        new_direction = "LONG" if new_signed > 0 else "SHORT"
+                        new_qty = abs(new_signed)
+                        if new_direction == existing.direction:
+                            existing.entry_price = (
+                                (existing.entry_price * existing.quantity) + (filled_price * quantity)
+                            ) / new_qty
+                            action_tag = "AMPLIADO"
+                        else:
+                            existing.entry_price = filled_price
+                            action_tag = "INVERTIDO"
+                        existing.direction = new_direction
+                        existing.quantity = new_qty
+                        existing.leverage = applied_leverage
+                        existing.entry_order_id = entry_order_id
+                        existing.order_assumed = existing.order_assumed or order_assumed
+
+                        new_key = (symbol, new_direction)
+                        if new_key != old_key:
+                            del self._trades[old_key]
+                            self._trades[new_key] = existing
+                        self._paper_id_map[paper_trade_id] = new_key
+                        trade = existing
 
         self._sync_ws_symbols()
         await self.refresh_balance()
@@ -1253,9 +1367,10 @@ class ExecutionManager:
 
     async def close_trade(self, trade: Trade, close_price: float, reason: str) -> bool:
         async with self._lock:
+            key = (trade.symbol, trade.direction)
             if trade.status != "OPEN":
                 return False
-            if trade.symbol not in self._trades:
+            if self._trades.get(key) is not trade:
                 return False
 
             trade.status = reason
@@ -1269,7 +1384,7 @@ class ExecutionManager:
 
             trade.roi_pct = (trade.pnl_usdt / trade.notional_usdt * 100) if trade.notional_usdt else 0.0
 
-            del self._trades[trade.symbol]
+            del self._trades[key]
             self._paper_id_map.pop(trade.paper_trade_id, None)
             self._closed.append(trade)
 
@@ -1350,26 +1465,38 @@ class ExecutionManager:
             log.error(f"poll_positions: {e}")
             return []
 
-        pos_by_symbol: dict[str, dict] = {}
+        # En Hedge Mode Binance devuelve una entrada por (symbol,
+        # positionSide); en one-way mode devuelve positionSide=BOTH. Se
+        # indexa por (symbol, direction) para poder comparar 1:1 contra
+        # las posiciones locales sin mezclar LONG y SHORT del mismo símbolo.
+        pos_by_key: dict[tuple[str, str], dict] = {}
         for p in positions:
             sym = p.get("symbol", "")
             try:
                 amt = float(p.get("positionAmt", 0))
             except Exception:
                 amt = 0.0
-            if sym and abs(amt) > 0:
-                pos_by_symbol[sym] = p
+            if not sym or abs(amt) <= 0:
+                continue
+            pos_side = p.get("positionSide", "BOTH")
+            if pos_side == "BOTH":
+                direction = "LONG" if amt > 0 else "SHORT"
+            else:
+                direction = pos_side
+            pos_by_key[(sym, direction)] = p
 
         async with self._lock:
             open_copy = dict(self._trades)
 
-        missing: list[Trade] = [trade for symbol, trade in open_copy.items() if symbol not in pos_by_symbol]
+        missing: list[Trade] = [
+            trade for key, trade in open_copy.items() if key not in pos_by_key
+        ]
         return missing
 
     def find_by_paper_id(self, paper_trade_id: int) -> Optional[Trade]:
-        sym = self._paper_id_map.get(paper_trade_id)
-        if sym:
-            return self._trades.get(sym)
+        key = self._paper_id_map.get(paper_trade_id)
+        if key:
+            return self._trades.get(key)
         return None
 
 
@@ -1571,7 +1698,7 @@ async def signal_handler(request: web.Request) -> web.Response:
     if action == "close":
         reason = data.get("reason", "MAIN_BOT").upper()
         close_price = float(data.get("close_price", 0))
-        trade = execution_manager.find_by_paper_id(trade_id) or execution_manager._trades.get(symbol)
+        trade = execution_manager.find_by_paper_id(trade_id) or execution_manager.get_trade(symbol, data.get("direction"))
 
         async def _do_close():
             if trade:
@@ -1614,7 +1741,7 @@ async def signal_handler(request: web.Request) -> web.Response:
     if action in ("open_tp", "open_sl"):
         order_type = "TAKE_PROFIT_MARKET" if action == "open_tp" else "STOP_MARKET"
         trigger_price = float(data.get("trigger_price", 0))
-        trade = execution_manager._trades.get(symbol)
+        trade = execution_manager.get_trade(symbol, data.get("direction"))
 
         if not trade or trigger_price <= 0:
             executor_status["signals_rejected"] += 1
@@ -1680,9 +1807,9 @@ async def manual_close_handler(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
 
     symbol = data.get("symbol", "").upper()
-    trade = execution_manager._trades.get(symbol)
+    trade = execution_manager.get_trade(symbol, data.get("direction"))
     if not trade:
-        return web.json_response({"ok": False, "error": f"no hay posición abierta registrada para {symbol}"}, status=404)
+        return web.json_response({"ok": False, "error": f"no hay posición abierta registrada para {symbol} (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=404)
 
     async def _do_manual_close():
         closed = await execution_manager.force_close_trade(trade, reason="MANUAL")
@@ -1783,9 +1910,9 @@ async def manual_set_tp_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
 
-    trade = execution_manager._trades.get(symbol)
+    trade = execution_manager.get_trade(symbol, data.get("direction"))
     if not trade:
-        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol}"}, status=404)
+        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol} (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=404)
     if trigger_price <= 0:
         return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
 
@@ -1811,9 +1938,9 @@ async def manual_set_sl_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
 
-    trade = execution_manager._trades.get(symbol)
+    trade = execution_manager.get_trade(symbol, data.get("direction"))
     if not trade:
-        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol}"}, status=404)
+        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol} (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=404)
     if trigger_price <= 0:
         return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
 
@@ -1863,7 +1990,7 @@ async def manual_limit_order_handler(request: web.Request) -> web.Response:
     if not symbol or side not in ("BUY", "SELL") or price <= 0 or quantity <= 0:
         return web.json_response({"ok": False, "error": "parámetros inválidos"}, status=400)
 
-    trade = execution_manager._trades.get(symbol)
+    trade = execution_manager.get_trade(symbol, data.get("direction"))
     pos_side = _position_side_for(trade.direction) if trade else ("BOTH" if not HEDGE_MODE else None)
     try:
         result = await execution_manager.api.create_limit_order(
@@ -1893,8 +2020,9 @@ async def manual_set_symbol_leverage_handler(request: web.Request) -> web.Respon
 
     try:
         applied = await execution_manager.api.set_leverage_with_fallback(symbol, leverage)
-        trade = execution_manager._trades.get(symbol)
-        if trade:
+        # Aplica el nuevo leverage a TODAS las posiciones abiertas de este
+        # símbolo (LONG y SHORT pueden coexistir en Hedge Mode).
+        for trade in execution_manager.trades_for_symbol(symbol):
             trade.leverage = applied
         return web.json_response({"ok": True, "symbol": symbol, "requested": leverage, "applied": applied})
     except Exception as e:
@@ -1936,9 +2064,9 @@ async def manual_modify_margin_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
 
-    trade = execution_manager._trades.get(symbol)
+    trade = execution_manager.get_trade(symbol, data.get("direction"))
     if not trade or amount <= 0:
-        return web.json_response({"ok": False, "error": "posición no encontrada o monto inválido"}, status=400)
+        return web.json_response({"ok": False, "error": "posición no encontrada o monto inválido (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=400)
 
     pos_side = _position_side_for(trade.direction)
     try:
