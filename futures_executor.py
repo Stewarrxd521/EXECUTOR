@@ -34,6 +34,18 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 LEVERAGE        = int(os.environ.get("LEVERAGE", "4"))
 HEDGE_MODE      = os.environ.get("HEDGE_MODE", "false").lower() == "true"
+
+
+def set_hedge_mode_runtime(value: bool) -> None:
+    """Cambia el flag HEDGE_MODE del proceso en caliente (sin reiniciar).
+
+    Todo el código que usa HEDGE_MODE lo lee como variable global en el
+    momento de cada llamada (no queda "congelado" en ningún closure), así
+    que reasignarlo aquí es suficiente para que open_trade/close_trade,
+    el cálculo de positionSide, etc. usen el nuevo modo de inmediato.
+    """
+    global HEDGE_MODE
+    HEDGE_MODE = bool(value)
 PORT            = int(os.environ.get("PORT", "10000"))
 POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
 
@@ -686,6 +698,24 @@ class BinanceAPI:
     async def set_margin_type(self, symbol: str, margin_type: str) -> dict:
         """margin_type: 'ISOLATED' o 'CROSSED'."""
         return await self._rest_signed("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type})
+
+    async def get_position_mode(self) -> bool:
+        """Consulta el modo actual de la CUENTA en Binance (no el de este
+        proceso). True = Hedge Mode (dualSidePosition), False = One-way."""
+        result = await self._rest_signed("GET", "/fapi/v1/positionSide/dual", {})
+        return bool(result.get("dualSidePosition"))
+
+    async def set_position_mode(self, hedge: bool) -> dict:
+        """Cambia el modo de posición de la CUENTA en Binance.
+
+        IMPORTANTE: Binance rechaza este cambio (-4059 / -4068) si hay
+        posiciones abiertas u órdenes activas en la cuenta — hay que
+        cerrar todo primero. Esto es una restricción de Binance, no de
+        este bot.
+        """
+        return await self._rest_signed(
+            "POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "true" if hedge else "false"}
+        )
 
     async def modify_position_margin(self, symbol: str, amount: float, position_side: str = "BOTH", add: bool = True) -> dict:
         """type=1 añade margen, type=2 lo retira (solo válido en ISOLATED)."""
@@ -2029,6 +2059,79 @@ async def manual_set_symbol_leverage_handler(request: web.Request) -> web.Respon
         return web.json_response({"ok": False, "error": str(e)}, status=502)
 
 
+async def manual_get_position_mode_handler(request: web.Request) -> web.Response:
+    """Consulta el modo de posición ACTUAL en la cuenta de Binance (fuente
+    de verdad) además del flag local HEDGE_MODE que usa este proceso."""
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        account_hedge = await execution_manager.api.get_position_mode()
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+    return web.json_response({
+        "ok": True,
+        "account_hedge_mode": account_hedge,   # lo que Binance tiene configurado de verdad
+        "local_hedge_mode": HEDGE_MODE,         # lo que este proceso está usando
+        "in_sync": account_hedge == HEDGE_MODE,
+        "open_positions": len(execution_manager._trades),
+    })
+
+
+async def manual_set_position_mode_handler(request: web.Request) -> web.Response:
+    """Cambia el modo de posición de la cuenta (Hedge <-> One-way) y, si
+    Binance lo acepta, también actualiza el flag local HEDGE_MODE para
+    que el bot empiece a operar en ese modo inmediatamente.
+
+    Body esperado: {"hedge_mode": true}  o  {"hedge_mode": false}
+    """
+    if not _check_dashboard_token(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        data = await request.json()
+        hedge_mode = bool(data.get("hedge_mode"))
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    # Binance rechaza el cambio si hay posiciones u órdenes abiertas — se
+    # valida también localmente para dar un mensaje claro de inmediato,
+    # antes de gastar la llamada REST.
+    open_count = len(execution_manager._trades)
+    if open_count > 0:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": (
+                    f"No se puede cambiar el modo de posición con {open_count} posición(es) "
+                    f"abierta(s) localmente. Cierra todas las posiciones primero (Binance "
+                    f"rechaza este cambio si la cuenta tiene posiciones u órdenes activas)."
+                ),
+            },
+            status=409,
+        )
+
+    try:
+        await execution_manager.api.set_position_mode(hedge_mode)
+    except Exception as e:
+        err = str(e)
+        # -4059: "No need to change position side." -> ya estaba en ese modo
+        if "-4059" in err:
+            set_hedge_mode_runtime(hedge_mode)
+            return web.json_response({"ok": True, "hedge_mode": hedge_mode, "note": "la cuenta ya estaba en ese modo"})
+        # -4068 / similares: hay posiciones u órdenes abiertas en Binance
+        # aunque localmente no se vieran (p.ej. quedaron huérfanas).
+        return web.json_response(
+            {"ok": False, "error": f"Binance rechazó el cambio: {err}"},
+            status=409 if ("-4068" in err or "-4067" in err or "position" in err.lower()) else 502,
+        )
+
+    set_hedge_mode_runtime(hedge_mode)
+    log.info(f"manual_set_position_mode_handler: modo de posición cambiado a {'HEDGE' if hedge_mode else 'ONE-WAY'}")
+    return web.json_response({"ok": True, "hedge_mode": hedge_mode})
+
+
 async def manual_set_margin_type_handler(request: web.Request) -> web.Response:
     if not _check_dashboard_token(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
@@ -2335,6 +2438,22 @@ async function setLeverage() {
   } catch(e) { alert('Error de red al cambiar el leverage'); }
 }
 
+async function setPositionMode(hedge) {
+  const label = hedge ? 'Hedge Mode (LONG y SHORT independientes)' : 'One-way Mode (posición neta única)';
+  if (!confirm('¿Cambiar el modo de posición de la cuenta a ' + label + '? Binance exige que NO haya posiciones ni órdenes abiertas para permitir el cambio.')) return;
+  try {
+    const r = await fetch('/manual/set_position_mode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Dashboard-Token': DASH_TOKEN},
+      body: JSON.stringify({hedge_mode: hedge})
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'desconocido')); return; }
+    alert('Modo de posición actualizado a ' + (d.hedge_mode ? 'Hedge Mode' : 'One-way Mode') + '.');
+    refresh();
+  } catch(e) { alert('Error de red al cambiar el modo de posición'); }
+}
+
 async function clearHistory() {
   if (!confirm('¿Borrar TODO el historial de operaciones cerradas y reiniciar el PnL realizado? Esta acción no se puede deshacer.')) return;
   try {
@@ -2603,6 +2722,15 @@ async def dashboard_handler(request: web.Request) -> web.Response:
       <div class="value" id="trading_state" style="color:{'#3fb950' if em.trading_enabled else '#f85149'}">{'🟢 ACTIVO' if em.trading_enabled else '🔴 PAUSADO'}</div>
       <button class="btn-toggle" id="trading_toggle_btn" onclick="toggleTrading()">{'⏸ Pausar nuevas posiciones' if em.trading_enabled else '▶ Reactivar nuevas posiciones'}</button>
     </div>
+    <div class="card">
+      <div class="label">Modo de posición</div>
+      <div class="value" id="pos_mode_value">{'🔀 Hedge Mode' if HEDGE_MODE else '➡️ One-way Mode'}</div>
+      <div class="lev-row">
+        <button onclick="setPositionMode(false)" {"disabled" if not HEDGE_MODE else ""}>One-way</button>
+        <button onclick="setPositionMode(true)" {"disabled" if HEDGE_MODE else ""}>Hedge</button>
+      </div>
+      <div style="font-size:.68rem;color:#8b949e;margin-top:.3rem">Requiere 0 posiciones/órdenes abiertas en Binance para poder cambiarlo.</div>
+    </div>
   </div>
 
   <h2>📡 Señales Recibidas</h2>
@@ -2736,6 +2864,8 @@ async def start_http_server():
     app.router.add_post("/manual/limit_order", manual_limit_order_handler)
     app.router.add_post("/manual/set_symbol_leverage", manual_set_symbol_leverage_handler)
     app.router.add_post("/manual/set_margin_type", manual_set_margin_type_handler)
+    app.router.add_get("/manual/position_mode", manual_get_position_mode_handler)
+    app.router.add_post("/manual/set_position_mode", manual_set_position_mode_handler)
     app.router.add_post("/manual/modify_margin", manual_modify_margin_handler)
     app.router.add_get("/manual/orders", manual_get_orders_handler)
     app.router.add_get("/", dashboard_handler)
