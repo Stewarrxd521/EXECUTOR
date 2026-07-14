@@ -76,7 +76,7 @@ REST_FAPI_URL = os.environ.get(
 # balance/posición, ni el resto de llamadas REST que tampoco tienen
 # equivalente WS) pasa por Fixie — eso quedó así por decisión explícita.
 # Variable típica que entrega el addon de Fixie: FIXIE_URL=http://user:pass@host:port
-FIXIE_URL = os.environ.get("FIXIE_URL", "").strip()
+FIXIE_URL = os.environ.get("FIXIE_URL", "http://fixie:CuLSweHyTOG4Lg3@ventoux.usefixie.com:80").strip()
 
 logging.basicConfig(
     level=logging.INFO,
