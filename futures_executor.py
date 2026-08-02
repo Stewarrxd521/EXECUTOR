@@ -12,6 +12,7 @@ from aiohttp import web
 import logging
 import math
 import re
+import time
 from datetime import datetime, timezone
 import os
 import json
@@ -48,6 +49,15 @@ def set_hedge_mode_runtime(value: bool) -> None:
     HEDGE_MODE = bool(value)
 PORT            = int(os.environ.get("PORT", "10000"))
 POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
+# Intervalo mínimo entre consultas de balance (WS API, account.balance).
+# Antes se pedía balance fresco justo después de CADA apertura/cierre de
+# posición, lo que hacía que leverage (REST vía Fixie) + orden (WS) +
+# balance (WS) salieran casi en el mismo instante hacia Binance. Ahora
+# refresh_balance() se autolimita a como máximo 1 consulta cada
+# BALANCE_POLL_S segundos, y un loop independiente (balance_sync_loop)
+# se encarga de mantenerlo actualizado sin depender de la actividad de
+# trading.
+BALANCE_POLL_S  = int(os.environ.get("BALANCE_POLL_S", "60"))
 
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
@@ -206,6 +216,13 @@ class Trade:
     pnl_usdt: float = 0.0
     roi_pct: float = 0.0
     order_assumed: bool = False
+    # Modo con el que se logró (o se asumió) la orden de ENTRADA de esta
+    # posición puntual: True = Hedge (positionSide=LONG/SHORT), False =
+    # One-way (positionSide=BOTH). Ya no se decide por el flag global
+    # HEDGE_MODE sino por lo que realmente aceptó Binance para esta
+    # posición (ver ExecutionManager._place_entry_order). Se usa luego
+    # para cerrar / poner TP-SL con el positionSide correcto.
+    hedge_mode: bool = True
 
     @property
     def notional_usdt(self) -> float:
@@ -610,11 +627,15 @@ class BinanceAPI:
 
         use_close_position = close_position and quantity is None
 
+        # Se decide reduceOnly según el positionSide REAL de esta orden
+        # puntual (no el flag global HEDGE_MODE, que puede no coincidir
+        # si esta posición cayó al fallback One-way): con LONG/SHORT
+        # (Hedge) Binance rechaza reduceOnly porque side+positionSide ya
+        # implica reducción; con BOTH (One-way) sí hace falta para no
+        # abrir posición nueva.
+        is_hedge_side = (position_side or "BOTH") in ("LONG", "SHORT")
         reduce_only = None
-        if not use_close_position and not HEDGE_MODE:
-            # En Hedge Mode, reduceOnly no se puede enviar (Binance lo
-            # rechaza): side + positionSide ya implica reducción. En
-            # One-way Mode sí hace falta para no abrir posición nueva.
+        if not use_close_position and not is_hedge_side:
             reduce_only = "true"
 
         return await self.create_algo_order(
@@ -895,16 +916,36 @@ class ExecutionManager:
         self._balance: float = 0.0
         self._paper_id_map: dict[int, tuple[str, str]] = {}
         self.trading_enabled: bool = True
+        self._last_balance_refresh: float = 0.0
+        self._balance_refresh_lock = asyncio.Lock()
 
-    async def refresh_balance(self):
-        try:
-            balances = await self.api.account_balance()
-            for b in balances:
-                if b.get("asset") == "USDT":
-                    self._balance = float(b.get("availableBalance", b.get("balance", 0)))
-                    return
-        except Exception as e:
-            log.error(f"refresh_balance: {e}")
+    async def refresh_balance(self, force: bool = False):
+        """
+        Consulta el balance (account.balance, WS API). Autolimitada a un
+        máximo de 1 consulta real cada BALANCE_POLL_S segundos: así,
+        aunque open_trade/close_trade sigan llamando a esto tras cada
+        operación, no se dispara una petición nueva si ya se refrescó
+        hace poco — evita sumarse a la ráfaga leverage(REST)+orden(WS)
+        que salía junta en el mismo instante. balance_sync_loop() se
+        encarga de mantenerlo al día (force=True) cada BALANCE_POLL_S
+        segundos de forma independiente a la actividad de trading.
+        """
+        now = time.monotonic()
+        if not force and (now - self._last_balance_refresh) < BALANCE_POLL_S:
+            return
+        async with self._balance_refresh_lock:
+            now = time.monotonic()
+            if not force and (now - self._last_balance_refresh) < BALANCE_POLL_S:
+                return
+            try:
+                balances = await self.api.account_balance()
+                for b in balances:
+                    if b.get("asset") == "USDT":
+                        self._balance = float(b.get("availableBalance", b.get("balance", 0)))
+                        break
+                self._last_balance_refresh = time.monotonic()
+            except Exception as e:
+                log.error(f"refresh_balance: {e}")
 
     @property
     def balance(self) -> float:
@@ -1116,6 +1157,66 @@ class ExecutionManager:
                 new_order_resp_type="RESULT",
             )
 
+    @staticmethod
+    def _is_margin_insufficient(err: str) -> bool:
+        return "-2019" in err or "Margin is insufficient" in err
+
+    async def _place_entry_order(
+        self,
+        symbol: str,
+        side: str,
+        qty_str: str,
+        direction: str,
+        filters: dict,
+        ref_price: float,
+    ) -> tuple[Optional[dict], bool, bool]:
+        """
+        Envía la orden de ENTRADA. Como se opera LONG y SHORT del mismo
+        símbolo al mismo tiempo, SIEMPRE se intenta primero en modo
+        Hedge (positionSide=LONG/SHORT):
+
+        - Si falla por margen insuficiente (-2019): NO se reintenta en
+          otro modo — se trata igual que siempre (posición "asumida"),
+          porque el problema es de margen, no de positionSide.
+        - Si falla por cualquier OTRO motivo (típicamente -4061 "order's
+          position side does not match user's setting", es decir la
+          cuenta en Binance no está realmente en Hedge Mode) se
+          reintenta UNA vez en modo One-way (positionSide=BOTH). Lo que
+          haya funcionado en ESTE intento es lo que se registra como
+          modo real de esta posición puntual (Trade.hedge_mode).
+
+        Devuelve (result_o_None, used_hedge, order_assumed).
+        """
+        try:
+            result = await self._place_market_order_safe(
+                symbol=symbol, side=side, qty_str=qty_str,
+                position_side=direction, filters=filters, ref_price=ref_price,
+            )
+            return result, True, False
+        except Exception as e_hedge:
+            err_hedge = str(e_hedge)
+            if self._is_margin_insufficient(err_hedge):
+                log.warning(f"_place_entry_order: {symbol} margen insuficiente en modo Hedge — posición asumida: {e_hedge}")
+                return None, True, True
+
+            log.warning(
+                f"_place_entry_order: {symbol} rechazada en modo Hedge ({e_hedge}) por un motivo "
+                f"distinto a margen — reintentando como One-way (positionSide=BOTH)"
+            )
+            try:
+                result = await self._place_market_order_safe(
+                    symbol=symbol, side=side, qty_str=qty_str,
+                    position_side="BOTH", filters=filters, ref_price=ref_price,
+                )
+                return result, False, False
+            except Exception as e_oneway:
+                err_oneway = str(e_oneway)
+                if self._is_margin_insufficient(err_oneway):
+                    log.warning(f"_place_entry_order: {symbol} margen insuficiente en reintento One-way — posición asumida: {e_oneway}")
+                    return None, False, True
+                log.error(f"_place_entry_order: {symbol} falló tanto en Hedge como en One-way: {e_oneway}")
+                raise
+
     async def open_trade(
         self,
         symbol: str,
@@ -1126,7 +1227,10 @@ class ExecutionManager:
     ) -> Optional[Trade]:
         direction = direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
-        position_side = direction if HEDGE_MODE else "BOTH"
+        # El positionSide de ENTRADA ya no se decide con el flag global
+        # HEDGE_MODE: se intenta siempre en modo Hedge primero y, si
+        # Binance la rechaza por un motivo distinto a margen, se cae a
+        # One-way automáticamente (ver _place_entry_order más abajo).
 
         # Ya NO se bloquea si el símbolo ya tiene una posición abierta: la
         # señal se manda siempre. Si ya existía una posición en ese símbolo,
@@ -1194,16 +1298,24 @@ class ExecutionManager:
         quantity = send_qty
 
         qty_str = format_qty(quantity, filters.get("stepSize", 0.001))
-        log.info(f"open_trade: enviando MARKET por WS → {symbol} {side} qty={qty_str} (notional≈${send_notional:.4f})")
+        log.info(f"open_trade: enviando MARKET por WS → {symbol} {side} qty={qty_str} (notional≈${send_notional:.4f}) [intento Hedge]")
         try:
-            result = await self._place_market_order_safe(
+            result, used_hedge, order_assumed = await self._place_entry_order(
                 symbol=symbol,
                 side=side,
                 qty_str=qty_str,
-                position_side=position_side,
+                direction=direction,
                 filters=filters,
                 ref_price=ref_price,
             )
+        except Exception as e_ord:
+            log.error(f"open_trade: fallo enviando MARKET (Hedge y fallback One-way) para {symbol}: {e_ord}")
+            return None
+
+        if order_assumed:
+            log.warning(f"[ASUMIDA] {symbol} — posición registrada como abierta pese a margen insuficiente")
+            entry_order_id = "MARGIN_INSUFFICIENT"
+        else:
             entry_order_id = str(result.get("orderId", result.get("clientOrderId", "WS_ORDER")))
             avg = result.get("avgPrice") or result.get("price")
             try:
@@ -1220,22 +1332,17 @@ class ExecutionManager:
                     quantity = executed_qty
             except Exception:
                 pass
-            log.info(f"MARKET WS OK: {symbol} {side} qty={quantity} id={entry_order_id} avg={filled_price}")
-        except Exception as e_ord:
-            err = str(e_ord)
-            if "-2019" in err or "Margin is insufficient" in err:
-                log.warning(f"[ASUMIDA] MARKET WS -2019 para {symbol} — posición registrada como abierta: {e_ord}")
-                entry_order_id = "MARGIN_INSUFFICIENT"
-                order_assumed = True
-            else:
-                log.error(f"open_trade: fallo enviando MARKET WS para {symbol}: {e_ord}")
-                return None
+            log.info(
+                f"MARKET WS OK: {symbol} {side} qty={quantity} id={entry_order_id} avg={filled_price} "
+                f"modo={'Hedge' if used_hedge else 'One-way (fallback)'}"
+            )
 
         async with self._lock:
             key = (symbol, direction)
 
-            if HEDGE_MODE:
-                # En Hedge Mode, Binance mantiene LONG y SHORT del mismo
+            if used_hedge:
+                # Esta entrada se logró (o se asumió) en Hedge Mode: Binance
+                # mantiene LONG y SHORT del mismo
                 # símbolo como posiciones TOTALMENTE independientes
                 # (positionSide). No hay neteo entre ellas: una señal LONG
                 # nunca debe tocar la posición SHORT existente del mismo
@@ -1258,6 +1365,7 @@ class ExecutionManager:
                         entry_order_id=entry_order_id,
                         current_price=filled_price,
                         order_assumed=order_assumed,
+                        hedge_mode=True,
                     )
                     self._trades[key] = trade
                     self._paper_id_map[paper_trade_id] = key
@@ -1272,11 +1380,13 @@ class ExecutionManager:
                     existing.leverage = applied_leverage
                     existing.entry_order_id = entry_order_id
                     existing.order_assumed = existing.order_assumed or order_assumed
+                    existing.hedge_mode = True
                     self._paper_id_map[paper_trade_id] = key
                     trade = existing
                     action_tag = "AMPLIADO"
             else:
-                # One-way mode (positionSide=BOTH): Binance mantiene UN
+                # Esta entrada se logró (o se asumió) en One-way (fallback,
+                # positionSide=BOTH): Binance mantiene UN
                 # único neto por símbolo sin importar qué `side` se mande,
                 # así que aquí también debe haber como máximo una entrada
                 # local por símbolo (cualquiera sea su dirección actual).
@@ -1298,6 +1408,7 @@ class ExecutionManager:
                         entry_order_id=entry_order_id,
                         current_price=filled_price,
                         order_assumed=order_assumed,
+                        hedge_mode=False,
                     )
                     self._trades[key] = trade
                     self._paper_id_map[paper_trade_id] = key
@@ -1341,6 +1452,7 @@ class ExecutionManager:
                         existing.leverage = applied_leverage
                         existing.entry_order_id = entry_order_id
                         existing.order_assumed = existing.order_assumed or order_assumed
+                        existing.hedge_mode = False
 
                         new_key = (symbol, new_direction)
                         if new_key != old_key:
@@ -1411,7 +1523,7 @@ class ExecutionManager:
                 symbol=trade.symbol,
                 direction=trade.direction,
                 quantity=trade.quantity,
-                position_side=(trade.direction if HEDGE_MODE else "BOTH"),
+                position_side=(trade.direction if trade.hedge_mode else "BOTH"),
             )
             log.info(f"force_close: close_position_market OK para {trade.symbol}")
         except Exception as e:
@@ -1628,6 +1740,22 @@ async def position_monitor_loop(session: aiohttp.ClientSession):
             log.error(f"position_monitor_loop: {e}")
 
         await asyncio.sleep(POSITION_POLL_S)
+
+
+# ══════════════════════════════════════════════════════════
+#  SYNC DE BALANCE
+# ══════════════════════════════════════════════════════════
+async def balance_sync_loop():
+    """
+    Único responsable de mantener el balance actualizado. Corre
+    independiente de las señales de trading, así que la consulta de
+    balance queda espaciada en el tiempo y no coincide con el instante
+    en que se manda leverage (REST) + orden (WS) al abrir una posición.
+    """
+    log.info(f"Balance Sync Loop — refrescando balance cada {BALANCE_POLL_S}s")
+    while True:
+        await execution_manager.refresh_balance(force=True)
+        await asyncio.sleep(BALANCE_POLL_S)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1863,7 +1991,10 @@ async def _algo_set_tp_sl(trade: "Trade", trigger_price: float, order_type: str)
     """
     symbol = trade.symbol
     close_side = "SELL" if trade.direction == "LONG" else "BUY"
-    pos_side = _position_side_for(trade.direction)
+    # Usa el modo REAL con el que se abrió esta posición puntual, no el
+    # flag global HEDGE_MODE — pueden diferir si esta entrada cayó al
+    # fallback One-way (ver ExecutionManager._place_entry_order).
+    pos_side = trade.direction if trade.hedge_mode else "BOTH"
 
     try:
         algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
@@ -1964,7 +2095,14 @@ async def manual_cancel_tp_sl_handler(request: web.Request) -> web.Response:
     # En Hedge Mode, cada algo order trae su propio positionSide (LONG/SHORT).
     # Si el cliente especifica `direction`, sólo se cancelan los TP/SL de ESE
     # lado, para no tocar accidentalmente el TP/SL de la posición opuesta.
-    wanted_pos_side = direction.upper() if (direction and HEDGE_MODE) else None
+    # Se usa el modo REAL del trade rastreado (puede diferir del flag
+    # global HEDGE_MODE si esa entrada cayó al fallback One-way); si no
+    # hay trade local rastreado, se usa el flag global como mejor estimado.
+    _trade_for_dir = execution_manager.get_trade(symbol, direction) if direction else None
+    if _trade_for_dir is not None:
+        wanted_pos_side = direction.upper() if _trade_for_dir.hedge_mode else None
+    else:
+        wanted_pos_side = direction.upper() if (direction and HEDGE_MODE) else None
 
     try:
         algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
@@ -1999,7 +2137,7 @@ async def manual_limit_order_handler(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "parámetros inválidos"}, status=400)
 
     trade = execution_manager.get_trade(symbol, data.get("direction"))
-    pos_side = _position_side_for(trade.direction) if trade else ("BOTH" if not HEDGE_MODE else None)
+    pos_side = (trade.direction if trade.hedge_mode else "BOTH") if trade else ("BOTH" if not HEDGE_MODE else None)
     try:
         result = await execution_manager.api.create_limit_order(
             symbol=symbol, side=side, quantity=quantity, price=price,
@@ -2900,7 +3038,7 @@ async def main():
         log.critical(f"Error inicializando BinanceAPI WS / precios: {e}")
         return
 
-    await execution_manager.refresh_balance()
+    await execution_manager.refresh_balance(force=True)
     log.info(f"Balance USDT Futures: ${execution_manager.balance:.2f}")
 
     async with aiohttp.ClientSession() as sess:
@@ -2922,6 +3060,7 @@ async def main():
             start_http_server(),
             price_sync_loop(),
             position_monitor_loop(session),
+            balance_sync_loop(),
         )
 
 
