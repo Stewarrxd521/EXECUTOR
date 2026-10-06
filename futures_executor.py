@@ -1,90 +1,82 @@
-"""
-futures_executor_ws.py — Executor de Futuros Binance 100% WebSocket para trading
-
-- Órdenes de apertura/cierre por Binance USDⓈ-M Futures WebSocket API.
-- Consultas de balance y posiciones por WebSocket API.
-- Precios de mercado desde SymbolWebSocketPriceCache (ws.py / WS.py).
-"""
-
 import asyncio
-import aiohttp
-from aiohttp import web
+import hashlib
+import hmac
+import json
 import logging
 import math
+import os
 import re
 import time
-from datetime import datetime, timezone
-import os
-import json
 import uuid
-import hmac
-import hashlib
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional
 
-# ══════════════════════════════════════════════════════════
-#  CONFIGURACIÓN
-# ══════════════════════════════════════════════════════════
-BINANCE_API_KEY    = os.environ.get("BINANCE_API_KEY", "")
+import aiohttp
+from aiohttp import web
+
+try:
+    import orjson
+
+    _loads = orjson.loads
+
+    def _dumps(obj) -> str:
+        return orjson.dumps(obj).decode()
+except ImportError:
+    _loads = json.loads
+    _dumps = json.dumps
+
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-USE_TESTNET        = os.environ.get("USE_TESTNET", "false").lower() == "true"
-SIGNAL_SECRET      = os.environ.get("SIGNAL_SECRET", "cambiar-por-secreto-seguro")
+USE_TESTNET = os.environ.get("USE_TESTNET", "false").lower() == "true"
+SIGNAL_SECRET = os.environ.get("SIGNAL_SECRET", "cambiar-por-secreto-seguro")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-LEVERAGE        = int(os.environ.get("LEVERAGE", "4"))
-HEDGE_MODE      = os.environ.get("HEDGE_MODE", "false").lower() == "true"
-
-
-def set_hedge_mode_runtime(value: bool) -> None:
-    """Cambia el flag HEDGE_MODE del proceso en caliente (sin reiniciar).
-
-    Todo el código que usa HEDGE_MODE lo lee como variable global en el
-    momento de cada llamada (no queda "congelado" en ningún closure), así
-    que reasignarlo aquí es suficiente para que open_trade/close_trade,
-    el cálculo de positionSide, etc. usen el nuevo modo de inmediato.
-    """
-    global HEDGE_MODE
-    HEDGE_MODE = bool(value)
-PORT            = int(os.environ.get("PORT", "10000"))
+LEVERAGE = int(os.environ.get("LEVERAGE", "4"))
+HEDGE_MODE = os.environ.get("HEDGE_MODE", "false").lower() == "true"
+PORT = int(os.environ.get("PORT", "10000"))
 POSITION_POLL_S = int(os.environ.get("POSITION_POLL_S", "30"))
-BALANCE_POLL_S  = int(os.environ.get("BALANCE_POLL_S", "60"))
+BALANCE_POLL_S = int(os.environ.get("BALANCE_POLL_S", "60"))
 
 MIN_NOTIONAL_USDT = float(os.environ.get("MIN_NOTIONAL_USDT", "5.1"))
 NOTIONAL_SAFETY_BUFFER_PCT = float(os.environ.get("NOTIONAL_SAFETY_BUFFER_PCT", "2.0"))
 MAX_PRICE_AGE_S = float(os.environ.get("MAX_PRICE_AGE_S", "5.0"))
 MIN_VALID_PRICE = 0.00001
 
+HIGH_PRICE_THRESHOLD = float(os.environ.get("HIGH_PRICE_THRESHOLD", "2.0"))
+HIGH_PRICE_LEVERAGE = int(os.environ.get("HIGH_PRICE_LEVERAGE", "20"))
+
 WS_API_URL = os.environ.get(
     "BINANCE_WS_FAPI_URL",
     "wss://testnet.binancefuture.com/ws-fapi/v1" if USE_TESTNET else "wss://ws-fapi.binance.com/ws-fapi/v1",
 )
-
 REST_FAPI_URL = os.environ.get(
     "BINANCE_REST_FAPI_URL",
     "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com",
 )
 
-PROXY_URLS = [
-    "http://fixie:CuLSweHyTOG4Lg3@54.195.3.54:80",
-    "http://fixie:CuLSweHyTOG4Lg3@54.217.142.99:80",
-]
-
 _raw_proxy_urls = os.environ.get("PROXY_URLS", "").strip()
 if _raw_proxy_urls:
     PROXY_URLS = [u.strip() for u in _raw_proxy_urls.split(",") if u.strip()]
 else:
-    # Retrocompatibilidad: si solo existe FIXIE_URL (una única salida),
-    # se usa como único elemento de la lista.
-    _legacy_fixie = os.environ.get(
-        "FIXIE_URL", "http://fixie:CuLSweHyTOG4Lg3@ventoux.usefixie.com:80"
-    ).strip()
+    _legacy_fixie = os.environ.get("FIXIE_URL", "http://fixie:CuLSweHyTOG4Lg3@ventoux.usefixie.com:80").strip()
     PROXY_URLS = [_legacy_fixie] if _legacy_fixie else []
 
-# Se mantiene por compatibilidad con el resto del código/dashboard que
-# solo necesita saber "¿hay algún proxy configurado?".
-FIXIE_URL = PROXY_URLS[0] if PROXY_URLS else ""
+PRICE_STEP_TIERS: list[tuple[float, float]] = [
+    (2.0, 0.1),
+    (100.0, 0.01),
+    (1000.0, 0.001),
+    (10000.0, 0.0001),
+    (100000.0, 0.00001),
+]
+
+BLOCKED_SYMBOLS: set[str] = {
+    s.strip().upper()
+    for s in os.environ.get("BLOCKED_SYMBOLS", "BTCUSDT,ETHUSDT,BTCUSDC,ETHUSDC").split(",")
+    if s.strip()
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,40 +85,49 @@ logging.basicConfig(
 )
 log = logging.getLogger("Executor")
 
+_FMT_MIN = "%Y-%m-%d %H:%M UTC"
+_FMT_SEC = "%Y-%m-%d %H:%M:%S UTC"
+_BAN_RE = re.compile(r"banned until (\d+)")
+_RETRYABLE_ORDER_ERRORS = ("-4164", "-1013", "-1111", "Notional", "precision")
 
-# ══════════════════════════════════════════════════════════
-#  AJUSTE DE CANTIDAD / NOTIONAL MÍNIMO
-# ══════════════════════════════════════════════════════════
+_bg_tasks: set = set()
+
+
+def set_hedge_mode_runtime(value: bool) -> None:
+    global HEDGE_MODE
+    HEDGE_MODE = bool(value)
+
+
+def _utc(fmt: str = _FMT_MIN) -> str:
+    return time.strftime(fmt, time.gmtime())
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+@lru_cache(maxsize=512)
 def _step_decimals(step: float) -> int:
-    """Cantidad de decimales implicada por un stepSize (p.ej. 0.001 -> 3)."""
     if step <= 0:
         return 8
     s = f"{step:.10f}".rstrip("0")
-    if "." not in s:
-        return 0
-    return len(s.split(".")[1])
-
-
-def floor_to_step(value: float, step: float) -> float:
-    """Redondea `value` hacia abajo al múltiplo de `step` más cercano,
-    evitando los errores típicos de coma flotante (0.1 + 0.2, etc.)."""
-    if step <= 0:
-        return value
-    decimals = _step_decimals(step)
-    units = math.floor(round(value / step, 8))
-    return round(units * step, decimals)
+    return len(s.split(".")[1]) if "." in s else 0
 
 
 def ceil_to_step(value: float, step: float) -> float:
-    """Redondea `value` hacia arriba al múltiplo de `step` más cercano."""
     if step <= 0:
         return value
-    decimals = _step_decimals(step)
-    units = math.ceil(round(value / step, 8))
-    return round(units * step, decimals)
+    return round(math.ceil(round(value / step, 8)) * step, _step_decimals(step))
+
 
 def clamp_price(value: float, minimum: float = MIN_VALID_PRICE) -> float:
-    """Asegura que un precio nunca quede por debajo del mínimo válido."""
     try:
         price = float(value)
     except Exception:
@@ -137,10 +138,6 @@ def clamp_price(value: float, minimum: float = MIN_VALID_PRICE) -> float:
 
 
 def format_qty(value: float, step: float) -> str:
-    """Formatea la cantidad con la cantidad de decimales del stepSize,
-    sin notación científica ni decimales innecesarios. Para cantidades
-    enteras usa round() en vez de int() truncado, para no perder una
-    unidad por ruido de coma flotante (p.ej. 26.999999999 -> 26)."""
     decimals = _step_decimals(step)
     return f"{value:.{decimals}f}" if decimals > 0 else str(int(round(value)))
 
@@ -151,56 +148,54 @@ def resolve_safe_quantity(
     filters: dict,
     extra_buffer_pct: float = 0.0,
 ) -> tuple[float, float]:
-    """
-    Calcula la cantidad final a enviar a Binance a partir de un notional
-    (tamaño de orden en USDT) objetivo y el precio de referencia, en vez
-    de confiar ciegamente en la `quantity` que llega en la señal.
-
-    - Convierte notional -> quantity con el precio más fresco disponible.
-    - Redondea al stepSize (LOT_SIZE) del símbolo para evitar -1111/-1013.
-    - Si el notional resultante queda por debajo del mínimo exigido
-      (MIN_NOTIONAL_USDT, con colchón opcional), sube la cantidad al
-      siguiente múltiplo de stepSize que sí lo cumpla.
-
-    Devuelve (quantity, notional_final).
-    """
     if price <= 0:
         raise ValueError("price debe ser > 0 para calcular la cantidad")
 
-    # Default seguro: si no sabemos el stepSize real, asumimos cantidad
-    # entera (stepSize=1) en vez de 0.001. Un entero SIEMPRE es múltiplo
-    # válido de cualquier stepSize más fino (0.1, 0.01, 0.001...), así que
-    # es el fallback universalmente seguro — al revés (asumir decimales en
-    # un símbolo que en realidad exige enteros) es lo que dispara -1111.
     step = float(filters.get("stepSize", 1.0)) or 1.0
     min_qty = float(filters.get("minQty", step))
     min_notional = max(float(filters.get("min_notional", MIN_NOTIONAL_USDT)), MIN_NOTIONAL_USDT)
-    min_notional *= (1 + extra_buffer_pct / 100.0)
+    min_notional *= 1 + extra_buffer_pct / 100.0
 
-    raw_qty = desired_notional / price
-    qty = ceil_to_step(raw_qty, step)
-    if qty < min_qty:
-        qty = min_qty
-
+    qty = max(ceil_to_step(desired_notional / price, step), min_qty)
     notional = qty * price
     if notional < min_notional:
-        needed_qty = min_notional / price
-        qty = ceil_to_step(needed_qty, step)
-        if qty < min_qty:
-            qty = min_qty
+        qty = max(ceil_to_step(min_notional / price, step), min_qty)
         notional = qty * price
-
     return qty, notional
 
 
-# ══════════════════════════════════════════════════════════
-#  MODELO DE TRADE
-# ══════════════════════════════════════════════════════════
+def leverage_for_price(price: float) -> int:
+    return HIGH_PRICE_LEVERAGE if price > HIGH_PRICE_THRESHOLD else LEVERAGE
+
+
+def is_symbol_blocked(symbol: str) -> bool:
+    return (symbol or "").upper() in BLOCKED_SYMBOLS
+
+
+def step_for_price(price: float) -> float:
+    step = 1.0
+    for threshold, tier_step in PRICE_STEP_TIERS:
+        if price <= threshold:
+            break
+        step = tier_step
+    return step
+
+
+def filters_for_price(price: float) -> dict:
+    step = step_for_price(price)
+    return {
+        "stepSize": step,
+        "minQty": step,
+        "qty_precision": _step_decimals(step),
+        "min_notional": MIN_NOTIONAL_USDT,
+    }
+
+
 @dataclass
 class Trade:
     id: int
     symbol: str
-    direction: str  # LONG | SHORT
+    direction: str
     entry_price: float
     quantity: float
     open_time: str
@@ -208,38 +203,36 @@ class Trade:
     paper_trade_id: int = 0
     entry_order_id: str = ""
     current_price: float = 0.0
-    status: str = "OPEN"  # OPEN | TP | SL | CLOSED | MANUAL | CLOSE_ALL
+    status: str = "OPEN"
     close_price: float = 0.0
     close_time: str = ""
     pnl_usdt: float = 0.0
     roi_pct: float = 0.0
     order_assumed: bool = False
-    # Modo con el que se logró (o se asumió) la orden de ENTRADA de esta
-    # posición puntual: True = Hedge (positionSide=LONG/SHORT), False =
-    # One-way (positionSide=BOTH). Ya no se decide por el flag global
-    # HEDGE_MODE sino por lo que realmente aceptó Binance para esta
-    # posición (ver ExecutionManager._place_entry_order). Se usa luego
-    # para cerrar / poner TP-SL con el positionSide correcto.
     hedge_mode: bool = True
+    step_size: float = 1.0
 
     @property
     def notional_usdt(self) -> float:
         return self.entry_price * self.quantity
 
+    @property
+    def position_side(self) -> str:
+        return self.direction if self.hedge_mode else "BOTH"
+
+    def calc_pnl(self, price: float) -> float:
+        diff = price - self.entry_price if self.direction == "LONG" else self.entry_price - price
+        return diff * self.quantity
+
     def update_unrealized(self, price: float):
         self.current_price = price
-        if self.direction == "LONG":
-            self.pnl_usdt = (price - self.entry_price) * self.quantity
-        else:
-            self.pnl_usdt = (self.entry_price - price) * self.quantity
-        self.roi_pct = (self.pnl_usdt / self.notional_usdt * 100) if self.notional_usdt else 0.0
+        self.pnl_usdt = self.calc_pnl(price)
+        notional = self.entry_price * self.quantity
+        self.roi_pct = self.pnl_usdt / notional * 100 if notional else 0.0
 
 
-# ══════════════════════════════════════════════════════════
-#  BINANCE WS API
-# ══════════════════════════════════════════════════════════
 class BinanceAPI:
-    """Cliente mínimo para Binance Futures WebSocket API."""
+    LEVERAGE_FALLBACK_LADDER = [20, 15, 10, 5, 4]
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False, ws_url: str = WS_API_URL):
         if not api_key or not api_secret:
@@ -247,6 +240,8 @@ class BinanceAPI:
 
         self.api_key = api_key
         self.api_secret = api_secret.encode("utf-8")
+        self._hmac_base = hmac.new(self.api_secret, digestmod=hashlib.sha256)
+        self._headers = {"X-MBX-APIKEY": api_key}
         self.testnet = testnet
         self.ws_url = ws_url
 
@@ -257,66 +252,42 @@ class BinanceAPI:
         self._pending: dict[str, asyncio.Future] = {}
         self._closed = False
 
-        # NOTA: se eliminó el cache de filtros de /fapi/v1/exchangeInfo por
-        # decisión explícita (esa llamada REST fue removida del todo). Ahora
-        # se usa siempre BinanceAPI.SAFE_DEFAULT_FILTERS (quantity entera,
-        # stepSize=1) — ver comentario en resolve_safe_quantity() sobre por
-        # qué un entero es el default seguro universal.
-
-        # Cache de leverage aplicado por símbolo, para no repetir la
-        # llamada REST de set_leverage si el valor no cambió (velocidad).
         self._leverage_cache: dict[str, int] = {}
         self._leverage_lock = asyncio.Lock()
-
-        # Freno de bloqueo de IP (Binance -1003 / HTTP 418): si Binance ya
-        # nos banea por exceso de requests, dejamos de pegarle a REST hasta
-        # que pase el tiempo indicado en el propio mensaje de error, en vez
-        # de seguir reintentando y empeorar/alargar el bloqueo.
         self._rest_ban_until_ms: float = 0.0
-
-        # Freno de bloqueo POR PROXY/IP para la llamada de leverage: cada
-        # URL de PROXY_URLS tiene su propio timestamp de baneo, así una
-        # IP baneada no tumba a las demás — se salta a la siguiente.
         self._proxy_ban_until_ms: dict[str, float] = {}
 
     @staticmethod
     def _payload_string(params: dict) -> str:
-        return "&".join(
-            f"{k}={params[k]}"
-            for k in sorted(params.keys())
-            if k != "signature"
-        )
+        return "&".join(f"{k}={params[k]}" for k in sorted(params) if k != "signature")
 
     def _sign(self, params: dict) -> str:
-        payload = self._payload_string(params)
-        return hmac.new(self.api_secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        h = self._hmac_base.copy()
+        h.update(self._payload_string(params).encode("utf-8"))
+        return h.hexdigest()
+
+    @staticmethod
+    def _parse_ban_until(text: str) -> Optional[float]:
+        if "-1003" not in text:
+            return None
+        match = _BAN_RE.search(text)
+        return float(match.group(1)) if match else None
 
     def _is_rest_banned(self) -> bool:
-        return self._rest_ban_until_ms > datetime.now(timezone.utc).timestamp() * 1000
+        return self._rest_ban_until_ms > time.time() * 1000
 
     def _rest_ban_remaining_s(self) -> float:
-        return max(0.0, self._rest_ban_until_ms / 1000 - datetime.now(timezone.utc).timestamp())
+        return max(0.0, self._rest_ban_until_ms / 1000 - time.time())
 
     def _note_possible_ip_ban(self, response_text: str):
-        """
-        Si la respuesta de Binance indica -1003 (demasiadas requests, IP
-        baneada), guarda el timestamp hasta el que dura el bloqueo para
-        que las próximas llamadas REST se omitan en vez de seguir
-        golpeando la API y alargar/empeorar el bloqueo.
-        """
-        if "-1003" not in response_text:
+        until_ms = self._parse_ban_until(response_text)
+        if until_ms is None or until_ms <= self._rest_ban_until_ms:
             return
-        match = re.search(r"banned until (\d+)", response_text)
-        if not match:
-            return
-        until_ms = float(match.group(1))
-        if until_ms > self._rest_ban_until_ms:
-            self._rest_ban_until_ms = until_ms
-            until_dt = datetime.fromtimestamp(until_ms / 1000, tz=timezone.utc)
-            log.error(
-                f"⛔ IP bloqueada por Binance (rate limit -1003) hasta {until_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} "
-                f"(~{self._rest_ban_remaining_s():.0f}s) — se omitirán llamadas REST hasta entonces"
-            )
+        self._rest_ban_until_ms = until_ms
+        log.error(
+            f"⛔ IP bloqueada por Binance (rate limit -1003) hasta {_utc_from_ms(until_ms)} "
+            f"(~{self._rest_ban_remaining_s():.0f}s) — se omitirán llamadas REST hasta entonces"
+        )
 
     def _check_rest_ban_or_raise(self):
         if self._is_rest_banned():
@@ -324,42 +295,26 @@ class BinanceAPI:
 
     @staticmethod
     def _proxy_label(proxy_url: Optional[str]) -> str:
-        """Etiqueta legible sin credenciales, solo para logs (host:puerto)."""
         if not proxy_url:
             return "directo (sin proxy)"
-        try:
-            return proxy_url.split("@", 1)[-1]
-        except Exception:
-            return "proxy"
+        return proxy_url.split("@", 1)[-1]
 
     def _is_proxy_banned(self, proxy_url: str) -> bool:
-        until = self._proxy_ban_until_ms.get(proxy_url, 0.0)
-        return until > datetime.now(timezone.utc).timestamp() * 1000
+        return self._proxy_ban_until_ms.get(proxy_url, 0.0) > time.time() * 1000
 
     def _proxy_ban_remaining_s(self, proxy_url: str) -> float:
-        until = self._proxy_ban_until_ms.get(proxy_url, 0.0)
-        return max(0.0, until / 1000 - datetime.now(timezone.utc).timestamp())
+        return max(0.0, self._proxy_ban_until_ms.get(proxy_url, 0.0) / 1000 - time.time())
 
     def _note_possible_proxy_ban(self, proxy_url: str, response_text: str):
-        """
-        Igual que _note_possible_ip_ban pero por proxy individual: si
-        Binance devuelve -1003 usando `proxy_url`, guarda el timestamp de
-        baneo SOLO para esa IP, dejando libres las demás de PROXY_URLS.
-        """
-        if "-1003" not in response_text:
+        until_ms = self._parse_ban_until(response_text)
+        if until_ms is None or until_ms <= self._proxy_ban_until_ms.get(proxy_url, 0.0):
             return
-        match = re.search(r"banned until (\d+)", response_text)
-        if not match:
-            return
-        until_ms = float(match.group(1))
-        if until_ms > self._proxy_ban_until_ms.get(proxy_url, 0.0):
-            self._proxy_ban_until_ms[proxy_url] = until_ms
-            until_dt = datetime.fromtimestamp(until_ms / 1000, tz=timezone.utc)
-            log.error(
-                f"⛔ IP {self._proxy_label(proxy_url)} bloqueada por Binance (-1003) hasta "
-                f"{until_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} (~{self._proxy_ban_remaining_s(proxy_url):.0f}s) "
-                f"— se saltará a la siguiente IP de PROXY_URLS si hay alguna disponible"
-            )
+        self._proxy_ban_until_ms[proxy_url] = until_ms
+        log.error(
+            f"⛔ IP {self._proxy_label(proxy_url)} bloqueada por Binance (-1003) hasta "
+            f"{_utc_from_ms(until_ms)} (~{self._proxy_ban_remaining_s(proxy_url):.0f}s) "
+            f"— se saltará a la siguiente IP de PROXY_URLS si hay alguna disponible"
+        )
 
     def _ws_alive(self) -> bool:
         return bool(
@@ -369,7 +324,10 @@ class BinanceAPI:
 
     async def _ensure_http_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                connector=aiohttp.TCPConnector(limit=0, ttl_dns_cache=300),
+            )
         return self._session
 
     async def connect(self):
@@ -380,8 +338,6 @@ class BinanceAPI:
             if self._ws_alive():
                 return
 
-            # Limpiar conexión muerta (el reader pudo haber terminado sin
-            # cerrar el socket explícitamente — quedaba "zombie")
             if self._ws is not None:
                 try:
                     if not self._ws.closed:
@@ -392,14 +348,14 @@ class BinanceAPI:
             if self._reader_task is not None and not self._reader_task.done():
                 self._reader_task.cancel()
 
-            await self._ensure_http_session()
-
+            session = await self._ensure_http_session()
             log.info(f"Conectando Binance WS API → {self.ws_url}")
-            self._ws = await self._session.ws_connect(
+            self._ws = await session.ws_connect(
                 self.ws_url,
                 autoping=True,
                 heartbeat=30,
                 max_msg_size=0,
+                compress=0,
             )
             self._reader_task = asyncio.create_task(self._reader())
 
@@ -413,63 +369,61 @@ class BinanceAPI:
             await self._session.close()
 
     async def _reader(self):
-        assert self._ws is not None
+        ws = self._ws
+        pending = self._pending
         while not self._closed:
             try:
-                msg = await self._ws.receive()
+                msg = await ws.receive()
             except Exception as e:
                 log.error(f"WS reader error: {e}")
                 break
 
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
-                    data = json.loads(msg.data)
+                    data = _loads(msg.data)
                 except Exception:
                     log.warning(f"WS no JSON: {msg.data!r}")
                     continue
 
-                req_id = str(data.get("id")) if data.get("id") is not None else None
-                fut = self._pending.pop(req_id, None) if req_id is not None else None
+                req_id = data.get("id")
+                fut = pending.pop(str(req_id), None) if req_id is not None else None
                 if fut is not None and not fut.done():
                     fut.set_result(data)
-                else:
-                    log.debug(f"WS event no mapeado: {data}")
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 break
 
         err = ConnectionError("WebSocket API desconectado")
-        for fut in list(self._pending.values()):
+        for fut in list(pending.values()):
             if not fut.done():
                 fut.set_exception(err)
-        self._pending.clear()
+        pending.clear()
 
-    async def _request(self, method: str, params: Optional[dict] = None, signed: bool = False, timeout: float = 20.0, _retry: bool = True) -> dict:
+    async def _request(self, method: str, params: Optional[dict] = None, signed: bool = False,
+                       timeout: float = 20.0, _retry: bool = True) -> dict:
         await self.connect()
 
-        params = dict(params or {})
+        p = dict(params) if params else {}
         if signed:
-            params.setdefault("apiKey", self.api_key)
-            params.setdefault("timestamp", int(datetime.now(timezone.utc).timestamp() * 1000))
-            params.setdefault("recvWindow", 5000)
-            params["signature"] = self._sign(params)
+            p.setdefault("apiKey", self.api_key)
+            p.setdefault("timestamp", _now_ms())
+            p.setdefault("recvWindow", 5000)
+            p["signature"] = self._sign(p)
 
-        req_id = str(uuid.uuid4())
+        req_id = uuid.uuid4().hex
         payload = {"id": req_id, "method": method}
-        if params:
-            payload["params"] = params
+        if p:
+            payload["params"] = p
 
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
 
         try:
-            assert self._ws is not None
-            await self._ws.send_json(payload)
+            await self._ws.send_str(_dumps(payload))
         except Exception as e:
             self._pending.pop(req_id, None)
             if _retry:
                 log.warning(f"_request: fallo enviando ({e!r}); reconectando y reintentando una vez")
-                return await self._request(method, params, signed=False, timeout=timeout, _retry=False)
+                return await self._request(method, params, signed, timeout, _retry=False)
             raise
 
         try:
@@ -478,31 +432,26 @@ class BinanceAPI:
             self._pending.pop(req_id, None)
             if _retry and not self._ws_alive():
                 log.warning(f"_request: sin respuesta ({e!r}); conexión muerta, reconectando y reintentando una vez")
-                return await self._request(method, params, signed=False, timeout=timeout, _retry=False)
+                return await self._request(method, params, signed, timeout, _retry=False)
             raise
 
         if response.get("status") != 200:
-            err = response.get("error") or {}
-            raise RuntimeError(f"Binance WS error {response.get('status')}: {err}")
+            raise RuntimeError(f"Binance WS error {response.get('status')}: {response.get('error') or {}}")
         return response.get("result", response)
+
+    async def _request_dict(self, method: str, params: dict) -> dict:
+        result = await self._request(method, params, signed=True)
+        return result if isinstance(result, dict) else {"raw": result}
 
     async def account_balance(self) -> list[dict]:
         result = await self._request("account.balance", signed=True)
         return result if isinstance(result, list) else []
 
     async def position_information(self, symbol: Optional[str] = None) -> list[dict]:
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        result = await self._request("account.position", params=params, signed=True)
+        result = await self._request("account.position", {"symbol": symbol} if symbol else {}, signed=True)
         return result if isinstance(result, list) else []
 
     async def set_leverage(self, symbol: str, leverage: int, force: bool = False) -> dict:
-        """
-        Cambia el leverage inicial de un símbolo. Esto es exclusivamente
-        REST en Binance (POST /fapi/v1/leverage) — la WS API no expone
-        ningún método equivalente.
-        """
         leverage = int(leverage)
         if not force and self._leverage_cache.get(symbol) == leverage:
             return {"symbol": symbol, "leverage": leverage, "cached": True}
@@ -512,13 +461,10 @@ class BinanceAPI:
                 return {"symbol": symbol, "leverage": leverage, "cached": True}
 
             if not PROXY_URLS:
-                # Sin ningún proxy configurado: sale con la IP directa del proceso.
                 data = await self._set_leverage_via_proxy(symbol, leverage, proxy_url=None)
                 self._leverage_cache[symbol] = leverage
                 return data
 
-            # Solo se intenta con las IPs que ahora mismo NO están marcadas
-            # como baneadas por Binance (-1003).
             candidates = [p for p in PROXY_URLS if not self._is_proxy_banned(p)]
             if not candidates:
                 soonest = min(self._proxy_ban_remaining_s(p) for p in PROXY_URLS)
@@ -547,33 +493,20 @@ class BinanceAPI:
                             f"({e!r}); probando con la siguiente IP de PROXY_URLS"
                         )
                         continue
-                    # Rechazo que no tiene que ver con bloqueo de IP (p.ej. -4028
-                    # leverage inválido para el símbolo): cambiar de IP no lo va a
-                    # resolver, así que se propaga tal cual para que lo maneje
-                    # set_leverage_with_fallback (escalera de leverage).
                     raise
-            # Se agotaron todas las IPs candidatas por errores de conexión/baneo.
             raise last_err if last_err else RuntimeError("set_leverage: sin IPs disponibles en PROXY_URLS")
 
     async def _set_leverage_via_proxy(self, symbol: str, leverage: int, proxy_url: Optional[str]) -> dict:
-        """Ejecuta el POST /fapi/v1/leverage a través de una IP concreta
-        (o directo si proxy_url es None). No cachea leverage ni maneja
-        reintentos entre IPs — eso lo hace set_leverage()."""
         session = await self._ensure_http_session()
         params = {
             "symbol": symbol,
             "leverage": leverage,
-            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "timestamp": _now_ms(),
             "recvWindow": 5000,
         }
-        query = self._payload_string(params)
-        signature = self._sign(params)
-        url = f"{REST_FAPI_URL}/fapi/v1/leverage?{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": self.api_key}
+        url = f"{REST_FAPI_URL}/fapi/v1/leverage?{self._payload_string(params)}&signature={self._sign(params)}"
 
-        # Única llamada REST del bot que se mantiene fuera de la WS API
-        # (Binance no expone equivalente para cambiar leverage).
-        request_kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=10)}
+        request_kwargs = {"headers": self._headers, "timeout": aiohttp.ClientTimeout(total=10)}
         if proxy_url:
             request_kwargs["proxy"] = proxy_url
 
@@ -586,30 +519,14 @@ class BinanceAPI:
                     self._note_possible_ip_ban(text)
                 raise RuntimeError(f"REST set_leverage error {resp.status}: {text}")
             try:
-                data = json.loads(text)
+                data = _loads(text)
             except Exception:
                 data = {"raw": text}
             log.info(f"Leverage REST OK vía {self._proxy_label(proxy_url)}: {symbol} → {data.get('leverage', leverage)}x")
             return data
 
-    # ── Escalera de leverage de respaldo ───────────────────────────────
-    # Algunos símbolos rechazan el leverage configurado por defecto
-    # (cada símbolo tiene su propio límite máximo según el notional, y
-    # no podemos conocerlos todos de antemano, menos aún con limitaciones
-    # de IP que impiden golpear /leverageBracket por cada símbolo). En
-    # vez de abortar la apertura, se prueba esta escalera 10x→4x hasta
-    # que Binance acepte uno.
-    LEVERAGE_FALLBACK_LADDER = [ 4]
-
     async def set_leverage_with_fallback(self, symbol: str, preferred: int) -> int:
-        """
-        Intenta aplicar `preferred`; si Binance lo rechaza (p.ej. -4028
-        "Leverage X is not valid", típico en símbolos con límite propio
-        más bajo), recorre LEVERAGE_FALLBACK_LADDER (excluyendo el ya
-        intentado) hasta encontrar uno aceptado. Devuelve el leverage
-        que finalmente quedó aplicado en el símbolo.
-        """
-        ladder = [preferred] + [lv for lv in self.LEVERAGE_FALLBACK_LADDER if lv != preferred]
+        ladder = [preferred] + [lv for lv in self.LEVERAGE_FALLBACK_LADDER if lv < preferred]
         last_err: Optional[Exception] = None
         for lv in ladder:
             try:
@@ -623,53 +540,28 @@ class BinanceAPI:
         log.error(f"set_leverage_with_fallback: {symbol} rechazó TODA la escalera de leverage ({ladder}): {last_err}")
         return preferred
 
-    # ── REST firmado genérico (para endpoints sin equivalente en la WS API) ──
-    async def _rest_signed(self, http_method: str, path: str, params: dict, timeout: float = 10.0) -> dict:
+    async def _rest_signed(self, http_method: str, path: str, params: dict, timeout: float = 10.0):
         self._check_rest_ban_or_raise()
         session = await self._ensure_http_session()
         params = dict(params or {})
-        params.setdefault("timestamp", int(datetime.now(timezone.utc).timestamp() * 1000))
+        params.setdefault("timestamp", _now_ms())
         params.setdefault("recvWindow", 5000)
-        query = self._payload_string(params)
-        signature = self._sign(params)
-        url = f"{REST_FAPI_URL}{path}?{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": self.api_key}
-        async with session.request(http_method, url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+        url = f"{REST_FAPI_URL}{path}?{self._payload_string(params)}&signature={self._sign(params)}"
+        async with session.request(http_method, url, headers=self._headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             text = await resp.text()
             if resp.status != 200:
                 self._note_possible_ip_ban(text)
                 raise RuntimeError(f"REST {http_method} {path} error {resp.status}: {text}")
             try:
-                return json.loads(text)
+                return _loads(text)
             except Exception:
                 return {"raw": text}
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> list[dict]:
-        """
-        SIN EQUIVALENTE EN LA WS API: ws-fapi solo ofrece order.status
-        (consulta de UNA orden puntual), no un listado de abiertas. Se
-        mantiene como REST firmado, sin pasar por Fixie.
-        """
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        result = await self._rest_signed("GET", "/fapi/v1/openOrders", params)
+        result = await self._rest_signed("GET", "/fapi/v1/openOrders", {"symbol": symbol} if symbol else {})
         return result if isinstance(result, list) else []
 
-    async def cancel_order(self, symbol: str, order_id) -> dict:
-        """Cancela una orden individual — migrado a la WS API (order.cancel),
-        que sí tiene equivalente documentado por Binance."""
-        result = await self._request("order.cancel", {"symbol": symbol, "orderId": order_id}, signed=True)
-        return result if isinstance(result, dict) else {"raw": result}
-
     async def cancel_all_open_orders(self, symbol: str) -> dict:
-        """
-        SIN EQUIVALENTE EN LA WS API: Binance no expone un método
-        'cancelar todas las órdenes del símbolo' en ws-fapi (solo existe
-        order.cancel para una orden a la vez). Se mantiene como REST
-        firmado (DELETE /fapi/v1/allOpenOrders), SIN pasar por Fixie
-        (por decisión explícita, Fixie se reserva solo para leverage).
-        """
         return await self._rest_signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
     async def create_tp_sl_order(
@@ -677,63 +569,28 @@ class BinanceAPI:
         symbol: str,
         side: str,
         trigger_price: float,
-        order_type: str,  # "STOP_MARKET" (SL) o "TAKE_PROFIT_MARKET" (TP)
+        order_type: str,
         position_side: Optional[str] = None,
         close_position: bool = True,
         quantity: Optional[float] = None,
         time_in_force: str = "GTC",
     ) -> dict:
-        """
-        TP/SL de Binance Futures. order.place (la WS API de órdenes
-        normales) NO acepta STOP_MARKET/TAKE_PROFIT_MARKET con
-        closePosition (-4120) — exige el endpoint dedicado de Algo Order,
-        que ahora también está disponible en la WS API (método
-        `algoOrder.place`, ver create_algo_order), así que se envían por
-        ahí — ya no hace falta REST para esto.
-
-        FIX -4509 "Time in Force (TIF) GTE can only be used with open
-        positions": closePosition=true usa internamente el TIF especial
-        GTE_GTC, y Binance SOLO lo acepta si en el instante exacto de la
-        request ya existe una posición (o una orden) registrada en su
-        lado para ese símbolo. Si el TP/SL se manda justo después de la
-        entrada (o sin posición todavía), aparece esa carrera y la
-        request se rechaza aunque la posición exista un instante después.
-
-        Para no depender de ese timing, en cuanto se conoce la cantidad
-        de la posición NUNCA se usa closePosition=true: se manda
-        STOP_MARKET/TAKE_PROFIT_MARKET con `quantity` + `reduceOnly`
-        (o solo `quantity` + `positionSide` en Hedge Mode, donde
-        reduceOnly no está permitido). Esa combinación no depende de que
-        ya exista posición — Binance simplemente deja la orden
-        condicional en NEW hasta que haya algo que reducir cuando se
-        dispare el trigger. closePosition=true queda solo como fallback
-        para cuando no se tiene la cantidad exacta a mano.
-        """
         trigger_price = clamp_price(trigger_price)
         if trigger_price <= 0:
             raise ValueError("trigger_price inválido")
 
         use_close_position = close_position and quantity is None
-
-        # Se decide reduceOnly según el positionSide REAL de esta orden
-        # puntual (no el flag global HEDGE_MODE, que puede no coincidir
-        # si esta posición cayó al fallback One-way): con LONG/SHORT
-        # (Hedge) Binance rechaza reduceOnly porque side+positionSide ya
-        # implica reducción; con BOTH (One-way) sí hace falta para no
-        # abrir posición nueva.
-        is_hedge_side = (position_side or "BOTH") in ("LONG", "SHORT")
-        reduce_only = None
-        if not use_close_position and not is_hedge_side:
-            reduce_only = "true"
+        position_side = position_side or "BOTH"
+        reduce_only = "true" if (not use_close_position and position_side not in ("LONG", "SHORT")) else None
 
         return await self.create_algo_order(
             symbol=symbol,
             side=side,
             order_type=order_type,
             triggerPrice=str(trigger_price),
-            positionSide=position_side or "BOTH",
+            positionSide=position_side,
             closePosition="true" if use_close_position else None,
-            quantity=None if use_close_position else (str(quantity) if quantity is not None else None),
+            quantity=None if use_close_position or quantity is None else str(quantity),
             reduceOnly=reduce_only,
             timeInForce=time_in_force,
             workingType="MARK_PRICE",
@@ -760,119 +617,65 @@ class BinanceAPI:
         }
         if position_side:
             params["positionSide"] = position_side
-        # Mismo motivo que en create_market_order: reduceOnly no se puede
-        # enviar junto con positionSide=LONG/SHORT (Hedge) — Binance lo
-        # rechaza con -1106.
         if reduce_only and position_side not in ("LONG", "SHORT"):
             params["reduceOnly"] = "true"
-        result = await self._request("order.place", params=params, signed=True)
-        return result if isinstance(result, dict) else {"raw": result}
+        return await self._request_dict("order.place", params)
 
     async def create_algo_order(self, symbol: str, side: str, order_type: str, **extra) -> dict:
-        """
-        Algo Order condicional — MIGRADO a la WS API: Binance añadió el
-        método `algoOrder.place` (antes solo existía como REST POST
-        /fapi/v1/algoOrder, necesario para STOP_MARKET/TAKE_PROFIT_MARKET
-        con closePosition porque order.place los rechazaba con -4120).
-        `extra` admite cualquier param adicional (triggerPrice,
-        positionSide, closePosition, quantity, reduceOnly, timeInForce,
-        price, workingType...); las claves con valor None se omiten.
-        """
         params = {"symbol": symbol, "side": side, "algoType": "CONDITIONAL", "type": order_type}
-        for k, v in extra.items():
-            if v is not None:
-                params[k] = v
-        result = await self._request("algoOrder.place", params, signed=True)
-        return result if isinstance(result, dict) else {"raw": result}
+        params.update({k: v for k, v in extra.items() if v is not None})
+        return await self._request_dict("algoOrder.place", params)
 
     async def get_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict]:
-        """
-        SIN EQUIVALENTE EN LA WS API: no existe un método ws-fapi para
-        listar algo orders abiertas (solo algoOrder.place/algoOrder.cancel
-        de a una). Se mantiene como REST firmado, sin pasar por Fixie.
-        """
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        result = await self._rest_signed("GET", "/fapi/v1/algoOpenOrders", params)
+        result = await self._rest_signed("GET", "/fapi/v1/algoOpenOrders", {"symbol": symbol} if symbol else {})
         if isinstance(result, dict):
             return result.get("orders") or result.get("algoOrders") or []
         return result if isinstance(result, list) else []
 
     async def cancel_algo_order(self, algo_id) -> dict:
-        """Cancela un algo order individual — migrado a la WS API
-        (algoOrder.cancel)."""
-        result = await self._request("algoOrder.cancel", {"algoId": algo_id}, signed=True)
-        return result if isinstance(result, dict) else {"raw": result}
+        return await self._request_dict("algoOrder.cancel", {"algoId": algo_id})
 
     async def cancel_all_algo_orders(self, symbol: str) -> dict:
-        """
-        SIN EQUIVALENTE EN LA WS API: no existe un 'cancelar todas las
-        algo orders del símbolo' en ws-fapi. Se mantiene como REST
-        firmado (DELETE /fapi/v1/algoOpenOrders), sin pasar por Fixie.
-        """
         return await self._rest_signed("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
 
     async def cancel_symbol_orders(self, symbol: str) -> dict:
-        """
-        Cancela todas las órdenes vivas del símbolo: normales y algo orders.
-        Se usa al cerrar posiciones para evitar que queden órdenes huérfanas.
-        """
+        normal, algo = await asyncio.gather(
+            self.cancel_all_open_orders(symbol),
+            self.cancel_all_algo_orders(symbol),
+            return_exceptions=True,
+        )
         result: dict = {"symbol": symbol}
-        normal_err = None
-        algo_err = None
+        normal_err = normal if isinstance(normal, Exception) else None
+        algo_err = algo if isinstance(algo, Exception) else None
 
-        try:
-            result["normal"] = await self.cancel_all_open_orders(symbol)
-        except Exception as e:
-            normal_err = e
-            result["normal_error"] = str(e)
-
-        try:
-            result["algo"] = await self.cancel_all_algo_orders(symbol)
-        except Exception as e:
-            algo_err = e
-            result["algo_error"] = str(e)
+        if normal_err:
+            result["normal_error"] = str(normal_err)
+        else:
+            result["normal"] = normal
+        if algo_err:
+            result["algo_error"] = str(algo_err)
+        else:
+            result["algo"] = algo
 
         if normal_err and algo_err:
             raise RuntimeError(
                 f"No se pudieron cancelar órdenes normales ni algo orders para {symbol}: {normal_err}; {algo_err}"
             )
-
         return result
 
     async def set_margin_type(self, symbol: str, margin_type: str) -> dict:
-        """margin_type: 'ISOLATED' o 'CROSSED'.
-        SIN EQUIVALENTE EN LA WS API — se mantiene como REST firmado,
-        sin pasar por Fixie."""
         return await self._rest_signed("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type})
 
     async def get_position_mode(self) -> bool:
-        """Consulta el modo actual de la CUENTA en Binance (no el de este
-        proceso). True = Hedge Mode (dualSidePosition), False = One-way.
-        SIN EQUIVALENTE EN LA WS API — se mantiene como REST firmado,
-        sin pasar por Fixie."""
         result = await self._rest_signed("GET", "/fapi/v1/positionSide/dual", {})
         return bool(result.get("dualSidePosition"))
 
     async def set_position_mode(self, hedge: bool) -> dict:
-        """Cambia el modo de posición de la CUENTA en Binance.
-
-        IMPORTANTE: Binance rechaza este cambio (-4059 / -4068) si hay
-        posiciones abiertas u órdenes activas en la cuenta — hay que
-        cerrar todo primero. Esto es una restricción de Binance, no de
-        este bot.
-        SIN EQUIVALENTE EN LA WS API — se mantiene como REST firmado,
-        sin pasar por Fixie.
-        """
         return await self._rest_signed(
             "POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "true" if hedge else "false"}
         )
 
     async def modify_position_margin(self, symbol: str, amount: float, position_side: str = "BOTH", add: bool = True) -> dict:
-        """type=1 añade margen, type=2 lo retira (solo válido en ISOLATED).
-        SIN EQUIVALENTE EN LA WS API — se mantiene como REST firmado,
-        sin pasar por Fixie."""
         params = {
             "symbol": symbol,
             "amount": str(abs(amount)),
@@ -880,24 +683,6 @@ class BinanceAPI:
             "positionSide": position_side,
         }
         return await self._rest_signed("POST", "/fapi/v1/positionMargin", params)
-
-    # ELIMINADO por decisión explícita: la carga de /fapi/v1/exchangeInfo
-    # (_load_all_symbol_filters / get_symbol_filters) se quitó del todo.
-    # Ya no hay ninguna llamada REST para leer stepSize/minQty/minNotional
-    # reales por símbolo. En su lugar se usa siempre SAFE_DEFAULT_FILTERS
-    # (cantidad entera, stepSize=1): un entero siempre es múltiplo válido
-    # de cualquier stepSize más fino que el real, así que es la opción que
-    # menos rechazos (-1111/-1013) provoca sin tener el dato exacto — al
-    # revés (asumir decimales en un símbolo que exige enteros) sí dispara
-    # -1111. La única desventaja es que en símbolos que SÍ aceptan
-    # fracciones, la cantidad enviada puede quedar redondeada hacia arriba
-    # a un entero, ligeramente por encima de lo estrictamente necesario.
-    SAFE_DEFAULT_FILTERS: dict = {
-        "stepSize": 1.0,
-        "minQty": 1.0,
-        "qty_precision": 0,
-        "min_notional": MIN_NOTIONAL_USDT,
-    }
 
     async def create_market_order(
         self,
@@ -912,26 +697,14 @@ class BinanceAPI:
             "symbol": symbol,
             "side": side,
             "type": "MARKET",
-            # Binance WS API exige los DECIMAL (price, quantity, etc.) como
-            # strings, no como floats — enviar float puede introducir
-            # ruido de precisión (p.ej. 0.1 + 0.2) que dispara -1111/-1013.
             "quantity": str(quantity),
             "newOrderRespType": new_order_resp_type,
         }
         if position_side:
             params["positionSide"] = position_side
-        # En Hedge Mode (positionSide=LONG/SHORT) Binance RECHAZA el
-        # parámetro reduceOnly con -1106 "Parameter 'reduceonly' sent
-        # when not required" — side+positionSide ya implica reducción
-        # por sí solo. Sólo tiene sentido enviarlo en One-way
-        # (positionSide=BOTH o ausente). Se filtra aquí, centralizado,
-        # para que ningún caller (close_position_market,
-        # close_all_positions, etc.) tenga que acordarse de esto.
-        is_hedge_side = position_side in ("LONG", "SHORT")
-        if reduce_only and not is_hedge_side:
+        if reduce_only and position_side not in ("LONG", "SHORT"):
             params["reduceOnly"] = "true"
-        result = await self._request("order.place", params=params, signed=True)
-        return result if isinstance(result, dict) else {"raw": result}
+        return await self._request_dict("order.place", params)
 
     async def close_position_market(
         self,
@@ -940,20 +713,17 @@ class BinanceAPI:
         quantity: float,
         position_side: Optional[str] = None,
     ) -> dict:
-        direction = direction.upper()
-        close_side = "SELL" if direction == "LONG" else "BUY"
         return await self.create_market_order(
             symbol=symbol,
-            side=close_side,
+            side="SELL" if direction.upper() == "LONG" else "BUY",
             quantity=quantity,
             position_side=position_side,
             reduce_only=True,
-            new_order_resp_type="RESULT",
         )
 
     async def close_all_positions(self, symbol: Optional[str] = None) -> list[dict]:
         positions = await self.position_information(symbol=symbol)
-        closed = []
+        coros = []
         for p in positions:
             try:
                 amt = float(p.get("positionAmt", 0))
@@ -962,52 +732,31 @@ class BinanceAPI:
             if abs(amt) <= 0:
                 continue
 
-            sym = p.get("symbol", symbol or "")
             pos_side = p.get("positionSide") or None
-
             if pos_side in ("LONG", "SHORT"):
                 close_side = "SELL" if pos_side == "LONG" else "BUY"
-                qty = abs(amt)
-                result = await self.create_market_order(
-                    symbol=sym,
-                    side=close_side,
-                    quantity=qty,
-                    position_side=pos_side,
-                    reduce_only=True,
-                    new_order_resp_type="RESULT",
-                )
             else:
                 close_side = "SELL" if amt > 0 else "BUY"
-                qty = abs(amt)
-                result = await self.create_market_order(
-                    symbol=sym,
-                    side=close_side,
-                    quantity=qty,
-                    position_side="BOTH",
-                    reduce_only=True,
-                    new_order_resp_type="RESULT",
-                )
-            closed.append(result)
-        return closed
+                pos_side = "BOTH"
+
+            coros.append(self.create_market_order(
+                symbol=p.get("symbol", symbol or ""),
+                side=close_side,
+                quantity=abs(amt),
+                position_side=pos_side,
+                reduce_only=True,
+            ))
+        return list(await asyncio.gather(*coros)) if coros else []
 
 
-# ══════════════════════════════════════════════════════════
-#  GESTOR DE EJECUCIÓN
-# ══════════════════════════════════════════════════════════
+def _utc_from_ms(ms: float) -> str:
+    return time.strftime(_FMT_SEC, time.gmtime(ms / 1000))
+
+
 class ExecutionManager:
-    """Ejecuta y rastrea posiciones reales en Binance Futures vía WS."""
-
     def __init__(self, binance_api, price_ws):
         self.api = binance_api
         self.price_ws = price_ws
-        # CLAVE: (symbol, direction) y NO solo symbol. Con HEDGE_MODE=true
-        # Binance mantiene posiciones LONG y SHORT independientes para el
-        # mismo símbolo (positionSide=LONG / SHORT). Si el diccionario
-        # local sólo usaba `symbol` como clave, una posición SHORT podía
-        # pisar/mezclarse con una LONG abierta del mismo símbolo (o
-        # viceversa), aunque en Binance fueran dos posiciones separadas.
-        # Con la clave compuesta, cada dirección vive en su propia entrada
-        # y se abre/cierra/promedia de forma independiente.
         self._trades: dict[tuple[str, str], Trade] = {}
         self._closed: list[Trade] = []
         self._counter: int = 0
@@ -1019,26 +768,13 @@ class ExecutionManager:
         self._balance_refresh_lock = asyncio.Lock()
 
     async def refresh_balance(self, force: bool = False):
-        """
-        Consulta el balance (account.balance, WS API). Autolimitada a un
-        máximo de 1 consulta real cada BALANCE_POLL_S segundos: así,
-        aunque open_trade/close_trade sigan llamando a esto tras cada
-        operación, no se dispara una petición nueva si ya se refrescó
-        hace poco — evita sumarse a la ráfaga leverage(REST)+orden(WS)
-        que salía junta en el mismo instante. balance_sync_loop() se
-        encarga de mantenerlo al día (force=True) cada BALANCE_POLL_S
-        segundos de forma independiente a la actividad de trading.
-        """
-        now = time.monotonic()
-        if not force and (now - self._last_balance_refresh) < BALANCE_POLL_S:
+        if not force and (time.monotonic() - self._last_balance_refresh) < BALANCE_POLL_S:
             return
         async with self._balance_refresh_lock:
-            now = time.monotonic()
-            if not force and (now - self._last_balance_refresh) < BALANCE_POLL_S:
+            if not force and (time.monotonic() - self._last_balance_refresh) < BALANCE_POLL_S:
                 return
             try:
-                balances = await self.api.account_balance()
-                for b in balances:
+                for b in await self.api.account_balance():
                     if b.get("asset") == "USDT":
                         self._balance = float(b.get("availableBalance", b.get("balance", 0)))
                         break
@@ -1060,40 +796,26 @@ class ExecutionManager:
 
     @property
     def open_longs(self) -> list[Trade]:
-        return [t for t in self.open_trades if t.direction == "LONG"]
+        return [t for t in self._trades.values() if t.direction == "LONG"]
 
     @property
     def open_shorts(self) -> list[Trade]:
-        return [t for t in self.open_trades if t.direction == "SHORT"]
+        return [t for t in self._trades.values() if t.direction == "SHORT"]
 
     @property
     def active_symbols(self) -> set:
-        return {sym for (sym, _direction) in self._trades.keys()}
+        return {sym for sym, _d in self._trades}
 
     def trades_for_symbol(self, symbol: str) -> list[Trade]:
-        """Todas las posiciones abiertas (LONG y/o SHORT) para un símbolo."""
         symbol = symbol.upper()
         return [t for (sym, _d), t in self._trades.items() if sym == symbol]
 
     def get_trade(self, symbol: str, direction: Optional[str] = None) -> Optional[Trade]:
-        """Busca una posición por símbolo (+ dirección opcional).
-
-        Pensado para los endpoints HTTP existentes que sólo mandan
-        `symbol` (compatibilidad hacia atrás): si no se especifica
-        `direction` y hay una sola posición abierta para ese símbolo, la
-        devuelve sin ambigüedad. Si hay DOS (LONG y SHORT simultáneas en
-        Hedge Mode) y no se especificó dirección, no se puede adivinar
-        cuál quiere el llamador — devuelve None para forzar a que el
-        cliente especifique `direction` en vez de operar a ciegas sobre
-        la posición equivocada.
-        """
         symbol = symbol.upper()
         if direction:
             return self._trades.get((symbol, direction.upper()))
         matches = self.trades_for_symbol(symbol)
-        if len(matches) == 1:
-            return matches[0]
-        return None
+        return matches[0] if len(matches) == 1 else None
 
     @property
     def total_realized_pnl(self) -> float:
@@ -1101,7 +823,7 @@ class ExecutionManager:
 
     @property
     def unrealized_pnl(self) -> float:
-        return sum(t.pnl_usdt for t in self.open_trades)
+        return sum(t.pnl_usdt for t in self._trades.values())
 
     @property
     def equity(self) -> float:
@@ -1113,48 +835,24 @@ class ExecutionManager:
         except Exception as e:
             log.error(f"_sync_ws_symbols: {e}")
 
+    def _fresh_ws_price(self, symbol: str) -> float:
+        try:
+            p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
+            return float(p) if p and p > 0 else 0.0
+        except Exception:
+            return 0.0
+
     async def get_entry_reference_price(
         self,
         symbol: str,
         extra_symbols: Optional[list[str]] = None,
         fallback_price: float = 0.0,
     ) -> float:
-        """
-        Resuelve el precio REAL de entrada — NUNCA confía en el `price`
-        que llega en la señal salvo como ÚLTIMO recurso (ver punto 3),
-        ya que normalmente es solo informativo/de cuando se generó la
-        señal y puede llevar segundos de desfase.
+        p = self._fresh_ws_price(symbol)
+        if p:
+            return p
 
-        100% WebSocket — ya NO hay fallback REST de precio (get_rest_price
-        se eliminó por decisión explícita: se quitaron todas las llamadas
-        REST salvo la de leverage). Orden de preferencia:
-
-        1. Caché WS ya activa para el símbolo — pero SÓLO si es reciente
-           (< MAX_PRICE_AGE_S). Un precio cacheado viejo (p.ej. de una
-           posición anterior ya cerrada en ese mismo símbolo, cuyo stream
-           se desuscribió) es PEOR que no tener nada: produce un
-           entry_price completamente fuera de mercado sin ningún error
-           visible. Por eso aquí se exige freshness, no solo presencia.
-        2. Si el símbolo aún no estaba suscrito (o el dato es viejo), se
-           suscribe al WS de precios y se espera a que llegue un tick
-           fresco, re-suscribiendo periódicamente por si el símbolo se
-           cayó del stream o el primer mensaje de suscripción se perdió.
-        3. Si tras esperar el WS el tiempo máximo sigue sin entregar nada
-           Y se dispone de un `fallback_price` (típicamente el precio que
-           traía la señal de entrada), se usa ESE como último recurso en
-           vez de cancelar la apertura — dejando bien claro en el log que
-           es un precio aproximado y no confirmado contra mercado.
-           Cancelar la operación solo ocurre si no hay absolutamente
-           ningún precio disponible (ni WS ni fallback).
-        """
-        try:
-            p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
-            if p and p > 0:
-                return float(p)
-        except Exception:
-            pass
-
-        def _subscribe():
+        def subscribe():
             try:
                 wanted = self.active_symbols | {symbol}
                 if extra_symbols:
@@ -1163,25 +861,21 @@ class ExecutionManager:
             except Exception as e:
                 log.warning(f"get_entry_reference_price: no se pudo suscribir {symbol} al WS: {e}")
 
-        _subscribe()
+        subscribe()
 
-        # Margen de espera al tick fresco del WS antes de recurrir al
-        # fallback_price. Re-suscribe periódicamente por si el primer
-        # intento de suscripción se perdió.
-        deadline = asyncio.get_event_loop().time() + 10.0
-        resub_every_s = 3.0
-        last_resub = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(0.2)
-            try:
-                p = self.price_ws.get_price(symbol, max_age_s=MAX_PRICE_AGE_S)
-                if p and p > 0:
-                    return float(p)
-            except Exception:
-                pass
-            now = asyncio.get_event_loop().time()
-            if now - last_resub >= resub_every_s:
-                _subscribe()
+        loop = asyncio.get_running_loop()
+        last_resub = loop.time()
+        deadline = last_resub + 10.0
+        while True:
+            await asyncio.sleep(0.02)
+            p = self._fresh_ws_price(symbol)
+            if p:
+                return p
+            now = loop.time()
+            if now >= deadline:
+                break
+            if now - last_resub >= 3.0:
+                subscribe()
                 last_resub = now
 
         if fallback_price and fallback_price > 0:
@@ -1207,27 +901,14 @@ class ExecutionManager:
         ref_price: float,
         reduce_only: bool = False,
     ) -> dict:
-        """
-        Envía la orden MARKET con la quantity ya calculada. Si Binance la
-        rechaza específicamente por notional insuficiente (-4164) o por
-        precisión/stepSize (-1013 / -1111) — típico cuando el precio se
-        movió justo entre el cálculo y el envío — se recalcula la
-        cantidad con un colchón de seguridad mayor sobre el notional
-        mínimo y se reintenta UNA sola vez con un precio fresco.
-        """
         try:
             return await self.api.create_market_order(
-                symbol=symbol,
-                side=side,
-                quantity=qty_str,
-                position_side=position_side,
-                reduce_only=reduce_only,
-                new_order_resp_type="RESULT",
+                symbol=symbol, side=side, quantity=qty_str,
+                position_side=position_side, reduce_only=reduce_only,
             )
         except Exception as e:
             err = str(e)
-            is_notional_or_precision = any(code in err for code in ("-4164", "-1013", "-1111", "Notional", "precision"))
-            if not is_notional_or_precision:
+            if not any(code in err for code in _RETRYABLE_ORDER_ERRORS):
                 raise
 
             log.warning(f"_place_market_order_safe: {symbol} rechazada ({err}); recalculando con colchón mayor y reintentando una vez")
@@ -1237,23 +918,17 @@ class ExecutionManager:
             except Exception:
                 fresh_price = ref_price
 
-            # Doble colchón de seguridad en el reintento (p.ej. 2% -> ~10%).
             retry_buffer = max(NOTIONAL_SAFETY_BUFFER_PCT * 5, 10.0)
             min_notional = max(float(filters.get("min_notional", MIN_NOTIONAL_USDT)), MIN_NOTIONAL_USDT)
             target_notional = min_notional * (1 + retry_buffer / 100.0)
 
             retry_qty, retry_notional = resolve_safe_quantity(target_notional, fresh_price, filters)
             retry_qty_str = format_qty(retry_qty, filters.get("stepSize", 0.001))
-
             log.info(f"_place_market_order_safe: reintento {symbol} qty={retry_qty_str} (notional≈${retry_notional:.4f}, precio={fresh_price})")
 
             return await self.api.create_market_order(
-                symbol=symbol,
-                side=side,
-                quantity=retry_qty_str,
-                position_side=position_side,
-                reduce_only=reduce_only,
-                new_order_resp_type="RESULT",
+                symbol=symbol, side=side, quantity=retry_qty_str,
+                position_side=position_side, reduce_only=reduce_only,
             )
 
     @staticmethod
@@ -1269,23 +944,6 @@ class ExecutionManager:
         filters: dict,
         ref_price: float,
     ) -> tuple[Optional[dict], bool, bool]:
-        """
-        Envía la orden de ENTRADA. Como se opera LONG y SHORT del mismo
-        símbolo al mismo tiempo, SIEMPRE se intenta primero en modo
-        Hedge (positionSide=LONG/SHORT):
-
-        - Si falla por margen insuficiente (-2019): NO se reintenta en
-          otro modo — se trata igual que siempre (posición "asumida"),
-          porque el problema es de margen, no de positionSide.
-        - Si falla por cualquier OTRO motivo (típicamente -4061 "order's
-          position side does not match user's setting", es decir la
-          cuenta en Binance no está realmente en Hedge Mode) se
-          reintenta UNA vez en modo One-way (positionSide=BOTH). Lo que
-          haya funcionado en ESTE intento es lo que se registra como
-          modo real de esta posición puntual (Trade.hedge_mode).
-
-        Devuelve (result_o_None, used_hedge, order_assumed).
-        """
         try:
             result = await self._place_market_order_safe(
                 symbol=symbol, side=side, qty_str=qty_str,
@@ -1293,8 +951,7 @@ class ExecutionManager:
             )
             return result, True, False
         except Exception as e_hedge:
-            err_hedge = str(e_hedge)
-            if self._is_margin_insufficient(err_hedge):
+            if self._is_margin_insufficient(str(e_hedge)):
                 log.warning(f"_place_entry_order: {symbol} margen insuficiente en modo Hedge — posición asumida: {e_hedge}")
                 return None, True, True
 
@@ -1309,8 +966,7 @@ class ExecutionManager:
                 )
                 return result, False, False
             except Exception as e_oneway:
-                err_oneway = str(e_oneway)
-                if self._is_margin_insufficient(err_oneway):
+                if self._is_margin_insufficient(str(e_oneway)):
                     log.warning(f"_place_entry_order: {symbol} margen insuficiente en reintento One-way — posición asumida: {e_oneway}")
                     return None, False, True
                 log.error(f"_place_entry_order: {symbol} falló tanto en Hedge como en One-way: {e_oneway}")
@@ -1326,60 +982,25 @@ class ExecutionManager:
     ) -> Optional[Trade]:
         direction = direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
-        # El positionSide de ENTRADA ya no se decide con el flag global
-        # HEDGE_MODE: se intenta siempre en modo Hedge primero y, si
-        # Binance la rechaza por un motivo distinto a margen, se cae a
-        # One-way automáticamente (ver _place_entry_order más abajo).
 
-        # Ya NO se bloquea si el símbolo ya tiene una posición abierta: la
-        # señal se manda siempre. Si ya existía una posición en ese símbolo,
-        # se fusiona con la nueva al registrar el trade (ver más abajo),
-        # igual que hace Binance internamente con el neto por símbolo.
+        if is_symbol_blocked(symbol):
+            log.warning(f"open_trade: {symbol} está en BLOCKED_SYMBOLS — apertura cancelada")
+            return None
 
-        order_assumed = False
-        entry_order_id = ""
-
-        # ── Resolución del precio REAL de entrada ──────────────────────
-        # El `price` de la señal es solo orientativo (sirve para calcular
-        # el notional deseado junto con `quantity`), pero NUNCA se usa
-        # como precio de entrada ni se descarta la apertura por su
-        # diferencia con el mercado. Siempre se solicita el precio real
-        # — 100% WebSocket, con el precio de la señal como último recurso
-        # si el WS no entrega nada a tiempo — y con ESE se calcula la
-        # cantidad final y se registra la entrada.
         ref_price = await self.get_entry_reference_price(symbol, fallback_price=price)
         if ref_price <= 0:
-            log.error(
-                f"open_trade: no se pudo obtener NINGÚN precio para {symbol} (ni WS ni precio de señal) "
-                f"— apertura cancelada"
-            )
+            log.error(f"open_trade: no se pudo obtener NINGÚN precio para {symbol} (ni WS ni precio de señal) — apertura cancelada")
             return None
 
         if price > 0 and abs(ref_price - price) / max(price, 1e-9) > 0.01:
-            log.info(
-                f"open_trade: precio de señal={price} es solo orientativo — se abre con precio real={ref_price} para {symbol}"
-            )
+            log.info(f"open_trade: precio de señal={price} es solo orientativo — se abre con precio real={ref_price} para {symbol}")
 
-        desired_notional = price * quantity if price > 0 else ref_price * quantity
+        desired_notional = (price if price > 0 else ref_price) * quantity
         filled_price = ref_price
 
-        # exchangeInfo/get_symbol_filters se eliminó por decisión explícita
-        # (ya no hay ninguna llamada REST para leer stepSize/minQty reales):
-        # se usa siempre el default fijo seguro (cantidad entera).
-        filters = dict(BinanceAPI.SAFE_DEFAULT_FILTERS)
-
-        # set_leverage sigue siendo la única llamada REST (vía Fixie), con
-        # su propia escalera de respaldo 5x→4x si el símbolo la rechaza.
-        try:
-            leverage_result = await self.api.set_leverage_with_fallback(symbol, LEVERAGE)
-        except Exception as e:
-            leverage_result = e
-
-        if isinstance(leverage_result, Exception):
-            log.warning(f"open_trade: no se pudo aplicar NINGÚN leverage de la escalera para {symbol}: {leverage_result}")
-            applied_leverage = LEVERAGE
-        else:
-            applied_leverage = leverage_result
+        filters = filters_for_price(ref_price)
+        step_size = float(filters["stepSize"])
+        target_leverage = leverage_for_price(ref_price)
 
         try:
             send_qty, send_notional = resolve_safe_quantity(
@@ -1389,6 +1010,9 @@ class ExecutionManager:
             log.error(f"open_trade: no se pudo calcular quantity segura para {symbol}: {e}")
             return None
 
+        log.info(f"open_trade: {symbol} precio={ref_price} → stepSize={step_size}, leverage objetivo={target_leverage}x")
+        applied_leverage = await self.api.set_leverage_with_fallback(symbol, target_leverage)
+
         if abs(send_qty - quantity) > 1e-12:
             log.info(
                 f"open_trade: quantity ajustada para {symbol} → señal={quantity} (notional≈${desired_notional:.4f}) "
@@ -1396,16 +1020,12 @@ class ExecutionManager:
             )
         quantity = send_qty
 
-        qty_str = format_qty(quantity, filters.get("stepSize", 0.001))
+        qty_str = format_qty(quantity, step_size)
         log.info(f"open_trade: enviando MARKET por WS → {symbol} {side} qty={qty_str} (notional≈${send_notional:.4f}) [intento Hedge]")
         try:
             result, used_hedge, order_assumed = await self._place_entry_order(
-                symbol=symbol,
-                side=side,
-                qty_str=qty_str,
-                direction=direction,
-                filters=filters,
-                ref_price=ref_price,
+                symbol=symbol, side=side, qty_str=qty_str,
+                direction=direction, filters=filters, ref_price=ref_price,
             )
         except Exception as e_ord:
             log.error(f"open_trade: fallo enviando MARKET (Hedge y fallback One-way) para {symbol}: {e_ord}")
@@ -1416,15 +1036,12 @@ class ExecutionManager:
             entry_order_id = "MARGIN_INSUFFICIENT"
         else:
             entry_order_id = str(result.get("orderId", result.get("clientOrderId", "WS_ORDER")))
-            avg = result.get("avgPrice") or result.get("price")
             try:
-                avg_f = float(avg)
+                avg_f = float(result.get("avgPrice") or result.get("price"))
                 if avg_f > 0:
                     filled_price = avg_f
             except Exception:
                 pass
-            # Si la cantidad final se ajustó en el reintento, refleja el valor
-            # realmente ejecutado en el trade que se registra.
             try:
                 executed_qty = float(result.get("origQty") or result.get("executedQty") or quantity)
                 if executed_qty > 0:
@@ -1436,94 +1053,67 @@ class ExecutionManager:
                 f"modo={'Hedge' if used_hedge else 'One-way (fallback)'}"
             )
 
+        def new_trade() -> Trade:
+            self._counter += 1
+            return Trade(
+                id=self._counter,
+                symbol=symbol,
+                direction=direction,
+                entry_price=filled_price,
+                quantity=quantity,
+                open_time=_utc(),
+                leverage=applied_leverage,
+                paper_trade_id=paper_trade_id,
+                entry_order_id=entry_order_id,
+                current_price=filled_price,
+                order_assumed=order_assumed,
+                hedge_mode=used_hedge,
+                step_size=step_size,
+            )
+
+        cancel_residual = False
         async with self._lock:
             key = (symbol, direction)
 
             if used_hedge:
-                # Esta entrada se logró (o se asumió) en Hedge Mode: Binance
-                # mantiene LONG y SHORT del mismo
-                # símbolo como posiciones TOTALMENTE independientes
-                # (positionSide). No hay neteo entre ellas: una señal LONG
-                # nunca debe tocar la posición SHORT existente del mismo
-                # símbolo, y viceversa. Por eso aquí sólo se busca/actualiza
-                # la entrada con la MISMA clave (symbol, direction); jamás
-                # se mira la dirección contraria.
                 existing = self._trades.get(key)
-
                 if existing is None:
-                    self._counter += 1
-                    trade = Trade(
-                        id=self._counter,
-                        symbol=symbol,
-                        direction=direction,
-                        entry_price=filled_price,
-                        quantity=quantity,
-                        open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                        leverage=applied_leverage,
-                        paper_trade_id=paper_trade_id,
-                        entry_order_id=entry_order_id,
-                        current_price=filled_price,
-                        order_assumed=order_assumed,
-                        hedge_mode=True,
-                    )
+                    trade = new_trade()
                     self._trades[key] = trade
-                    self._paper_id_map[paper_trade_id] = key
                     action_tag = "ABIERTO"
                 else:
-                    # Misma dirección ya abierta: amplía y promedia precio.
-                    new_qty = existing.quantity + quantity
+                    existing.step_size = min(existing.step_size, step_size)
+                    new_qty = round(existing.quantity + quantity, _step_decimals(existing.step_size))
                     existing.entry_price = (
-                        (existing.entry_price * existing.quantity) + (filled_price * quantity)
+                        existing.entry_price * existing.quantity + filled_price * quantity
                     ) / new_qty
                     existing.quantity = new_qty
                     existing.leverage = applied_leverage
                     existing.entry_order_id = entry_order_id
                     existing.order_assumed = existing.order_assumed or order_assumed
                     existing.hedge_mode = True
-                    self._paper_id_map[paper_trade_id] = key
                     trade = existing
                     action_tag = "AMPLIADO"
+                self._paper_id_map[paper_trade_id] = key
             else:
-                # Esta entrada se logró (o se asumió) en One-way (fallback,
-                # positionSide=BOTH): Binance mantiene UN
-                # único neto por símbolo sin importar qué `side` se mande,
-                # así que aquí también debe haber como máximo una entrada
-                # local por símbolo (cualquiera sea su dirección actual).
-                # Se busca la entrada existente para ESTE símbolo en
-                # cualquier dirección — nunca puede haber dos en one-way.
                 existing = next((t for (sym, _d), t in self._trades.items() if sym == symbol), None)
 
                 if existing is None:
-                    self._counter += 1
-                    trade = Trade(
-                        id=self._counter,
-                        symbol=symbol,
-                        direction=direction,
-                        entry_price=filled_price,
-                        quantity=quantity,
-                        open_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                        leverage=applied_leverage,
-                        paper_trade_id=paper_trade_id,
-                        entry_order_id=entry_order_id,
-                        current_price=filled_price,
-                        order_assumed=order_assumed,
-                        hedge_mode=False,
-                    )
+                    trade = new_trade()
                     self._trades[key] = trade
                     self._paper_id_map[paper_trade_id] = key
                     action_tag = "ABIERTO"
                 else:
                     old_key = (existing.symbol, existing.direction)
-                    # Fusión con signo (+ LONG / - SHORT), igual que el
-                    # neto real que mantiene Binance por símbolo.
                     old_signed = existing.quantity if existing.direction == "LONG" else -existing.quantity
                     delta_signed = quantity if direction == "LONG" else -quantity
-                    new_signed = old_signed + delta_signed
+                    existing.step_size = min(existing.step_size, step_size)
+                    new_signed = round(old_signed + delta_signed, _step_decimals(existing.step_size))
 
                     if abs(new_signed) < 1e-9:
                         existing.status = "NETTED"
                         existing.close_price = filled_price
-                        existing.close_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                        existing.close_time = _utc()
                         existing.update_unrealized(filled_price)
                         del self._trades[old_key]
                         self._paper_id_map.pop(existing.paper_trade_id, None)
@@ -1531,16 +1121,13 @@ class ExecutionManager:
                         log.info(f"open_trade: {symbol} neteado a 0 con esta señal — posición cerrada")
                         trade = None
                         action_tag = "NETEADO"
-                        try:
-                            await self.api.cancel_symbol_orders(symbol)
-                        except Exception as e:
-                            log.warning(f"open_trade: no se pudieron cancelar órdenes residuales de {symbol} tras neteo a 0: {e}")
+                        cancel_residual = True
                     else:
                         new_direction = "LONG" if new_signed > 0 else "SHORT"
                         new_qty = abs(new_signed)
                         if new_direction == existing.direction:
                             existing.entry_price = (
-                                (existing.entry_price * existing.quantity) + (filled_price * quantity)
+                                existing.entry_price * existing.quantity + filled_price * quantity
                             ) / new_qty
                             action_tag = "AMPLIADO"
                         else:
@@ -1561,7 +1148,13 @@ class ExecutionManager:
                         trade = existing
 
         self._sync_ws_symbols()
-        await self.refresh_balance()
+        _spawn(self.refresh_balance())
+
+        if cancel_residual:
+            try:
+                await self.api.cancel_symbol_orders(symbol)
+            except Exception as e:
+                log.warning(f"open_trade: no se pudieron cancelar órdenes residuales de {symbol} tras neteo a 0: {e}")
 
         if trade is None:
             return None
@@ -1577,21 +1170,15 @@ class ExecutionManager:
     async def close_trade(self, trade: Trade, close_price: float, reason: str) -> bool:
         async with self._lock:
             key = (trade.symbol, trade.direction)
-            if trade.status != "OPEN":
-                return False
-            if self._trades.get(key) is not trade:
+            if trade.status != "OPEN" or self._trades.get(key) is not trade:
                 return False
 
             trade.status = reason
             trade.close_price = close_price
-            trade.close_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-            if trade.direction == "LONG":
-                trade.pnl_usdt = (close_price - trade.entry_price) * trade.quantity
-            else:
-                trade.pnl_usdt = (trade.entry_price - close_price) * trade.quantity
-
-            trade.roi_pct = (trade.pnl_usdt / trade.notional_usdt * 100) if trade.notional_usdt else 0.0
+            trade.close_time = _utc()
+            trade.pnl_usdt = trade.calc_pnl(close_price)
+            notional = trade.notional_usdt
+            trade.roi_pct = trade.pnl_usdt / notional * 100 if notional else 0.0
 
             del self._trades[key]
             self._paper_id_map.pop(trade.paper_trade_id, None)
@@ -1603,16 +1190,16 @@ class ExecutionManager:
             log.warning(f"close_trade: no se pudieron cancelar órdenes residuales de {trade.symbol}: {e}")
 
         self._sync_ws_symbols()
-
         log.info(
             f"[REAL #{trade.id}] CERRADO {reason} {trade.symbol} @ ${close_price} | "
             f"PnL: {trade.pnl_usdt:+.4f} USDT ({trade.roi_pct:+.2f}%)"
         )
-        await self.refresh_balance()
+        _spawn(self.refresh_balance())
         return True
 
     async def force_close_trade(self, trade: Trade, reason: str = "MAIN_BOT", close_price: Optional[float] = None) -> bool:
-        close_price = close_price if close_price and close_price > 0 else (trade.current_price if trade.current_price > 0 else trade.entry_price)
+        if not (close_price and close_price > 0):
+            close_price = trade.current_price if trade.current_price > 0 else trade.entry_price
         try:
             await self.api.cancel_symbol_orders(trade.symbol)
         except Exception as e:
@@ -1622,7 +1209,7 @@ class ExecutionManager:
                 symbol=trade.symbol,
                 direction=trade.direction,
                 quantity=trade.quantity,
-                position_side=(trade.direction if trade.hedge_mode else "BOTH"),
+                position_side=trade.position_side,
             )
             log.info(f"force_close: close_position_market OK para {trade.symbol}")
         except Exception as e:
@@ -1649,19 +1236,20 @@ class ExecutionManager:
 
     async def close_all_global(self, reason: str = "CLOSE_ALL") -> list[Trade]:
         async with self._lock:
-            trades_snapshot = list(self._trades.values())
+            snapshot = list(self._trades.values())
 
-        closed_trades = []
-        for trade in trades_snapshot:
+        async def _close_one(trade: Trade) -> Optional[Trade]:
             try:
-                closed = await self.force_close_trade(trade, reason=reason)
-                if closed:
-                    closed_trades.append(trade)
+                if await self.force_close_trade(trade, reason=reason):
                     log.info(f"close_all_global: cerrado {trade.symbol} #{trade.id}")
+                    return trade
             except Exception as e:
                 log.error(f"close_all_global: error cerrando {trade.symbol}: {e}")
+            return None
 
-        log.info(f"close_all_global: {len(closed_trades)}/{len(trades_snapshot)} posiciones cerradas")
+        results = await asyncio.gather(*(_close_one(t) for t in snapshot))
+        closed_trades = [t for t in results if t is not None]
+        log.info(f"close_all_global: {len(closed_trades)}/{len(snapshot)} posiciones cerradas")
         return closed_trades
 
     async def poll_positions(self) -> list[Trade]:
@@ -1674,11 +1262,7 @@ class ExecutionManager:
             log.error(f"poll_positions: {e}")
             return []
 
-        # En Hedge Mode Binance devuelve una entrada por (symbol,
-        # positionSide); en one-way mode devuelve positionSide=BOTH. Se
-        # indexa por (symbol, direction) para poder comparar 1:1 contra
-        # las posiciones locales sin mezclar LONG y SHORT del mismo símbolo.
-        pos_by_key: dict[tuple[str, str], dict] = {}
+        live_keys: set[tuple[str, str]] = set()
         for p in positions:
             sym = p.get("symbol", "")
             try:
@@ -1688,58 +1272,42 @@ class ExecutionManager:
             if not sym or abs(amt) <= 0:
                 continue
             pos_side = p.get("positionSide", "BOTH")
-            if pos_side == "BOTH":
-                direction = "LONG" if amt > 0 else "SHORT"
-            else:
-                direction = pos_side
-            pos_by_key[(sym, direction)] = p
+            direction = ("LONG" if amt > 0 else "SHORT") if pos_side == "BOTH" else pos_side
+            live_keys.add((sym, direction))
 
-        async with self._lock:
-            open_copy = dict(self._trades)
-
-        missing: list[Trade] = [
-            trade for key, trade in open_copy.items() if key not in pos_by_key
-        ]
-        return missing
+        return [t for key, t in list(self._trades.items()) if key not in live_keys]
 
     def find_by_paper_id(self, paper_trade_id: int) -> Optional[Trade]:
         key = self._paper_id_map.get(paper_trade_id)
-        if key:
-            return self._trades.get(key)
-        return None
+        return self._trades.get(key) if key else None
 
 
-# ══════════════════════════════════════════════════════════
-#  INSTANCIAS GLOBALES
-# ══════════════════════════════════════════════════════════
 execution_manager: Optional[ExecutionManager] = None
 
-executor_status = {
-    "signals_received": 0,
-    "signals_open": 0,
-    "signals_close": 0,
-    "signals_rejected": 0,
-    "manual_closes": 0,
-    "signals_tp_set": 0,
-    "signals_tp_closed": 0,
-    "signals_sl_set": 0,
-    "signals_sl_closed": 0,
+_STATUS_KEYS = (
+    "signals_received", "signals_open", "signals_close", "signals_rejected", "manual_closes",
+    "signals_tp_set", "signals_tp_closed", "signals_sl_set", "signals_sl_closed",
+)
+executor_status = {k: 0 for k in _STATUS_KEYS}
+executor_status.update({
     "last_signal_time": "Esperando señales...",
     "last_signal_detail": "",
-    "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-}
+    "started_at": _utc(_FMT_SEC),
+})
+
+_TG_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+_tg_session: Optional[aiohttp.ClientSession] = None
 
 
-# ══════════════════════════════════════════════════════════
-#  TELEGRAM
-# ══════════════════════════════════════════════════════════
-async def send_telegram(session: aiohttp.ClientSession, message: str):
+async def send_telegram(message: str):
+    global _tg_session
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    if _tg_session is None or _tg_session.closed:
+        _tg_session = aiohttp.ClientSession()
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with _tg_session.post(_TG_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 log.error(f"Telegram error {resp.status}: {await resp.text()}")
     except Exception as e:
@@ -1767,23 +1335,25 @@ def build_open_message(trade: Trade) -> str:
     )
 
 
+_CLOSE_REASONS = {
+    "TP": ("✅", "TAKE PROFIT 🎯"),
+    "SL": ("❌", "STOP LOSS 🛑"),
+    "CLOSED": ("🔄", "CIERRE EXTERNO"),
+    "MAIN_BOT": ("🔄", "CIERRE SEÑAL PRINCIPAL"),
+    "CLOSE_ALL": ("🛑", "CIERRE GLOBAL (SEÑAL)"),
+    "MANUAL": ("🖐", "CIERRE MANUAL (DASHBOARD)"),
+    "NETTED": ("➖", "NETEADA POR SEÑAL OPUESTA"),
+}
+
+
 def build_close_message(trade: Trade) -> str:
-    reason_map = {
-        "TP": ("✅", "TAKE PROFIT 🎯"),
-        "SL": ("❌", "STOP LOSS 🛑"),
-        "CLOSED": ("🔄", "CIERRE EXTERNO"),
-        "MAIN_BOT": ("🔄", "CIERRE SEÑAL PRINCIPAL"),
-        "CLOSE_ALL": ("🛑", "CIERRE GLOBAL (SEÑAL)"),
-        "MANUAL": ("🖐", "CIERRE MANUAL (DASHBOARD)"),
-        "NETTED": ("➖", "NETEADA POR SEÑAL OPUESTA"),
-    }
-    emoji, reason_str = reason_map.get(trade.status, ("⚠️", trade.status))
+    emoji, reason_str = _CLOSE_REASONS.get(trade.status, ("⚠️", trade.status))
     dir_str = "🟢 LONG" if trade.direction == "LONG" else "🔴 SHORT"
     pnl_emoji = "💚" if trade.pnl_usdt >= 0 else "❗"
 
-    closed_all = execution_manager.closed_trades
-    wins = sum(1 for t in closed_all if t.status == "TP")
+    closed_all = execution_manager._closed
     total = len(closed_all)
+    wins = sum(1 for t in closed_all if t.status == "TP")
     wr = f"{wins / total * 100:.1f}% ({wins}✅/{total - wins}❌)" if total else "N/A"
 
     return (
@@ -1807,10 +1377,7 @@ def build_close_message(trade: Trade) -> str:
     )
 
 
-# ══════════════════════════════════════════════════════════
-#  MONITOR DE POSICIONES — SOLO ALERTA
-# ══════════════════════════════════════════════════════════
-async def position_monitor_loop(session: aiohttp.ClientSession):
+async def position_monitor_loop():
     log.info(f"Position Monitor (sólo alertas) — poll cada {POSITION_POLL_S}s")
     await asyncio.sleep(10)
     alerted: set[str] = set()
@@ -1826,46 +1393,33 @@ async def position_monitor_loop(session: aiohttp.ClientSession):
                 alerted.add(trade.symbol)
                 log.warning(f"⚠️ {trade.symbol} (#{trade.id}) ya no aparece en Binance pero sigue OPEN localmente.")
                 await send_telegram(
-                    session,
                     f"⚠️ <b>POSIBLE CIERRE EXTERNO DETECTADO</b>\n"
                     f"📊 <code>{trade.symbol}</code> (Real #{trade.id} | Paper #{trade.paper_trade_id})\n"
                     f"Ya no aparece entre tus posiciones de Binance, pero el executor sigue registrándola como abierta.\n"
-                    f"➡️ No se cerró automáticamente.",
+                    f"➡️ No se cerró automáticamente."
                 )
 
             alerted &= (missing_symbols | execution_manager.active_symbols)
-
         except Exception as e:
             log.error(f"position_monitor_loop: {e}")
 
         await asyncio.sleep(POSITION_POLL_S)
 
 
-# ══════════════════════════════════════════════════════════
-#  SYNC DE BALANCE
-# ══════════════════════════════════════════════════════════
 async def balance_sync_loop():
-    """
-    Único responsable de mantener el balance actualizado. Corre
-    independiente de las señales de trading, así que la consulta de
-    balance queda espaciada en el tiempo y no coincide con el instante
-    en que se manda leverage (REST) + orden (WS) al abrir una posición.
-    """
     log.info(f"Balance Sync Loop — refrescando balance cada {BALANCE_POLL_S}s")
     while True:
         await execution_manager.refresh_balance(force=True)
         await asyncio.sleep(BALANCE_POLL_S)
 
 
-# ══════════════════════════════════════════════════════════
-#  SYNC DE PRECIOS
-# ══════════════════════════════════════════════════════════
 async def price_sync_loop():
     log.info("Price Sync Loop — actualizando PnL desde caché WS cada 1s")
     while True:
         try:
-            for trade in execution_manager.open_trades:
-                price = execution_manager.price_ws.get_price(trade.symbol)
+            get_price = execution_manager.price_ws.get_price
+            for trade in list(execution_manager._trades.values()):
+                price = get_price(trade.symbol)
                 if price:
                     trade.update_unrealized(price)
         except Exception as e:
@@ -1873,26 +1427,46 @@ async def price_sync_loop():
         await asyncio.sleep(1)
 
 
-# ══════════════════════════════════════════════════════════
-#  HTTP SIGNAL HANDLER
-# ══════════════════════════════════════════════════════════
+def _json_err(error: str, status: int = 400) -> web.Response:
+    return web.json_response({"ok": False, "error": error}, status=status)
+
+
+def _check_dashboard_token(request: web.Request) -> bool:
+    return request.headers.get("X-Dashboard-Token", "") == SIGNAL_SECRET
+
+
+async def _auth_json(request: web.Request):
+    if not _check_dashboard_token(request):
+        return None, _json_err("unauthorized", 401)
+    try:
+        return await request.json(), None
+    except Exception:
+        return None, _json_err("invalid json", 400)
+
+
+_TP_SL_TYPES = {"open_tp": "TAKE_PROFIT_MARKET", "close_tp": "TAKE_PROFIT_MARKET",
+                "open_sl": "STOP_MARKET", "close_sl": "STOP_MARKET"}
+_NO_DIR_HINT = "(si hay LONG y SHORT simultáneas, especifica 'direction')"
+
+
 async def signal_handler(request: web.Request) -> web.Response:
-    secret = request.headers.get("X-Signal-Secret", "")
-    if secret != SIGNAL_SECRET:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    if request.headers.get("X-Signal-Secret", "") != SIGNAL_SECRET:
+        return _json_err("unauthorized", 401)
 
     try:
         data = await request.json()
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
     action = data.get("action", "").lower()
     symbol = data.get("symbol", "").upper()
     trade_id = int(data.get("trade_id", 0))
 
     executor_status["signals_received"] += 1
-    executor_status["last_signal_time"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    executor_status["last_signal_time"] = _utc("%H:%M:%S UTC")
     executor_status["last_signal_detail"] = f"{action.upper()} {symbol}"
+
+    em = execution_manager
 
     if action == "open":
         direction = data.get("direction", "").upper()
@@ -1901,170 +1475,145 @@ async def signal_handler(request: web.Request) -> web.Response:
 
         if not symbol or not direction or price <= 0 or quantity <= 0:
             executor_status["signals_rejected"] += 1
-            return web.json_response({"ok": False, "error": "missing or invalid open params"}, status=400)
+            return _json_err("missing or invalid open params", 400)
 
-        if not execution_manager.trading_enabled:
+        if is_symbol_blocked(symbol):
+            executor_status["signals_rejected"] += 1
+            log.warning(f"Señal OPEN ignorada para {symbol} — símbolo bloqueado (BLOCKED_SYMBOLS)")
+            return _json_err(f"{symbol} está bloqueado para operar", 200)
+
+        if not em.trading_enabled:
             executor_status["signals_rejected"] += 1
             log.warning(f"Señal OPEN ignorada para {symbol} — trading pausado manualmente desde el dashboard")
-            return web.json_response({"ok": False, "error": "trading pausado manualmente desde el dashboard"}, status=200)
+            return _json_err("trading pausado manualmente desde el dashboard", 200)
 
         async def _do_open():
-            trade = await execution_manager.open_trade(symbol, direction, price, quantity, paper_trade_id=trade_id)
+            trade = await em.open_trade(symbol, direction, price, quantity, paper_trade_id=trade_id)
             if trade:
                 executor_status["signals_open"] += 1
-                async with aiohttp.ClientSession() as sess:
-                    await send_telegram(sess, build_open_message(trade))
+                await send_telegram(build_open_message(trade))
             else:
                 executor_status["signals_rejected"] += 1
 
-        asyncio.create_task(_do_open())
+        _spawn(_do_open())
         return web.json_response({"ok": True, "action": "open", "symbol": symbol, "direction": direction})
 
     if action == "close":
         reason = data.get("reason", "MAIN_BOT").upper()
         close_price = float(data.get("close_price", 0))
-        trade = execution_manager.find_by_paper_id(trade_id) or execution_manager.get_trade(symbol, data.get("direction"))
+        trade = em.find_by_paper_id(trade_id) or em.get_trade(symbol, data.get("direction"))
 
         async def _do_close():
             if trade:
                 use_price = close_price if close_price > 0 else trade.current_price or trade.entry_price
-                closed = await execution_manager.force_close_trade(trade, reason=reason, close_price=use_price)
-                if closed:
+                if await em.force_close_trade(trade, reason=reason, close_price=use_price):
                     executor_status["signals_close"] += 1
-                    async with aiohttp.ClientSession() as sess:
-                        await send_telegram(sess, build_close_message(trade))
-            else:
-                closed = await execution_manager.force_close_by_symbol(symbol)
-                if closed:
-                    executor_status["signals_close"] += 1
-                    async with aiohttp.ClientSession() as sess:
-                        await send_telegram(sess, f"🔄 <b>CIERRE FORZADO (sin estado local)</b>\n<code>{symbol}</code>")
+                    await send_telegram(build_close_message(trade))
+            elif await em.force_close_by_symbol(symbol):
+                executor_status["signals_close"] += 1
+                await send_telegram(f"🔄 <b>CIERRE FORZADO (sin estado local)</b>\n<code>{symbol}</code>")
 
-        asyncio.create_task(_do_close())
+        _spawn(_do_close())
         return web.json_response({"ok": True, "action": "close", "symbol": symbol})
 
     if action == "close_all":
-        total_open = len(execution_manager.open_trades)
+        total_open = len(em._trades)
 
         async def _do_close_all():
-            closed_trades = await execution_manager.close_all_global(reason="CLOSE_ALL")
-            async with aiohttp.ClientSession() as sess:
-                if not closed_trades:
-                    await send_telegram(sess, "🛑 CIERRE GLOBAL ejecutado — no había posiciones abiertas.")
-                    return
-                for t in closed_trades:
-                    await send_telegram(sess, build_close_message(t))
-                await send_telegram(sess, f"🛑 CIERRE GLOBAL completado — {len(closed_trades)} posición(es) cerrada(s).")
+            closed_trades = await em.close_all_global(reason="CLOSE_ALL")
+            if not closed_trades:
+                await send_telegram("🛑 CIERRE GLOBAL ejecutado — no había posiciones abiertas.")
+                return
+            for t in closed_trades:
+                await send_telegram(build_close_message(t))
+            await send_telegram(f"🛑 CIERRE GLOBAL completado — {len(closed_trades)} posición(es) cerrada(s).")
 
-        asyncio.create_task(_do_close_all())
+        _spawn(_do_close_all())
         executor_status["signals_close"] += total_open
         return web.json_response({"ok": True, "action": "close_all", "positions_targeted": total_open})
 
-    # ── TP/SL vía REST — funcionalidad NUEVA, independiente de
-    # open/close/close_all (posiciones). Usa los mismos helpers que el
-    # dashboard manual (_algo_set_tp_sl / _algo_cancel_tp_sl).
     if action in ("open_tp", "open_sl"):
-        order_type = "TAKE_PROFIT_MARKET" if action == "open_tp" else "STOP_MARKET"
+        order_type = _TP_SL_TYPES[action]
         trigger_price = float(data.get("trigger_price", 0))
-        trade = execution_manager.get_trade(symbol, data.get("direction"))
+        trade = em.get_trade(symbol, data.get("direction"))
 
         if not trade or trigger_price <= 0:
             executor_status["signals_rejected"] += 1
-            return web.json_response(
-                {"ok": False, "error": f"{action}: sin posición abierta para {symbol} o trigger_price inválido"},
-                status=400,
-            )
+            return _json_err(f"{action}: sin posición abierta para {symbol} o trigger_price inválido", 400)
 
         async def _do_open_algo():
             try:
                 await _algo_set_tp_sl(trade, trigger_price, order_type)
-                key = "signals_tp_set" if action == "open_tp" else "signals_sl_set"
-                executor_status[key] += 1
-                emoji = "🎯" if action == "open_tp" else "🛑"
-                label = "TP" if action == "open_tp" else "SL"
-                async with aiohttp.ClientSession() as sess:
-                    await send_telegram(sess, f"{emoji} <b>{label} actualizado</b>\n<code>{symbol}</code> @ {trigger_price}")
+                executor_status["signals_tp_set" if action == "open_tp" else "signals_sl_set"] += 1
+                emoji, label = ("🎯", "TP") if action == "open_tp" else ("🛑", "SL")
+                await send_telegram(f"{emoji} <b>{label} actualizado</b>\n<code>{symbol}</code> @ {trigger_price}")
             except Exception as e:
                 executor_status["signals_rejected"] += 1
                 log.error(f"signal {action}: fallo para {symbol}: {e}")
 
-        asyncio.create_task(_do_open_algo())
+        _spawn(_do_open_algo())
         return web.json_response({"ok": True, "action": action, "symbol": symbol, "trigger_price": trigger_price})
 
     if action in ("close_tp", "close_sl"):
-        order_type = "TAKE_PROFIT_MARKET" if action == "close_tp" else "STOP_MARKET"
+        order_type = _TP_SL_TYPES[action]
 
         if not symbol:
             executor_status["signals_rejected"] += 1
-            return web.json_response({"ok": False, "error": f"{action}: falta symbol"}, status=400)
+            return _json_err(f"{action}: falta symbol", 400)
 
         async def _do_close_algo():
             try:
                 n = await _algo_cancel_tp_sl(symbol, order_type)
-                key = "signals_tp_closed" if action == "close_tp" else "signals_sl_closed"
-                executor_status[key] += 1
-                emoji = "🎯" if action == "close_tp" else "🛑"
-                label = "TP" if action == "close_tp" else "SL"
-                async with aiohttp.ClientSession() as sess:
-                    await send_telegram(sess, f"{emoji} <b>{label} cancelado</b>\n<code>{symbol}</code> — {n} orden(es)")
+                executor_status["signals_tp_closed" if action == "close_tp" else "signals_sl_closed"] += 1
+                emoji, label = ("🎯", "TP") if action == "close_tp" else ("🛑", "SL")
+                await send_telegram(f"{emoji} <b>{label} cancelado</b>\n<code>{symbol}</code> — {n} orden(es)")
             except Exception as e:
                 executor_status["signals_rejected"] += 1
                 log.error(f"signal {action}: fallo para {symbol}: {e}")
 
-        asyncio.create_task(_do_close_algo())
+        _spawn(_do_close_algo())
         return web.json_response({"ok": True, "action": action, "symbol": symbol})
 
     executor_status["signals_rejected"] += 1
-    return web.json_response({"ok": False, "error": f"unknown action: {action}"}, status=400)
-
-
-def _check_dashboard_token(request: web.Request) -> bool:
-    return request.headers.get("X-Dashboard-Token", "") == SIGNAL_SECRET
+    return _json_err(f"unknown action: {action}", 400)
 
 
 async def manual_close_handler(request: web.Request) -> web.Response:
-    if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    data, err = await _auth_json(request)
+    if err:
+        return err
 
     symbol = data.get("symbol", "").upper()
     trade = execution_manager.get_trade(symbol, data.get("direction"))
     if not trade:
-        return web.json_response({"ok": False, "error": f"no hay posición abierta registrada para {symbol} (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=404)
+        return _json_err(f"no hay posición abierta registrada para {symbol} {_NO_DIR_HINT}", 404)
 
     async def _do_manual_close():
-        closed = await execution_manager.force_close_trade(trade, reason="MANUAL")
-        if closed:
+        if await execution_manager.force_close_trade(trade, reason="MANUAL"):
             executor_status["signals_close"] += 1
             executor_status["manual_closes"] += 1
-            async with aiohttp.ClientSession() as sess:
-                await send_telegram(sess, build_close_message(trade))
+            await send_telegram(build_close_message(trade))
 
-    asyncio.create_task(_do_manual_close())
+    _spawn(_do_manual_close())
     return web.json_response({"ok": True, "action": "manual_close", "symbol": symbol})
 
 
 async def manual_close_all_handler(request: web.Request) -> web.Response:
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
 
-    total_open = len(execution_manager.open_trades)
+    total_open = len(execution_manager._trades)
 
     async def _do_close_all():
         closed_trades = await execution_manager.close_all_global(reason="MANUAL")
-        async with aiohttp.ClientSession() as sess:
-            if not closed_trades:
-                await send_telegram(sess, "🖐 Cierre manual global ejecutado — no había posiciones abiertas.")
-                return
-            for t in closed_trades:
-                await send_telegram(sess, build_close_message(t))
-            await send_telegram(sess, f"🖐 Cierre manual global completado — {len(closed_trades)} posición(es) cerrada(s).")
+        if not closed_trades:
+            await send_telegram("🖐 Cierre manual global ejecutado — no había posiciones abiertas.")
+            return
+        for t in closed_trades:
+            await send_telegram(build_close_message(t))
+        await send_telegram(f"🖐 Cierre manual global completado — {len(closed_trades)} posición(es) cerrada(s).")
 
-    asyncio.create_task(_do_close_all())
+    _spawn(_do_close_all())
     executor_status["signals_close"] += total_open
     executor_status["manual_closes"] += total_open
     return web.json_response({"ok": True, "action": "manual_close_all", "positions_targeted": total_open})
@@ -2074,169 +1623,116 @@ def _position_side_for(direction: str) -> Optional[str]:
     return direction.upper() if HEDGE_MODE else "BOTH"
 
 
-# ══════════════════════════════════════════════════════════
-#  ALGO ORDERS TP/SL — FUNCIONALIDAD NUEVA E INDEPENDIENTE
-#  (no toca open_trade/close_trade/force_close_*; la usan tanto el
-#  dashboard manual como las nuevas acciones REST open_tp/close_tp/
-#  open_sl/close_sl de signal_handler).
-# ══════════════════════════════════════════════════════════
 async def _algo_set_tp_sl(trade: "Trade", trigger_price: float, order_type: str) -> dict:
-    """
-    Crea un algo order STOP_MARKET (SL) o TAKE_PROFIT_MARKET (TP) para
-    `trade`, cancelando primero cualquier algo order previo del MISMO
-    tipo sobre ese símbolo (para no acumular condicionales duplicadas).
-    Usa quantity+reduceOnly vía create_tp_sl_order (no closePosition)
-    para evitar el -4509 'TIF GTE can only be used with open positions'.
-    """
+    api = execution_manager.api
     symbol = trade.symbol
-    close_side = "SELL" if trade.direction == "LONG" else "BUY"
-    # Usa el modo REAL con el que se abrió esta posición puntual, no el
-    # flag global HEDGE_MODE — pueden diferir si esta entrada cayó al
-    # fallback One-way (ver ExecutionManager._place_entry_order).
-    pos_side = trade.direction if trade.hedge_mode else "BOTH"
 
     try:
-        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
-        for o in algo_orders:
-            if o.get("type") == order_type:
-                await execution_manager.api.cancel_algo_order(o.get("algoId"))
+        stale = [o.get("algoId") for o in await api.get_open_algo_orders(symbol) if o.get("type") == order_type]
+        if stale:
+            await asyncio.gather(*(api.cancel_algo_order(i) for i in stale))
     except Exception as e:
         log.warning(f"_algo_set_tp_sl: no se pudo limpiar {order_type} previo de {symbol}: {e}")
 
-    # exchangeInfo/get_symbol_filters eliminado — default fijo seguro.
-    filters = BinanceAPI.SAFE_DEFAULT_FILTERS
-    qty = float(format_qty(trade.quantity, filters.get("stepSize", 0.001)))
-    return await execution_manager.api.create_tp_sl_order(
-        symbol=symbol, side=close_side, trigger_price=trigger_price,
-        order_type=order_type, position_side=pos_side, quantity=qty,
+    return await api.create_tp_sl_order(
+        symbol=symbol,
+        side="SELL" if trade.direction == "LONG" else "BUY",
+        trigger_price=trigger_price,
+        order_type=order_type,
+        position_side=trade.position_side,
+        quantity=float(format_qty(trade.quantity, trade.step_size)),
     )
 
 
 async def _algo_cancel_tp_sl(symbol: str, order_type: str) -> int:
-    """Cancela solo los algo orders del tipo indicado (TAKE_PROFIT_MARKET
-    o STOP_MARKET) para `symbol`. Devuelve cuántos se cancelaron."""
-    algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
-    cancelled = 0
-    for o in algo_orders:
-        if o.get("type") == order_type:
-            await execution_manager.api.cancel_algo_order(o.get("algoId"))
-            cancelled += 1
-    return cancelled
+    api = execution_manager.api
+    ids = [o.get("algoId") for o in await api.get_open_algo_orders(symbol) if o.get("type") == order_type]
+    if ids:
+        await asyncio.gather(*(api.cancel_algo_order(i) for i in ids))
+    return len(ids)
+
+
+async def _manual_set_algo(request: web.Request, order_type: str, result_key: str, label: str) -> web.Response:
+    if not _check_dashboard_token(request):
+        return _json_err("unauthorized", 401)
+    try:
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        trigger_price = float(data.get("trigger_price", 0))
+    except Exception:
+        return _json_err("invalid json", 400)
+
+    trade = execution_manager.get_trade(symbol, data.get("direction"))
+    if not trade:
+        return _json_err(f"sin posición abierta para {symbol} {_NO_DIR_HINT}", 404)
+    if trigger_price <= 0:
+        return _json_err("trigger_price inválido", 400)
+
+    try:
+        result = await _algo_set_tp_sl(trade, trigger_price, order_type)
+        return web.json_response({"ok": True, "symbol": symbol, result_key: trigger_price, "result": result})
+    except Exception as e:
+        log.error(f"manual_set_{result_key}: fallo creando {label} para {symbol}: {e}")
+        return _json_err(str(e), 502)
 
 
 async def manual_set_tp_handler(request: web.Request) -> web.Response:
-    """Crea un TAKE_PROFIT_MARKET vía Algo Order (WS API: método
-    algoOrder.place — order.place rechaza este tipo con -4120).
-    Se envía con quantity+reduceOnly (no closePosition=true) para evitar
-    el -4509 'TIF GTE can only be used with open positions': ver detalle
-    en BinanceAPI.create_tp_sl_order."""
-    if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-    try:
-        data = await request.json()
-        symbol = data.get("symbol", "").upper()
-        trigger_price = float(data.get("trigger_price", 0))
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-
-    trade = execution_manager.get_trade(symbol, data.get("direction"))
-    if not trade:
-        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol} (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=404)
-    if trigger_price <= 0:
-        return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
-
-    try:
-        result = await _algo_set_tp_sl(trade, trigger_price, "TAKE_PROFIT_MARKET")
-        return web.json_response({"ok": True, "symbol": symbol, "tp": trigger_price, "result": result})
-    except Exception as e:
-        log.error(f"manual_set_tp: fallo creando TP para {symbol}: {e}")
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+    return await _manual_set_algo(request, "TAKE_PROFIT_MARKET", "tp", "TP")
 
 
 async def manual_set_sl_handler(request: web.Request) -> web.Response:
-    """Crea un STOP_MARKET vía Algo Order API. Se envía con
-    quantity+reduceOnly (no closePosition=true) para evitar el -4509
-    'TIF GTE can only be used with open positions': ver detalle en
-    BinanceAPI.create_tp_sl_order."""
-    if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-    try:
-        data = await request.json()
-        symbol = data.get("symbol", "").upper()
-        trigger_price = float(data.get("trigger_price", 0))
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-
-    trade = execution_manager.get_trade(symbol, data.get("direction"))
-    if not trade:
-        return web.json_response({"ok": False, "error": f"sin posición abierta para {symbol} (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=404)
-    if trigger_price <= 0:
-        return web.json_response({"ok": False, "error": "trigger_price inválido"}, status=400)
-
-    try:
-        result = await _algo_set_tp_sl(trade, trigger_price, "STOP_MARKET")
-        return web.json_response({"ok": True, "symbol": symbol, "sl": trigger_price, "result": result})
-    except Exception as e:
-        log.error(f"manual_set_sl: fallo creando SL para {symbol}: {e}")
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+    return await _manual_set_algo(request, "STOP_MARKET", "sl", "SL")
 
 
 async def manual_cancel_tp_sl_handler(request: web.Request) -> web.Response:
-    if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    data, err = await _auth_json(request)
+    if err:
+        return err
     try:
-        data = await request.json()
         symbol = data.get("symbol", "").upper()
         direction = data.get("direction")
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
-    # En Hedge Mode, cada algo order trae su propio positionSide (LONG/SHORT).
-    # Si el cliente especifica `direction`, sólo se cancelan los TP/SL de ESE
-    # lado, para no tocar accidentalmente el TP/SL de la posición opuesta.
-    # Se usa el modo REAL del trade rastreado (puede diferir del flag
-    # global HEDGE_MODE si esa entrada cayó al fallback One-way); si no
-    # hay trade local rastreado, se usa el flag global como mejor estimado.
-    _trade_for_dir = execution_manager.get_trade(symbol, direction) if direction else None
-    if _trade_for_dir is not None:
-        wanted_pos_side = direction.upper() if _trade_for_dir.hedge_mode else None
+    trade_for_dir = execution_manager.get_trade(symbol, direction) if direction else None
+    if trade_for_dir is not None:
+        wanted_pos_side = direction.upper() if trade_for_dir.hedge_mode else None
     else:
         wanted_pos_side = direction.upper() if (direction and HEDGE_MODE) else None
 
+    api = execution_manager.api
     try:
-        algo_orders = await execution_manager.api.get_open_algo_orders(symbol)
-        cancelled = 0
-        for o in algo_orders:
-            if o.get("type") not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
-                continue
-            if wanted_pos_side and o.get("positionSide") not in (wanted_pos_side, None):
-                continue
-            await execution_manager.api.cancel_algo_order(o.get("algoId"))
-            cancelled += 1
-        return web.json_response({"ok": True, "symbol": symbol, "cancelled": cancelled})
+        ids = [
+            o.get("algoId")
+            for o in await api.get_open_algo_orders(symbol)
+            if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET")
+            and not (wanted_pos_side and o.get("positionSide") not in (wanted_pos_side, None))
+        ]
+        if ids:
+            await asyncio.gather(*(api.cancel_algo_order(i) for i in ids))
+        return web.json_response({"ok": True, "symbol": symbol, "cancelled": len(ids)})
     except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+        return _json_err(str(e), 502)
 
 
 async def manual_limit_order_handler(request: web.Request) -> web.Response:
-    """Coloca una orden LIMIT manual (reduceOnly opcional) para el símbolo."""
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
     try:
         data = await request.json()
         symbol = data.get("symbol", "").upper()
-        side = data.get("side", "").upper()  # BUY | SELL
+        side = data.get("side", "").upper()
         price = float(data.get("price", 0))
         quantity = float(data.get("quantity", 0))
         reduce_only = bool(data.get("reduce_only", False))
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
     if not symbol or side not in ("BUY", "SELL") or price <= 0 or quantity <= 0:
-        return web.json_response({"ok": False, "error": "parámetros inválidos"}, status=400)
+        return _json_err("parámetros inválidos", 400)
 
     trade = execution_manager.get_trade(symbol, data.get("direction"))
-    pos_side = (trade.direction if trade.hedge_mode else "BOTH") if trade else ("BOTH" if not HEDGE_MODE else None)
+    pos_side = trade.position_side if trade else ("BOTH" if not HEDGE_MODE else None)
     try:
         result = await execution_manager.api.create_limit_order(
             symbol=symbol, side=side, quantity=quantity, price=price,
@@ -2245,101 +1741,78 @@ async def manual_limit_order_handler(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "result": result})
     except Exception as e:
         log.error(f"manual_limit_order: fallo en LIMIT {symbol}: {e}")
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+        return _json_err(str(e), 502)
 
 
 async def manual_set_symbol_leverage_handler(request: web.Request) -> web.Response:
-    """Cambia el leverage de UN símbolo puntual (con escalera de respaldo),
-    sin afectar el leverage global por defecto."""
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
     try:
         data = await request.json()
         symbol = data.get("symbol", "").upper()
         leverage = int(data.get("leverage", 0))
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
     if not symbol or leverage <= 0:
-        return web.json_response({"ok": False, "error": "parámetros inválidos"}, status=400)
+        return _json_err("parámetros inválidos", 400)
 
     try:
         applied = await execution_manager.api.set_leverage_with_fallback(symbol, leverage)
-        # Aplica el nuevo leverage a TODAS las posiciones abiertas de este
-        # símbolo (LONG y SHORT pueden coexistir en Hedge Mode).
         for trade in execution_manager.trades_for_symbol(symbol):
             trade.leverage = applied
         return web.json_response({"ok": True, "symbol": symbol, "requested": leverage, "applied": applied})
     except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+        return _json_err(str(e), 502)
 
 
 async def manual_get_position_mode_handler(request: web.Request) -> web.Response:
-    """Consulta el modo de posición ACTUAL en la cuenta de Binance (fuente
-    de verdad) además del flag local HEDGE_MODE que usa este proceso."""
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
 
     try:
         account_hedge = await execution_manager.api.get_position_mode()
     except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+        return _json_err(str(e), 502)
 
     return web.json_response({
         "ok": True,
-        "account_hedge_mode": account_hedge,   # lo que Binance tiene configurado de verdad
-        "local_hedge_mode": HEDGE_MODE,         # lo que este proceso está usando
+        "account_hedge_mode": account_hedge,
+        "local_hedge_mode": HEDGE_MODE,
         "in_sync": account_hedge == HEDGE_MODE,
         "open_positions": len(execution_manager._trades),
     })
 
 
 async def manual_set_position_mode_handler(request: web.Request) -> web.Response:
-    """Cambia el modo de posición de la cuenta (Hedge <-> One-way) y, si
-    Binance lo acepta, también actualiza el flag local HEDGE_MODE para
-    que el bot empiece a operar en ese modo inmediatamente.
-
-    Body esperado: {"hedge_mode": true}  o  {"hedge_mode": false}
-    """
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
 
     try:
         data = await request.json()
         hedge_mode = bool(data.get("hedge_mode"))
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
-    # Binance rechaza el cambio si hay posiciones u órdenes abiertas — se
-    # valida también localmente para dar un mensaje claro de inmediato,
-    # antes de gastar la llamada REST.
     open_count = len(execution_manager._trades)
     if open_count > 0:
-        return web.json_response(
-            {
-                "ok": False,
-                "error": (
-                    f"No se puede cambiar el modo de posición con {open_count} posición(es) "
-                    f"abierta(s) localmente. Cierra todas las posiciones primero (Binance "
-                    f"rechaza este cambio si la cuenta tiene posiciones u órdenes activas)."
-                ),
-            },
-            status=409,
+        return _json_err(
+            f"No se puede cambiar el modo de posición con {open_count} posición(es) "
+            f"abierta(s) localmente. Cierra todas las posiciones primero (Binance "
+            f"rechaza este cambio si la cuenta tiene posiciones u órdenes activas).",
+            409,
         )
 
     try:
         await execution_manager.api.set_position_mode(hedge_mode)
     except Exception as e:
         err = str(e)
-        # -4059: "No need to change position side." -> ya estaba en ese modo
         if "-4059" in err:
             set_hedge_mode_runtime(hedge_mode)
             return web.json_response({"ok": True, "hedge_mode": hedge_mode, "note": "la cuenta ya estaba en ese modo"})
-        # -4068 / similares: hay posiciones u órdenes abiertas en Binance
-        # aunque localmente no se vieran (p.ej. quedaron huérfanas).
-        return web.json_response(
-            {"ok": False, "error": f"Binance rechazó el cambio: {err}"},
-            status=409 if ("-4068" in err or "-4067" in err or "position" in err.lower()) else 502,
+        return _json_err(
+            f"Binance rechazó el cambio: {err}",
+            409 if ("-4068" in err or "-4067" in err or "position" in err.lower()) else 502,
         )
 
     set_hedge_mode_runtime(hedge_mode)
@@ -2349,59 +1822,56 @@ async def manual_set_position_mode_handler(request: web.Request) -> web.Response
 
 async def manual_set_margin_type_handler(request: web.Request) -> web.Response:
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
     try:
         data = await request.json()
         symbol = data.get("symbol", "").upper()
-        margin_type = data.get("margin_type", "").upper()  # ISOLATED | CROSSED
+        margin_type = data.get("margin_type", "").upper()
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
     if margin_type not in ("ISOLATED", "CROSSED"):
-        return web.json_response({"ok": False, "error": "margin_type debe ser ISOLATED o CROSSED"}, status=400)
+        return _json_err("margin_type debe ser ISOLATED o CROSSED", 400)
 
     try:
         result = await execution_manager.api.set_margin_type(symbol, margin_type)
         return web.json_response({"ok": True, "symbol": symbol, "margin_type": margin_type, "result": result})
     except Exception as e:
-        # -4046 = "No need to change margin type" -> ya estaba en ese modo, no es un error real
         if "-4046" in str(e):
             return web.json_response({"ok": True, "symbol": symbol, "margin_type": margin_type, "note": "ya estaba en ese modo"})
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+        return _json_err(str(e), 502)
 
 
 async def manual_modify_margin_handler(request: web.Request) -> web.Response:
-    """Añade o retira margen aislado de una posición abierta."""
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
     try:
         data = await request.json()
         symbol = data.get("symbol", "").upper()
         amount = float(data.get("amount", 0))
         add = bool(data.get("add", True))
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
     trade = execution_manager.get_trade(symbol, data.get("direction"))
     if not trade or amount <= 0:
-        return web.json_response({"ok": False, "error": "posición no encontrada o monto inválido (si hay LONG y SHORT simultáneas, especifica 'direction')"}, status=400)
+        return _json_err(f"posición no encontrada o monto inválido {_NO_DIR_HINT}", 400)
 
-    pos_side = _position_side_for(trade.direction)
     try:
-        result = await execution_manager.api.modify_position_margin(symbol, amount, position_side=pos_side, add=add)
+        result = await execution_manager.api.modify_position_margin(
+            symbol, amount, position_side=_position_side_for(trade.direction), add=add
+        )
         return web.json_response({"ok": True, "symbol": symbol, "amount": amount, "add": add, "result": result})
     except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+        return _json_err(str(e), 502)
 
 
 async def manual_get_orders_handler(request: web.Request) -> web.Response:
-    """Devuelve las órdenes LIMIT abiertas + los Algo Orders (TP/SL)
-    activos de un símbolo, usado por el modal de gestión del dashboard."""
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
     symbol = request.query.get("symbol", "").upper()
     if not symbol:
-        return web.json_response({"ok": False, "error": "symbol requerido"}, status=400)
+        return _json_err("symbol requerido", 400)
     try:
         normal_orders, algo_orders = await asyncio.gather(
             execution_manager.api.get_open_orders(symbol),
@@ -2414,12 +1884,12 @@ async def manual_get_orders_handler(request: web.Request) -> web.Response:
             o["_algo"] = True
         return web.json_response({"ok": True, "symbol": symbol, "orders": normal_orders + algo_orders})
     except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=502)
+        return _json_err(str(e), 502)
 
 
 async def manual_toggle_trading_handler(request: web.Request) -> web.Response:
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
 
     execution_manager.trading_enabled = not execution_manager.trading_enabled
     state = "ACTIVADO 🟢" if execution_manager.trading_enabled else "PAUSADO 🔴 (no se enviarán nuevas posiciones)"
@@ -2430,16 +1900,16 @@ async def manual_toggle_trading_handler(request: web.Request) -> web.Response:
 async def manual_set_leverage_handler(request: web.Request) -> web.Response:
     global LEVERAGE
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
 
     try:
         data = await request.json()
         new_lev = int(data.get("leverage", 0))
     except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        return _json_err("invalid json", 400)
 
     if new_lev < 1 or new_lev > 125:
-        return web.json_response({"ok": False, "error": "leverage debe estar entre 1 y 125"}, status=400)
+        return _json_err("leverage debe estar entre 1 y 125", 400)
 
     LEVERAGE = new_lev
     log.warning(f"Leverage por defecto cambiado desde el dashboard a {LEVERAGE}x (aplica a próximas posiciones)")
@@ -2447,24 +1917,14 @@ async def manual_set_leverage_handler(request: web.Request) -> web.Response:
 
 
 async def manual_clear_history_handler(request: web.Request) -> web.Response:
-    """Borra el historial de operaciones cerradas y reinicia el PnL realizado."""
     if not _check_dashboard_token(request):
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return _json_err("unauthorized", 401)
 
-    em = execution_manager
-    count = len(em._closed)
-    em._closed.clear()
+    count = len(execution_manager._closed)
+    execution_manager._closed.clear()
 
-    # Reinicia también los contadores de señales para coherencia visual
-    executor_status["signals_open"] = 0
-    executor_status["signals_close"] = 0
-    executor_status["signals_received"] = 0
-    executor_status["signals_rejected"] = 0
-    executor_status["manual_closes"] = 0
-    executor_status["signals_tp_set"] = 0
-    executor_status["signals_tp_closed"] = 0
-    executor_status["signals_sl_set"] = 0
-    executor_status["signals_sl_closed"] = 0
+    for k in _STATUS_KEYS:
+        executor_status[k] = 0
     executor_status["last_signal_time"] = "Historial borrado"
     executor_status["last_signal_detail"] = ""
 
@@ -2472,47 +1932,49 @@ async def manual_clear_history_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "cleared": count})
 
 
+def _ser_trade(t: Trade) -> dict:
+    return {
+        "id": t.id,
+        "paper_trade_id": t.paper_trade_id,
+        "symbol": t.symbol,
+        "direction": t.direction,
+        "entry_price": t.entry_price,
+        "quantity": t.quantity,
+        "notional": t.notional_usdt,
+        "leverage": t.leverage,
+        "open_time": t.open_time,
+        "current_price": t.current_price,
+        "status": t.status,
+        "close_price": t.close_price,
+        "close_time": t.close_time,
+        "pnl_usdt": t.pnl_usdt,
+        "roi_pct": t.roi_pct,
+        "order_assumed": t.order_assumed,
+        "entry_order_id": t.entry_order_id,
+    }
+
+
 async def api_state_handler(request: web.Request) -> web.Response:
     em = execution_manager
-
-    def ser(t: Trade) -> dict:
-        return {
-            "id": t.id,
-            "paper_trade_id": t.paper_trade_id,
-            "symbol": t.symbol,
-            "direction": t.direction,
-            "entry_price": t.entry_price,
-            "quantity": t.quantity,
-            "notional": t.notional_usdt,
-            "leverage": t.leverage,
-            "open_time": t.open_time,
-            "current_price": t.current_price,
-            "status": t.status,
-            "close_price": t.close_price,
-            "close_time": t.close_time,
-            "pnl_usdt": t.pnl_usdt,
-            "roi_pct": t.roi_pct,
-            "order_assumed": t.order_assumed,
-            "entry_order_id": t.entry_order_id,
-        }
-
     closed = em.closed_trades
+    open_trades = em.open_trades
     wins = sum(1 for t in closed if t.status == "TP")
     total = len(closed)
+    unrealized = sum(t.pnl_usdt for t in open_trades)
 
     return web.json_response({
         "balance": em.balance,
-        "equity": em.equity,
-        "realized_pnl": em.total_realized_pnl,
-        "unrealized_pnl": em.unrealized_pnl,
+        "equity": em.balance + unrealized,
+        "realized_pnl": sum(t.pnl_usdt for t in closed),
+        "unrealized_pnl": unrealized,
         "wins": wins,
         "losses": total - wins,
         "win_rate": (wins / total * 100) if total else None,
-        "open_count": len(em.open_trades),
-        "open_longs": len(em.open_longs),
-        "open_shorts": len(em.open_shorts),
-        "open_trades": [ser(t) for t in em.open_trades],
-        "closed_trades": [ser(t) for t in closed],
+        "open_count": len(open_trades),
+        "open_longs": sum(1 for t in open_trades if t.direction == "LONG"),
+        "open_shorts": sum(1 for t in open_trades if t.direction == "SHORT"),
+        "open_trades": [_ser_trade(t) for t in open_trades],
+        "closed_trades": [_ser_trade(t) for t in closed],
         "executor_status": executor_status,
         "ws_symbols": ", ".join(sorted(em.active_symbols)) or "ninguno",
         "leverage": LEVERAGE,
@@ -2738,7 +2200,6 @@ async function loadManageOrders() {
 }
 
 async function mmCancelOrder(orderId) {
-  // Cancela TODOS los TP/SL (algo orders) del símbolo/dirección de un golpe.
   const r = await mmFetch('/manual/cancel_tp_sl', {symbol: manageSymbol, direction: manageDirection});
   if (r) { loadManageOrders(); }
 }
@@ -2748,10 +2209,6 @@ async function mmCancelAlgoOrder(algoId) {
   if (r) { loadManageOrders(); }
 }
 
-// ── Calculadora de precio TP/SL a partir de ganancia($) o ROI(%) ──
-// LONG: precio_objetivo = entrada + ganancia/qty
-// SHORT: precio_objetivo = entrada - ganancia/qty
-// ganancia (a partir de ROI%) = (roi/100) * margen = (roi/100) * entrada*qty/leverage
 function mmClampPrice(price) {
   const n = Number(price);
   if (!Number.isFinite(n)) return 0;
@@ -2854,6 +2311,9 @@ setInterval(refresh, 5000);
 </script>
 """
 
+_DASHBOARD_JS = DASHBOARD_JS_TEMPLATE.replace("__DASH_TOKEN__", json.dumps(SIGNAL_SECRET))
+
+
 async def dashboard_handler(request: web.Request) -> web.Response:
     em = execution_manager
     es = executor_status
@@ -2866,7 +2326,6 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     eq_col = "#3fb950" if em.equity >= em.balance else "#f85149"
     rp_col = "#3fb950" if em.total_realized_pnl >= 0 else "#f85149"
     up_col = "#3fb950" if em.unrealized_pnl >= 0 else "#f85149"
-    dashboard_js = DASHBOARD_JS_TEMPLATE.replace("__DASH_TOKEN__", json.dumps(SIGNAL_SECRET))
 
     html = f"""<!DOCTYPE html>
 <html lang="es">
@@ -2987,7 +2446,7 @@ async def dashboard_handler(request: web.Request) -> web.Response:
   </table></div>
 
   <p style="color:#484f58;margin-top:.6rem;font-size:.7rem">
-    Executor WS | Iniciado: {es['started_at']} | Actualizado: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+    Executor WS | Iniciado: {es['started_at']} | Actualizado: {_utc(_FMT_SEC)}
   </p>
 
   <div class="modal-overlay" id="manage_modal">
@@ -3062,10 +2521,14 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     </div>
   </div>
 
-  {dashboard_js}
+  {_DASHBOARD_JS}
 </body>
 </html>"""
     return web.Response(text=html, content_type="text/html")
+
+
+async def health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
 
 
 async def start_http_server():
@@ -3087,12 +2550,11 @@ async def start_http_server():
     app.router.add_post("/manual/modify_margin", manual_modify_margin_handler)
     app.router.add_get("/manual/orders", manual_get_orders_handler)
     app.router.add_get("/", dashboard_handler)
-    app.router.add_get("/health", dashboard_handler)
+    app.router.add_get("/health", health_handler)
     app.router.add_get("/api/state", api_state_handler)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info(f"Executor HTTP activo en http://0.0.0.0:{PORT}")
 
 
@@ -3106,9 +2568,9 @@ async def main():
     log.info(f"║   Leverage: {LEVERAGE}x | Poll cierre ext.: {POSITION_POLL_S}s              ║")
     log.info("╚══════════════════════════════════════════════════════╝")
     if PROXY_URLS:
-        _labels = ", ".join(BinanceAPI._proxy_label(p) for p in PROXY_URLS)
+        labels = ", ".join(BinanceAPI._proxy_label(p) for p in PROXY_URLS)
         log.info(
-            f"Proxy(s) configurado(s) para leverage ({len(PROXY_URLS)}): {_labels}. "
+            f"Proxy(s) configurado(s) para leverage ({len(PROXY_URLS)}): {labels}. "
             f"Si Binance banea una IP (-1003), se salta a la siguiente automáticamente."
         )
     else:
@@ -3144,27 +2606,30 @@ async def main():
     await execution_manager.refresh_balance(force=True)
     log.info(f"Balance USDT Futures: ${execution_manager.balance:.2f}")
 
-    async with aiohttp.ClientSession() as sess:
-        await send_telegram(
-            sess,
-            f"⚡ <b>Futures Executor WS iniciado</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 <b>Balance USDT:</b> <code>{execution_manager.balance:.2f} USDT</code>\n"
-            f"⚡ <b>Leverage:</b> <code>{LEVERAGE}x</code>\n"
-            f"📡 <b>Órdenes:</b> WebSocket API\n"
-            f"📡 <b>Precios:</b> WebSocket (ws.py)\n"
-            f"🌐 <b>Leverage (REST):</b> {f'vía proxy ({len(PROXY_URLS)} IP(s), failover automático)' if PROXY_URLS else '⚠️ sin proxy configurado'}\n"
-            f"🔒 <b>Cierre:</b> señal explícita o botón manual\n"
-            f"⚠️ <b>Error -2019:</b> posición puede registrarse como asumida",
-        )
+    proxy_note = f"vía proxy ({len(PROXY_URLS)} IP(s), failover automático)" if PROXY_URLS else "⚠️ sin proxy configurado"
+    await send_telegram(
+        f"⚡ <b>Futures Executor WS iniciado</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Balance USDT:</b> <code>{execution_manager.balance:.2f} USDT</code>\n"
+        f"⚡ <b>Leverage:</b> <code>{LEVERAGE}x</code>\n"
+        f"📡 <b>Órdenes:</b> WebSocket API\n"
+        f"📡 <b>Precios:</b> WebSocket (ws.py)\n"
+        f"🌐 <b>Leverage (REST):</b> {proxy_note}\n"
+        f"🔒 <b>Cierre:</b> señal explícita o botón manual\n"
+        f"⚠️ <b>Error -2019:</b> posición puede registrarse como asumida"
+    )
 
-    async with aiohttp.ClientSession() as session:
+    try:
         await asyncio.gather(
             start_http_server(),
             price_sync_loop(),
-            position_monitor_loop(session),
+            position_monitor_loop(),
             balance_sync_loop(),
         )
+    finally:
+        await api.close()
+        if _tg_session and not _tg_session.closed:
+            await _tg_session.close()
 
 
 if __name__ == "__main__":
