@@ -29,6 +29,7 @@ def make_settings(fake: FakeBinance, tmp_path: Path, **over) -> Settings:
         ws_api_url=f"{fake.ws}/ws-fapi/v1", stream_base_url=fake.ws, rest_url=fake.http,
         data_dir=tmp_path / "data", blocked_symbols=set(), signal_dedupe_ttl_s=0, leverage=5,
         high_price_threshold=1e12, exchange_info_bootstrap=False, seed_open_orders_rest=True,
+        exchange_info_file=tmp_path / "sin_base.txt",
     )
     for k, v in over.items():
         setattr(s, k, v)

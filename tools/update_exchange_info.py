@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Genera el exchangeInfo predefinido de todos los símbolos USDⓈ-M.
+"""Actualiza ``exchangeInfo.txt``, la base predefinida de reglas de todos los símbolos.
 
 Uso (en una máquina con acceso a Binance):
 
     python tools/update_exchange_info.py
     python tools/update_exchange_info.py --proxy http://user:pass@host:80
     python tools/update_exchange_info.py --brackets      # + leverage máximo (requiere API key)
-    python tools/update_exchange_info.py --out data/exchange_info.json
 
-Por defecto escribe ``executor/data/exchange_info.json`` (el snapshot
-empaquetado con el código). Hace UNA petición pública a
-``/fapi/v1/exchangeInfo`` (peso 1) y, con ``--brackets``, una firmada a
-``/fapi/v1/leverageBracket``.
+Guarda la respuesta cruda de ``/fapi/v1/exchangeInfo`` (el mismo formato que
+devuelve Binance) en ``exchangeInfo.txt`` en la raíz del repositorio. Hace UNA
+petición pública (peso 1) y, con ``--brackets``, una firmada a
+``/fapi/v1/leverageBracket`` que se añade bajo la clave ``_leverageBrackets``.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from executor.binance_api import RestClient, ServerClock  # noqa: E402
 from executor.config import BUNDLED_EXCHANGE_INFO  # noqa: E402
-from executor.exchange_info import apply_brackets, build_snapshot, parse_exchange_info  # noqa: E402
+from executor.exchange_info import parse_exchange_info  # noqa: E402
 
 
 async def main() -> int:
@@ -51,14 +50,13 @@ async def main() -> int:
             return 1
         if args.brackets:
             try:
-                n = apply_brackets(rules, await rest.leverage_brackets())
-                print(f"Leverage máximo aplicado a {n} símbolos")
+                payload["_leverageBrackets"] = await rest.leverage_brackets()
+                print(f"Leverage máximo incluido para {len(payload['_leverageBrackets'])} símbolos")
             except Exception as exc:
                 print(f"No se pudieron leer los brackets ({exc}); se continúa sin ellos", file=sys.stderr)
-        snapshot = build_snapshot(rules, "fapi/v1/exchangeInfo" + (" + leverageBracket" if args.brackets else ""))
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        out.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         trading = sum(1 for r in rules.values() if r.status == "TRADING")
         print(f"OK: {len(rules)} símbolos ({trading} en TRADING) → {out}")
         return 0

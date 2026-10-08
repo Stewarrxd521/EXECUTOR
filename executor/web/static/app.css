@@ -143,6 +143,7 @@ input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer
   width: min(380px, 100%); background: var(--panel); border-radius: 12px; padding: 28px; display: grid; gap: 14px;
   box-shadow: var(--shadow);
 }
+.login-box.connecting { text-align: center; }
 .login-box input[type=password] {
   height: 44px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); padding: 0 12px; outline: 0;
 }

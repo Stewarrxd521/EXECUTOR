@@ -55,7 +55,7 @@
 
   // ── WebSocket ──────────────────────────────────────────────────────────
   const WS = {
-    sock: null, seq: 0, pending: new Map(), retry: 0, token: '', authed: false,
+    sock: null, seq: 0, pending: new Map(), retry: 0, token: '', authed: false, denied: false,
     connect() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const sock = new WebSocket(`${proto}://${location.host}/ws`);
@@ -68,7 +68,10 @@
         setDot('c-dash', 'off');
         for (const p of this.pending.values()) { clearTimeout(p.t); p.rej(new Error('Conexión con el panel perdida')); }
         this.pending.clear();
-        if (this.token) setTimeout(() => this.connect(), Math.min(10000, 500 * 2 ** this.retry++));
+        if (!this.denied) {
+          if (!WS.everAuthed) $('#connecting-msg').textContent = 'Sin conexión con el executor; reintentando…';
+          setTimeout(() => this.connect(), Math.min(10000, 500 * 2 ** this.retry++));
+        }
       };
     },
     send(o) { if (this.sock && this.sock.readyState === 1) this.sock.send(JSON.stringify(o)); },
@@ -99,19 +102,27 @@
       case 'auth':
         if (m.ok) {
           WS.authed = true;
+          WS.everAuthed = true;
+          WS.denied = false;
           setDot('c-dash', 'on');
           $('#login').hidden = true;
           $('#app').hidden = false;
           $('#login-error').textContent = '';
+          $('#logout-btn').hidden = !m.required;
           WS.send({ op: 'markets', on: true });
           selectSymbol(S.symbol, true);
         } else {
+          // Solo ocurre si el servidor tiene DASHBOARD_TOKEN configurado.
+          const hadToken = !!WS.token;
+          WS.denied = true;
           WS.token = '';
           store.del('token');
           $('#login').hidden = false;
+          $('#connecting').hidden = true;
+          $('#login-form').hidden = false;
           $('#app').hidden = true;
-          $('#login-error').textContent = m.error || 'Token inválido';
-          try { WS.sock.close(); } catch { /* ya cerrado */ }
+          $('#login-error').textContent = hadToken ? (m.error || 'Token inválido') : '';
+          $('#login-token').focus();
         }
         break;
       case 'state': S.snap = m.data; renderAll(); break;
@@ -999,6 +1010,7 @@
       WS.token = token;
       if ($('#login-remember').checked) store.set('token', token);
       $('#login-error').textContent = '';
+      WS.denied = false;
       if (WS.sock && WS.sock.readyState === 1) WS.send({ op: 'auth', token }); else WS.connect();
     });
     $('#logout-btn').onclick = () => { store.del('token'); WS.token = ''; location.reload(); };
@@ -1136,6 +1148,8 @@
   bind();
   Chart.init();
   switchTab(S.tab);
-  const saved = store.get('token', '');
-  if (saved) { WS.token = saved; $('#login-token').value = saved; $('#login-error').textContent = 'Conectando…'; WS.connect(); }
+  // Acceso directo con el link: se conecta al instante. Solo si el servidor
+  // tiene DASHBOARD_TOKEN aparece el formulario de token.
+  WS.token = store.get('token', '');
+  WS.connect();
 })();

@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Optional
 from . import __version__
 from .account import AccountState
 from .binance_api import BinanceWsApi, RestClient, ServerClock
-from .config import BUNDLED_EXCHANGE_INFO, DEFAULT_SIGNAL_SECRET, Settings
+from .config import DEFAULT_SIGNAL_SECRET, Settings
 from .core import Core
 from .errors import BinanceAPIError, ErrorDoctor, ErrorJournal
 from .exchange_info import ExchangeInfo, apply_brackets, parse_exchange_info
@@ -55,7 +55,7 @@ class ExecutorService:
         ws = BinanceWsApi(settings.ws_api_url, settings.api_key, settings.api_secret, clock, settings.recv_window_ms)
         rest = RestClient(settings.rest_url, settings.api_key, settings.api_secret, clock, settings.proxy_urls,
                           settings.recv_window_ms, settings.rest_proxy_all)
-        exinfo = ExchangeInfo(settings.data_dir, BUNDLED_EXCHANGE_INFO, settings.min_notional_usdt)
+        exinfo = ExchangeInfo(settings.data_dir, settings.exchange_info_file, settings.min_notional_usdt)
         market = MarketData(settings.stream_base_url, clock, on_contract_info=exinfo.apply_contract_info)
         self.core = Core(
             settings=settings, clock=clock, ws=ws, rest=rest, account=AccountState(settings.hedge_mode_hint),
@@ -89,7 +89,7 @@ class ExecutorService:
         self.core.market.start()
 
         if s.signal_secret == DEFAULT_SIGNAL_SECRET:
-            log.warning("SIGNAL_SECRET usa el valor por defecto: cámbialo para proteger /signal y el dashboard")
+            log.warning("SIGNAL_SECRET usa el valor por defecto: debe coincidir con EXECUTOR_SIGNAL_SECRET de app.py")
         if not s.proxy_urls:
             log.warning("PROXY_URLS no configurado: las pocas llamadas REST saldrán con la IP directa del servidor")
 
