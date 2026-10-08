@@ -208,6 +208,8 @@ class TradeManager:
         self._tasks: set[asyncio.Task] = set()
         self._unauth_warned: OrderedDict = OrderedDict()
         self._unknown_open: dict[tuple[str, str], float] = {}
+        self._reconciling: set[tuple[str, str]] = set()
+        self._skipped_closed: dict[str, float] = {}
         self._recent_closed: dict[tuple[int, str, str], float] = {}
         # Orden por símbolo: un close espera a los open aceptados ANTES que él, y un
         # open espera a los close aceptados antes que él (nunca a los posteriores).
@@ -382,13 +384,10 @@ class TradeManager:
         symbol = str(data.get("symbol", "")).upper()[:32] if isinstance(data, dict) else ""
         ip = str(ip)[:64]
         now = time.time()
-        last = self._unauth_warned.get(ip, 0)
+        last = self._unauth_warned.get("*", 0)
         if now - last < 10:
             return  # ya registrado: solo cuenta (no inunda el registro de señales)
-        self._unauth_warned[ip] = now
-        self._unauth_warned.move_to_end(ip)
-        while len(self._unauth_warned) > 512:
-            self._unauth_warned.popitem(last=False)
+        self._unauth_warned["*"] = now
         self._log_signal(action or "?", symbol, "", False,
                          "secreto incorrecto (X-Signal-Secret no coincide con SIGNAL_SECRET)",
                          source=source, ip=ip)
@@ -407,6 +406,8 @@ class TradeManager:
     def _mark_rejected(self, trade_id: int, symbol: str) -> None:
         if (trade_id, symbol) in self.paper_map:
             return  # ese trade_id ya tiene posición abierta (otro tramo sí entró)
+        if any(s == symbol for s, _ in self._reconciling):
+            return  # otro tramo de estado desconocido aún se verifica
         self._rejected_ids[(trade_id, symbol)] = time.time()
         while len(self._rejected_ids) > 1000:
             self._rejected_ids.popitem(last=False)
@@ -586,6 +587,7 @@ class TradeManager:
         trade: Optional[Trade] = None
         note = ""
         unknown = False
+        baseline = 0.0
         already_closed: Optional[float] = None
         try:
             await self._await_ready()
@@ -602,9 +604,12 @@ class TradeManager:
                     ref = price or self.core.market.price(symbol) or 1.0
                     notional = margin * (lev or self.leverage_for_price(ref))
                 self._unknown_open.pop((symbol, direction), None)
+                before = self.core.account.position(symbol, direction)
+                baseline = before.qty if before is not None else 0.0
                 trade = await self.open_trade(symbol, direction, signal_price=price, quantity=quantity,
                                               notional=notional, paper_trade_id=sig.trade_id, source="signal",
                                               leverage=lev, level=level, signal_id=sig.signal_id)
+                already_closed = self._skipped_closed.pop(sig.signal_id, None)
                 unknown = trade is None and self._unknown_open.pop((symbol, direction), None) is not None
         except Exception:
             unknown = True
@@ -627,7 +632,8 @@ class TradeManager:
             if unknown:
                 # Pudo ejecutarse en Binance: no se marca como rechazada (su close debe
                 # funcionar) y se relee la posición real para registrarla si existe.
-                self._spawn(self._reconcile_unknown_open(symbol, direction, sig.trade_id))
+                self._reconciling.add((symbol, direction))
+                self._spawn(self._reconcile_unknown_open(symbol, direction, sig.trade_id, baseline))
                 entry = self._log_signal("open", symbol, direction, False,
                                          "estado desconocido: se verifica la posición real en Binance", sig)
             else:
@@ -638,12 +644,17 @@ class TradeManager:
 
         self.status["signals_open"] += 1
         self._rejected_ids.pop((sig.trade_id, symbol), None)
+        # ¿Llegó antes un close para esta apertura? Se marca YA (sin esperas de por medio)
+        # para que un tramo posterior del mismo trade_id no reabra mientras se cierra.
+        pending = self._take_pending_close(sig.trade_id, symbol, direction)
+        if pending is not None:
+            self._note_closed(sig.trade_id, symbol, direction)
         detail = f"#{trade.id} qty={trade.quantity:g} @ {trade.entry_price:g}" + (" (ASUMIDA)" if trade.order_assumed else "")
         if note:
             detail += f" — {note}"
         protections = []
         for kind, aliases in (("TP", _TP_ALIASES), ("SL", _SL_ALIASES)):
-            trig = safe_float(_first(d, aliases))
+            trig = safe_float(_first(d, aliases)) if pending is None else 0.0
             if trig > 0:
                 try:
                     await self.set_protection(symbol, trade.direction, kind, trig)
@@ -654,51 +665,63 @@ class TradeManager:
             detail += " — " + "/".join(protections) + " colocado(s)"
         self._log_signal("open", symbol, direction, True, detail, sig, executor_trade_id=trade.id)
 
-        # ¿Llegó antes un close para esta apertura? Se aplica ahora.
-        pending = self._take_pending_close(sig.trade_id, symbol, direction)
         if pending is not None and self.trades.get(trade.key) is trade:
             log.warning("Cierre diferido aplicado a %s %s (llegó antes que la apertura)", symbol, direction)
             ok = await self.close_trade(trade, pending["reason"], close_price=pending["close_price"],
                                         bot_pnl=pending["bot_pnl"], closed_by="signal")
             if ok:
                 self.status["signals_close"] += 1
-                self._note_closed(sig.trade_id, symbol, direction)
+            else:
+                self._recent_closed.pop((sig.trade_id, symbol, direction), None)
             self._log_signal("close", symbol, direction, ok, "cierre diferido aplicado (llegó antes que la apertura)",
                              sig)
         return {"ok": True, "detail": detail, "trade": trade.to_dict()}
 
-    async def _reconcile_unknown_open(self, symbol: str, direction: str, paper_id: int) -> None:
-        """Tras una apertura de estado desconocido, registra la posición si Binance la abrió."""
-        for delay in UNKNOWN_OPEN_CHECKS:
-            await asyncio.sleep(delay)
-            async with self._lock(symbol):
-                pos, confirmed = await self._fresh_position(symbol, direction)
-                if pos is None:
-                    if confirmed and delay == UNKNOWN_OPEN_CHECKS[-1]:
-                        log.info("%s %s: la apertura de estado desconocido no se ejecutó", direction, symbol)
-                    continue
-                if self.grid_owner(symbol, pos.direction):
-                    return
-                trade = self.trades.get((symbol, pos.direction))
-                if trade is None:
-                    trade = self.adopt_position(pos, paper_id=paper_id, source="signal")
-                    log.warning("%s %s: la apertura de estado desconocido SÍ se ejecutó (qty=%s); registrada",
-                                direction, symbol, pos.qty)
-                    self._announce_open(trade)
-                else:
-                    if pos.qty > trade.quantity:  # el tramo sí entró: se refleja la cantidad real
+    async def _reconcile_unknown_open(self, symbol: str, direction: str, paper_id: int, baseline: float) -> None:
+        """Tras una apertura de estado desconocido, registra lo que Binance sí abrió.
+
+        Solo se atribuye a la señal la cantidad que supera lo que ya había
+        (``baseline``) y lo que ya está registrado: nunca una posición ajena.
+        """
+        try:
+            for delay in UNKNOWN_OPEN_CHECKS:
+                await asyncio.sleep(delay)
+                pending = None
+                async with self._lock(symbol):
+                    pos, confirmed = await self._fresh_position(symbol, direction)
+                    trade = self.trades.get((symbol, direction))
+                    tracked = trade.quantity if trade is not None else 0.0
+                    real = pos.qty if pos is not None else 0.0
+                    tol = float(self.core.exinfo.get(symbol, pos.entry_price if pos else 0.0).step_size) / 2
+                    if pos is None or real - max(baseline, tracked) <= tol:
+                        if confirmed and delay == UNKNOWN_OPEN_CHECKS[-1]:
+                            log.info("%s %s: la apertura de estado desconocido no se ejecutó", direction, symbol)
+                        continue
+                    if self.grid_owner(symbol, direction):
+                        return
+                    if trade is None:
+                        trade = self.adopt_position(pos, paper_id=paper_id, source="signal")
+                        self._announce_open(trade)
+                    else:
                         trade.quantity = pos.qty
                         trade.entry_price = pos.entry_price or trade.entry_price
+                        if paper_id:
+                            self._map_paper(trade, paper_id)
                         self.save()
-                    if paper_id:
-                        self._map_paper(trade, paper_id)
-                pending = self._take_pending_close(paper_id, symbol, pos.direction) if paper_id else None
-            if pending is not None and self.trades.get(trade.key) is trade:
-                ok = await self.close_trade(trade, pending["reason"], close_price=pending["close_price"],
-                                            bot_pnl=pending["bot_pnl"], closed_by="signal")
-                if ok:
-                    self._note_closed(paper_id, symbol, pos.direction)
-            return
+                    log.warning("%s %s: la apertura de estado desconocido SÍ se ejecutó (posición %s); registrada",
+                                direction, symbol, pos.qty)
+                    self._rejected_ids.pop((paper_id, symbol), None)
+                    pending = self._take_pending_close(paper_id, symbol, direction) if paper_id else None
+                    if pending is not None:
+                        self._note_closed(paper_id, symbol, direction)
+                if pending is not None and self.trades.get(trade.key) is trade:
+                    ok = await self.close_trade(trade, pending["reason"], close_price=pending["close_price"],
+                                                bot_pnl=pending["bot_pnl"], closed_by="signal")
+                    if ok:
+                        self.status["signals_close"] += 1
+                return
+        finally:
+            self._reconciling.discard((symbol, direction))
 
     # ── close ─────────────────────────────────────────────────────────────
     def _accept_close(self, sig: Signal):
@@ -752,7 +775,8 @@ class TradeManager:
             detail = "cerrada" if ok else "error al cerrar (ver pestaña Errores)"
             if ok and not quantity:
                 self._note_closed(sig.trade_id, trade.symbol, trade.direction)
-        elif sig.trade_id and (sig.trade_id, symbol) in self._rejected_ids:
+        elif (sig.trade_id and (sig.trade_id, symbol) in self._rejected_ids
+              and not await self._untracked_position(symbol, direction)):
             ok = False
             detail = f"cierre ignorado: el trade_id {sig.trade_id} nunca se abrió en el executor"
         else:
@@ -762,14 +786,12 @@ class TradeManager:
                 detail = "cerrada (posición sin trade local)"
                 if not quantity:
                     self._note_closed(sig.trade_id, symbol, direction)
-            elif symbol and sig.trade_id:
+            elif sig.trade_id:
                 self._remember_pending_close(sig.trade_id, symbol, direction, reason, close_price, bot_pnl)
                 detail = (f"sin posición todavía: el cierre queda en espera {PENDING_CLOSE_TTL_S:.0f}s "
                           "por si la apertura llega tarde")
-            elif symbol:
-                detail = "sin posición abierta (close sin trade_id: no queda en espera)"
             else:
-                detail = "trade_id desconocido y sin symbol"
+                detail = "sin posición abierta (close sin trade_id: no queda en espera)"
         if ok:
             self.status["signals_close"] += 1
         else:
@@ -786,10 +808,26 @@ class TradeManager:
     def _take_pending_close(self, trade_id: int, symbol: str, direction: str) -> Optional[dict]:
         now = time.time()
         self._pending_close = {k: v for k, v in self._pending_close.items() if now - v["ts"] < PENDING_CLOSE_TTL_S}
-        for key in ((trade_id, symbol, direction), (trade_id, symbol, "")):
+        for key in ((trade_id, symbol, direction), (trade_id, symbol, ""), (trade_id, "", "")):
             if key in self._pending_close:
                 return self._pending_close.pop(key)
         return None
+
+    async def _untracked_position(self, symbol: str, direction: Optional[str]) -> bool:
+        """¿Hay una posición real (no de un grid) en el símbolo? Red de seguridad del close."""
+        if not symbol:
+            return False
+
+        def found() -> bool:
+            return any((not direction or p.direction == direction) and not self.grid_owner(symbol, p.direction)
+                       for p in self.core.account.positions_for(symbol))
+
+        if found():
+            return True
+        if any(s == symbol for s, _ in self._reconciling):
+            await self._fresh_position(symbol, direction or "LONG")
+            return found()
+        return False
 
     # ── close_all / TP / SL ───────────────────────────────────────────────
     def _accept_close_all(self, sig: Signal):
@@ -890,6 +928,12 @@ class TradeManager:
         symbol, direction = symbol.upper(), direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
         async with self._lock(symbol):
+            if source == "signal" and paper_trade_id:
+                # Un close de este trade_id pudo terminar mientras se esperaba el lock.
+                age = self._closed_recently(paper_trade_id, symbol, direction)
+                if age is not None:
+                    self._skipped_closed[signal_id] = age
+                    return None
             ref = await self.reference_price(symbol, signal_price)
             if ref <= 0:
                 self.core.bus.emit("open_failed", f"{symbol}: sin precio disponible", "error", symbol=symbol)

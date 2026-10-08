@@ -147,6 +147,8 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
   si se abrió, así el `close` del bot siempre la cierra.
 - `POST /signal?wait=1` espera el resultado en Binance (hasta `SIGNAL_WAIT_TIMEOUT_S`) y lo devuelve en `result`.
 - Un secreto incorrecto responde 401 y queda visible en la pestaña Señales y en `GET /api/signals`.
+- Las peticiones de un navegador desde otro sitio (`Origin` ajeno) se rechazan en `/signal`, `/ws/signal` y `/ws`
+  salvo que el origen esté en `CORS_ORIGINS`; los bots y scripts no envían `Origin` y no se ven afectados.
 
 ## API HTTP y cliente (`executor_client.py`)
 
@@ -193,7 +195,7 @@ ambos y las pruebas los ejecutan contra el executor.
 | --- | --- | --- |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Credenciales (Futuros habilitado) |
 | `USE_TESTNET` | `false` | Testnet de Binance Futures |
-| `SIGNAL_SECRET` | — | Secreto de `/signal` y de la escritura por HTTP (lista separada por comas para aceptar varios). Sin definir acepta los valores por defecto de los bots: `clave-secreta-aleatoria` y `cambiar-por-secreto-seguro`. Debe coincidir con `EXECUTOR_SECRET` de app_25 |
+| `SIGNAL_SECRET` | — | Secreto de `/signal` y de la escritura por HTTP, usado tal cual (como antes; puede contener comas). Sin definir acepta los valores por defecto de los bots: `clave-secreta-aleatoria` y `cambiar-por-secreto-seguro`. Debe coincidir con `EXECUTOR_SECRET` de app_25 |
 | `DASHBOARD_TOKEN` | — | Opcional. Vacío = dashboard abierto con el link; con valor, pide ese token |
 | `PORT` | `10000` | Puerto HTTP |
 | `PROXY_URLS` | — | Proxies HTTP separados por coma para REST (rotación y baneo por IP). `FIXIE_URL` sigue aceptándose |

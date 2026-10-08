@@ -611,8 +611,8 @@ class ExecutorClient:
     ) -> None:
         self.base_url = _clean_url(base_url or os.getenv("EXECUTOR_URL", "") or "http://127.0.0.1:10000")
         self.token = token if token is not None else os.getenv("EXECUTOR_TOKEN", "")
-        # Con solo EXECUTOR_TOKEN no se envía el secreto por defecto (el token basta).
-        self.secret = secret if secret is not None else os.getenv("EXECUTOR_SECRET", "" if self.token else DEFAULT_SECRET)
+        # Se envían ambos si existen: el executor acepta la petición si cualquiera es válido.
+        self.secret = secret if secret is not None else os.getenv("EXECUTOR_SECRET", DEFAULT_SECRET)
         self.timeout = timeout
         self.retries = retries
 

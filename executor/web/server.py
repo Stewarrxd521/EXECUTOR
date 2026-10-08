@@ -200,8 +200,14 @@ def build_app(service: ExecutorService) -> web.Application:
         return web.FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
     # ── POST /signal (ExecutorBridge de app.py / app_25.py) ─────────────────
+    def cross_site(request: web.Request) -> bool:
+        """Petición de un navegador desde otro sitio (los bots y scripts no envían Origin)."""
+        return bool(request.headers.get("Origin")) and not origin_allowed(request, settings.cors_origins, strict=True)
+
     async def signal(request: web.Request) -> web.Response:
         ip = client_ip(request, settings.trust_proxy)
+        if cross_site(request):
+            return json_response({"ok": False, "error": "origin no permitido (añádelo a CORS_ORIGINS)"}, 403)
         data, invalid = await read_body(request)
         if invalid or not isinstance(data, dict):
             return json_response({"ok": False, "error": "invalid json"}, 400)
@@ -214,8 +220,10 @@ def build_app(service: ExecutorService) -> web.Application:
         return json_response(body, status)
 
     # ── WebSocket /ws/signal ──────────────────────────────────────────────
-    async def signal_ws(request: web.Request) -> web.WebSocketResponse:
+    async def signal_ws(request: web.Request) -> web.StreamResponse:
         ip = client_ip(request, settings.trust_proxy)
+        if cross_site(request):
+            return json_response({"ok": False, "error": "origin no permitido (añádelo a CORS_ORIGINS)"}, 403)
         ws = web.WebSocketResponse(heartbeat=25, max_msg_size=1 << 20)
         await ws.prepare(request)
         authed = any_valid(request_secrets(request), settings.check_signal_secret)

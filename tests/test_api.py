@@ -562,3 +562,65 @@ def test_bridge_never_raises():
     bridge = executor_client.ExecutorBridge("http://[::1", SECRET, logger=lambda m: None, retries=0)
     assert bridge.send_signal_sync({"action": "open", "price": object()}) is None
     assert bridge.failed == 1
+
+
+async def test_unknown_open_never_claims_another_trade(service, fake, monkeypatch):
+    """La apertura desconocida NO se ejecutó: su close no puede cerrar el trade siguiente."""
+    import executor.trading as trading_mod
+    monkeypatch.setattr(trading_mod, "UNKNOWN_OPEN_CHECKS", (0.3, 0.6))
+    t = service.trades
+    fake.inject.append(("order.place", -1007, "Timeout waiting for response from backend server."))
+    for _ in range(3):
+        fake.inject.append(("order.status", -1001, "Internal error; unable to process your request."))
+    base = {"action": "open", "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000, "quantity": 0.01}
+    t.handle_signal(dict(base, trade_id=9))
+    await wait_for(lambda: t.signals(1) and "desconocido" in t.signals(1)[0]["detail"])
+    t.handle_signal({"action": "close", "trade_id": 9, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "SL"})
+    t.handle_signal(dict(base, trade_id=10))
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    await wait_for(lambda: not t._reconciling, timeout=5)
+    await asyncio.sleep(0.2)
+    assert t.get_trade("ETHUSDT", "SHORT").paper_ids == [10]
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == pytest.approx(-0.01)
+
+
+async def test_tranche_queued_behind_deferred_close_is_ignored(service, fake):
+    t = service.trades
+    t.handle_signal({"action": "close", "trade_id": 14, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "TP"})
+    await wait_for(lambda: t._pending_close)
+    base = {"action": "open", "trade_id": 14, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+            "quantity": 0.01}
+    t.handle_signal(dict(base, level=1))
+    t.handle_signal(dict(base, level=2))
+    await wait_for(lambda: any("tramo ignorado" in e["detail"] for e in t.signals(10)))
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is None)
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0
+
+
+async def test_close_with_only_trade_id_before_open(service, fake):
+    t = service.trades
+    t.handle_signal({"action": "close", "trade_id": 201, "reason": "SL"})
+    await wait_for(lambda: t._pending_close)
+    t.handle_signal({"action": "open", "trade_id": 201, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01})
+    await wait_for(lambda: t.closed and t.closed[-1].paper_trade_id == 201)
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0
+
+
+async def test_rejected_trade_id_still_closes_real_untracked_position(service, fake):
+    t = service.trades
+    trade = await t.open_trade("ETHUSDT", "SHORT", notional=30)
+    t._unmap_trade(trade)
+    del t.trades[trade.key]  # posición real que el executor no tiene registrada
+    t._rejected_ids[(31, "ETHUSDT")] = __import__("time").time()
+    t.handle_signal({"action": "close", "trade_id": 31, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "SL"})
+    await wait_for(lambda: fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0)
+
+
+async def test_cross_site_signal_is_rejected(open_service):
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        r = await client.post("/signal", data='{"action":"close_all","secret":"clave-secreta-aleatoria"}',
+                              headers={"Origin": "https://evil.example", "Content-Type": "text/plain"})
+        assert r.status == 403
+        r = await client.post("/signal", json={"action": "close_all"}, headers={"X-Signal-Secret": SECRET})
+        assert r.status == 200

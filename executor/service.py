@@ -106,6 +106,9 @@ class ExecutorService:
         self.core.telegram.start()
         self.core.market.start()
 
+        if not s.signal_secret_is_default and "," in s.signal_secret:
+            log.warning("SIGNAL_SECRET contiene comas y se usa como UN solo secreto (como en la versión original). "
+                        "Para aceptar varios secretos usa SIGNAL_SECRETS=secreto1,secreto2")
         if s.signal_secret_is_default:
             log.warning("SIGNAL_SECRET no está definido: se aceptan los secretos por defecto de los bridges "
                         "(%s). Defínelo y usa el mismo valor en EXECUTOR_SECRET (app_25) / "
