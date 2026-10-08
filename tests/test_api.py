@@ -19,9 +19,9 @@ SECRET = "clave-secreta-aleatoria"
 
 def legacy_settings(fake, tmp_path, **over):
     """Executor desplegado sin SIGNAL_SECRET ni DASHBOARD_TOKEN (como en Render)."""
+    over.setdefault("dashboard_token", "")
     return make_settings(fake, tmp_path, signal_secret=LEGACY_SIGNAL_SECRETS[0],
-                         signal_secrets=list(LEGACY_SIGNAL_SECRETS), signal_secret_is_default=True,
-                         dashboard_token="", **over)
+                         signal_secrets=list(LEGACY_SIGNAL_SECRETS), signal_secret_is_default=True, **over)
 
 
 @pytest.fixture
@@ -392,3 +392,173 @@ def test_parse_bool():
     for v in (False, 0, "0", "false", "no", "off", ""):
         assert parse_bool(v, True) is False
     assert parse_bool("quizás", True) is True and parse_bool(None, True) is True
+
+
+# ── Regresiones de la revisión adversarial ─────────────────────────────────
+async def test_unknown_status_open_is_adopted_and_closable(service, fake):
+    """order.place se ejecuta pero responde -1007 y order.status falla: no debe quedar huérfana."""
+    t = service.trades
+    fake.inject_after.append(("order.place", -1007, "Timeout waiting for response from backend server."))
+    for _ in range(3):
+        fake.inject.append(("order.status", -1001, "Internal error; unable to process your request."))
+    t.handle_signal({"action": "open", "trade_id": 77, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None, timeout=12)
+    assert (77, "ETHUSDT") not in t._rejected_ids
+    assert t.get_trade("ETHUSDT", "SHORT").paper_trade_id == 77
+    t.handle_signal({"action": "close", "trade_id": 77, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "TP"})
+    await wait_for(lambda: fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0)
+    assert t.closed[-1].paper_trade_id == 77
+
+
+async def test_late_tranche_after_close_does_not_reopen(service, fake):
+    t = service.trades
+    sig = {"action": "open", "trade_id": 81, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+           "quantity": 0.01}
+    t.handle_signal(dict(sig))
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    t.handle_signal({"action": "close", "trade_id": 81, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "SL"})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is None)
+    t.handle_signal(dict(sig, level=75))  # tramo que llegó tarde
+    await wait_for(lambda: t.signals(1) and "tramo ignorado" in t.signals(1)[0]["detail"])
+    assert t.get_trade("ETHUSDT", "SHORT") is None and fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0
+    # Otro trade_id sí abre.
+    t.handle_signal(dict(sig, trade_id=82))
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+
+
+async def test_close_without_trade_id_does_not_wait_for_next_open(service, fake):
+    t = service.trades
+    t.handle_signal({"action": "close", "symbol": "ETHUSDT", "direction": "SHORT"})
+    await wait_for(lambda: t.signals(1) and "close sin trade_id" in t.signals(1)[0]["detail"])
+    t.handle_signal({"action": "open", "trade_id": 83, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    await asyncio.sleep(0.3)
+    assert t.get_trade("ETHUSDT", "SHORT") is not None
+
+
+async def test_close_does_not_swallow_open_accepted_after_it(service, fake):
+    t = service.trades
+    gate = asyncio.Event()
+    original = service.orders.ensure_leverage
+
+    async def slow_leverage(*a, **k):
+        await gate.wait()
+        return await original(*a, **k)
+
+    service.orders.ensure_leverage = slow_leverage
+    base = {"action": "open", "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000, "quantity": 0.01}
+    t.handle_signal(dict(base, trade_id=91))
+    t.handle_signal({"action": "close", "trade_id": 91, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "TP"})
+    t.handle_signal(dict(base, trade_id=92))
+    await asyncio.sleep(0.2)
+    gate.set()
+    await wait_for(lambda: t.closed and t.closed[-1].paper_trade_id == 91)
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    assert t.closed[-1].quantity == pytest.approx(0.01)
+    assert t.get_trade("ETHUSDT", "SHORT").paper_trade_id == 92
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == pytest.approx(-0.01)
+
+
+async def test_quantity_times_price_defines_size(service, fake):
+    t = service.trades
+    t.handle_signal({"action": "open", "trade_id": 93, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01, "notional": 60})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    assert t.get_trade("ETHUSDT", "SHORT").quantity == pytest.approx(0.01)
+    assert "se usa quantity" in t.signals(1)[0]["detail"]
+
+
+async def test_dashboard_token_rejects_public_default_secret(fake, tmp_path, snapshot_file):
+    svc = ExecutorService(legacy_settings(fake, tmp_path, dashboard_token="tok"))
+    await svc.start()
+    async with TestClient(TestServer(build_app(svc))) as client:
+        assert (await client.get("/api/positions", headers={"X-Signal-Secret": SECRET})).status == 401
+        assert (await client.post("/api/trading", headers={"X-Signal-Secret": SECRET})).status == 401
+        # Varias credenciales: basta con que una sea válida.
+        r = await client.get("/api/positions", headers={"X-Signal-Secret": SECRET, "X-Dashboard-Token": "tok"})
+        assert r.status == 200
+        r = await client.get("/api/trades.csv", headers={"Authorization": "Bearer tok"})
+        assert r.status == 200
+        # /signal (los bots) sigue aceptando el secreto por defecto.
+        r = await client.post("/signal", json={"action": "close_all"}, headers={"X-Signal-Secret": SECRET})
+        assert r.status == 200
+        ws = await client.ws_connect("/ws")
+        await ws.send_json({"op": "auth", "token": SECRET})
+        assert (await ws.receive_json(timeout=5))["ok"] is False
+        await ws.close()
+    await svc.stop()
+
+
+async def test_cross_site_dashboard_websocket_is_rejected(open_service):
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        r = await client.get("/ws", headers={"Origin": "https://evil.example", "Connection": "Upgrade",
+                                             "Upgrade": "websocket", "Sec-WebSocket-Version": "13",
+                                             "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="})
+        assert r.status == 403
+        host = f"http://{client.host}:{client.port}"
+        ws = await client.ws_connect("/ws", origin=host)  # el propio dashboard
+        await ws.send_json({"op": "auth", "token": ""})
+        assert (await ws.receive_json(timeout=5))["ok"] is True
+        await ws.close()
+
+
+async def test_api_signal_reports_rejection_and_idempotency(open_service):
+    h = {"X-Signal-Secret": SECRET}
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        r = await client.post("/api/trading", json={"enabled": False}, headers=h)
+        assert (await r.json())["trading_enabled"] is False
+        r = await client.post("/api/signal", json={"action": "open", "trade_id": 1, "symbol": "ETHUSDT",
+                                                   "direction": "SHORT", "quantity": 0.01, "price": 3000}, headers=h)
+        assert r.status == 409 and (await r.json())["ok"] is False
+        await client.post("/api/trading", json={"enabled": True}, headers=h)
+        body = {"action": "open", "trade_id": 2, "symbol": "ETHUSDT", "direction": "SHORT", "quantity": 0.01,
+                "price": 3000}
+        r1 = await client.post("/api/signal", json=body, headers={**h, "Idempotency-Key": "k-1"})
+        r2 = await client.post("/api/signal", json=body, headers={**h, "Idempotency-Key": "k-1"})
+        assert r1.status == 200 and (await r2.json())["data"]["duplicate"] is True
+        await asyncio.sleep(0.3)
+        assert trade(open_service).quantity == pytest.approx(0.01)
+
+
+async def test_legacy_close_is_ambiguous_with_long_and_short(open_service, fake):
+    t = open_service.trades
+    for d in ("LONG", "SHORT"):
+        t.handle_signal({"action": "open", "trade_id": 3, "symbol": "ETHUSDT", "direction": d, "price": 3000,
+                         "quantity": 0.01})
+    await wait_for(lambda: len(t.open_trades) == 2)
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        h = {"X-Signal-Secret": SECRET}
+        r = await client.post("/manual/close", json={"symbol": "ETHUSDT", "direction": None}, headers=h)
+        assert r.status == 404
+        r = await client.post("/manual/close", json={"symbol": "ETHUSDT", "direction": "short"}, headers=h)
+        assert r.status == 200
+    await wait_for(lambda: len(t.open_trades) == 1)
+    assert t.open_trades[0].direction == "LONG"
+
+
+async def test_secrets_are_not_logged_and_signal_log_is_sanitized(open_service):
+    from executor.web.api import _safe_path
+    from aiohttp.test_utils import make_mocked_request
+    req = make_mocked_request("POST", "/api/close/BTCUSDT?secret=abc&symbol=BTCUSDT")
+    assert _safe_path(req) == "/api/close/BTCUSDT?secret=***&symbol=BTCUSDT"
+    t = open_service.trades
+    t.handle_signal({"action": "open", "symbol": "X" * 500, "direction": '"><img src=x onerror=alert(1)>'})
+    entry = t.signals(1)[0]
+    assert entry["direction"] == "" and len(entry["symbol"]) <= 32
+
+
+def test_signal_secret_with_comma_is_kept(monkeypatch):
+    from executor.config import load_settings
+    monkeypatch.setenv("SIGNAL_SECRET", "a,b")
+    s = load_settings()
+    assert s.check_signal_secret("a,b") and not s.check_signal_secret("a") and not s.signal_secret_is_default
+    monkeypatch.setenv("SIGNAL_SECRETS", "otro")
+    assert load_settings().check_signal_secret("otro")
+
+
+def test_bridge_never_raises():
+    bridge = executor_client.ExecutorBridge("http://[::1", SECRET, logger=lambda m: None, retries=0)
+    assert bridge.send_signal_sync({"action": "open", "price": object()}) is None
+    assert bridge.failed == 1

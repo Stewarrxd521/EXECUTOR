@@ -26,7 +26,8 @@ from aiohttp import web
 from aiohttp.abc import AbstractAccessLogger
 
 from ..service import ExecutorService
-from .common import Auth, client_ip, dumps, is_write, json_response, origin_allowed, read_args, run_command
+from .common import (Auth, client_ip, dumps, is_write, json_response, origin_allowed, read_args, request_secrets,
+                     run_command)
 
 log = logging.getLogger("executor.web")
 
@@ -111,16 +112,25 @@ def _envelope(cmd: str, status: int, body: dict) -> web.Response:
     return json_response(body, status)
 
 
+def _idempotency(request: web.Request, cmd: str, args: dict) -> None:
+    """``Idempotency-Key`` / ``X-Signal-Id`` como signal_id (reintentos seguros de señales)."""
+    if cmd == "signal" and not args.get("signal_id"):
+        key = request.headers.get("Idempotency-Key") or request.headers.get("X-Signal-Id")
+        if key:
+            args["signal_id"] = key
+
+
 def register_rest(app: web.Application, service: ExecutorService, auth: Auth) -> None:
     def make(cmd: str, defaults: dict):
         async def handler(request: web.Request) -> web.Response:
-            args, secret, error = await read_args(request, defaults)
+            args, secrets, error = await read_args(request, defaults)
             if args is None:
                 return json_response({"ok": False, "error": error}, 400)
             write = is_write(cmd)
-            if not auth.can(request, secret, write):
+            if not auth.can(request, secrets, write):
                 auth.warn_denied(request, request.path)
                 return auth.denied(write)
+            _idempotency(request, cmd, args)
             status, body = await run_command(service, cmd, args)
             return _envelope(cmd, status, body)
         return handler
@@ -129,21 +139,23 @@ def register_rest(app: web.Application, service: ExecutorService, auth: Auth) ->
         add_route(app, method, path, make(cmd, defaults))
 
     async def api_command(request: web.Request) -> web.Response:
-        args, secret, error = await read_args(request)
+        args, secrets, error = await read_args(request)
         if args is None:
             return json_response({"ok": False, "error": error}, 400)
         cmd = str(args.pop("cmd", "") or "")
         if not cmd:
             return json_response({"ok": False, "error": "falta cmd (ver GET /api/commands)"}, 400)
         write = is_write(cmd)
-        if not auth.can(request, secret, write):
-            auth.warn_denied(request, f"/api/command {cmd}")
+        if not auth.can(request, secrets, write):
+            auth.warn_denied(request, "/api/command")
             return auth.denied(write)
+        _idempotency(request, cmd, args)
         status, body = await run_command(service, cmd, args)
         return json_response(body, status)
 
     async def trades_csv(request: web.Request) -> web.StreamResponse:
-        if not auth.can_read(request, request.headers.get("X-Dashboard-Token", "") or request.query.get("token", "")):
+        if not auth.can_read(request, request_secrets(request)):
+            auth.warn_denied(request, request.path)
             return auth.denied(False)
         t = service.trades
         cols = ["id", "paper_trade_id", "paper_ids", "symbol", "direction", "status", "source", "closed_by",
@@ -170,12 +182,14 @@ def register_legacy(app: web.Application, service: ExecutorService, auth: Auth) 
     trades = service.trades
 
     async def args_or_error(request: web.Request) -> tuple[Optional[dict], Optional[web.Response]]:
-        args, secret, error = await read_args(request)
+        args, secrets, error = await read_args(request)
         if args is None:
             return None, json_response({"ok": False, "error": "invalid json"}, 400)
-        if not auth.can_write(request, secret):
+        if not auth.can_write(request, secrets):
             auth.warn_denied(request, request.path)
             return None, json_response({"ok": False, "error": "unauthorized"}, 401)
+        d = str(args.get("direction") or "").upper().strip()
+        args["direction"] = d if d in ("LONG", "SHORT") else None
         return args, None
 
     def no_position(symbol: str) -> web.Response:
@@ -183,9 +197,14 @@ def register_legacy(app: web.Application, service: ExecutorService, auth: Auth) 
                                                     f"(si hay LONG y SHORT simultáneas, especifica 'direction')"}, 404)
 
     def has_position(symbol: str, direction: Optional[str]) -> bool:
-        if trades.get_trade(symbol, direction) is not None:
-            return True
-        return any(not direction or p.direction == direction for p in service.core.account.positions_for(symbol))
+        """Como antes: sin direction y con LONG y SHORT abiertas es ambiguo (404)."""
+        if not symbol:
+            return False
+        tracked = [t for t in trades.open_trades if t.symbol == symbol and (not direction or t.direction == direction)]
+        if tracked:
+            return len(tracked) == 1
+        real = [p for p in service.core.account.positions_for(symbol) if not direction or p.direction == direction]
+        return len(real) == 1
 
     async def legacy_call(cmd: str, args: dict, shape) -> web.Response:
         status, body = await run_command(service, cmd, args)
@@ -203,7 +222,7 @@ def register_legacy(app: web.Application, service: ExecutorService, auth: Auth) 
         if err:
             return err
         symbol = str(args.get("symbol", "")).upper()
-        direction = str(args.get("direction", "")).upper() or None
+        direction = args["direction"]
         if not symbol or not has_position(symbol, direction):
             return no_position(symbol)
         spawn(run_command(service, "close_position", {"symbol": symbol, "direction": direction, "reason": "MANUAL",
@@ -242,7 +261,7 @@ def register_legacy(app: web.Application, service: ExecutorService, auth: Auth) 
             if err:
                 return err
             symbol = str(args.get("symbol", "")).upper()
-            direction = str(args.get("direction", "")).upper() or None
+            direction = args["direction"]
             if not symbol or not has_position(symbol, direction):
                 return json_response({"ok": False, "error": f"sin posición abierta para {symbol} (si hay LONG y "
                                                             f"SHORT simultáneas, especifica 'direction')"}, 404)
@@ -295,7 +314,7 @@ def register_legacy(app: web.Application, service: ExecutorService, auth: Auth) 
         if err:
             return err
         symbol = str(args.get("symbol", "")).upper()
-        if not has_position(symbol, str(args.get("direction", "")).upper() or None):
+        if not has_position(symbol, args["direction"]):
             return json_response({"ok": False, "error": "posición no encontrada o monto inválido (si hay LONG y "
                                                         "SHORT simultáneas, especifica 'direction')"}, 400)
         return await legacy_call("modify_margin", args, lambda d: d)
@@ -373,6 +392,8 @@ def cors_middleware(service: ExecutorService):
 @web.middleware
 async def json_errors_middleware(request: web.Request, handler):
     """404/405/500 como JSON {ok:false, error} en vez de texto plano."""
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        return await handler(request)  # un WebSocket ya abierto no admite una respuesta HTTP
     try:
         return await handler(request)
     except web.HTTPException as exc:
@@ -389,6 +410,17 @@ async def json_errors_middleware(request: web.Request, handler):
         return json_response({"ok": False, "error": "error interno del executor", "status": 500}, 500)
 
 
+_REDACT = {"secret", "token", "signal_secret"}
+
+
+def _safe_path(request) -> str:
+    """Ruta + query sin secretos (?secret=, ?token=)."""
+    if not request.query_string:
+        return request.path
+    parts = [f"{k}={'***' if k.lower() in _REDACT else v}" for k, v in request.query.items()]
+    return (request.path + "?" + "&".join(parts))[:300]
+
+
 class AccessLogger(AbstractAccessLogger):
     """Registra POST/DELETE y errores; omite el ruido de GET exitosos."""
 
@@ -402,7 +434,7 @@ class AccessLogger(AbstractAccessLogger):
             return
         level = logging.WARNING if status >= 400 else logging.INFO
         self.logger.log(level, "%s %s %s %d (%.0f ms)", client_ip(request, self.trust_proxy), request.method,
-                        request.path_qs if status >= 400 else request.path, status, time_taken * 1000)
+                        _safe_path(request) if status >= 400 else request.path, status, time_taken * 1000)
 
 
 def build_access_logger(trust_proxy: bool) -> type:

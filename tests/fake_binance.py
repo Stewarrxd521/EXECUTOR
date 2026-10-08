@@ -61,6 +61,7 @@ class FakeBinance:
         self.seq = 1000
         self.user_ws: set[web.WebSocketResponse] = set()
         self.inject: list[tuple[str, int, str]] = []
+        self.inject_after: list = []
         self.requests: list[tuple[str, dict]] = []
         self.rest_calls: list[str] = []
         self._tasks: list[asyncio.Task] = []
@@ -218,6 +219,10 @@ class FakeBinance:
                         self.inject.pop(i)
                         raise _Err(code, text)
                 result = self._dispatch(method, params)
+                for i, (m, code, text) in enumerate(self.inject_after):
+                    if m == method:  # se ejecuta, pero la respuesta es un error (estado desconocido)
+                        self.inject_after.pop(i)
+                        raise _Err(code, text)
                 await ws.send_str(json.dumps({"id": req["id"], "status": 200, "result": result,
                                               "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE",
                                                               "intervalNum": 1, "limit": 2400, "count": len(self.requests)}]}))

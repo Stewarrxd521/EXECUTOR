@@ -126,11 +126,18 @@ class Settings:
         return any(s and hmac.compare_digest(value.encode(), s.encode()) for s in accepted)
 
     def check_write_token(self, value: str) -> bool:
-        """Credencial para escribir por HTTP: SIGNAL_SECRET o DASHBOARD_TOKEN."""
+        """Credencial de la API HTTP/dashboard: DASHBOARD_TOKEN o SIGNAL_SECRET.
+
+        Con DASHBOARD_TOKEN definido, los secretos por defecto (públicos) de los
+        bots no sirven como token: hay que definir SIGNAL_SECRET o usar el token.
+        """
         if not value:
             return False
-        if self.dashboard_token and hmac.compare_digest(value.encode(), self.dashboard_token.encode()):
-            return True
+        if self.dashboard_token:
+            if hmac.compare_digest(value.encode(), self.dashboard_token.encode()):
+                return True
+            if self.signal_secret_is_default:
+                return False
         return self.check_signal_secret(value)
 
     @property
@@ -180,9 +187,12 @@ def load_settings() -> Settings:
     if not proxies and _env("FIXIE_URL"):
         proxies = [_env("FIXIE_URL")]
 
-    raw_secrets = _env_list("SIGNAL_SECRET")
+    # SIGNAL_SECRET se usa tal cual (como antes, puede contener comas);
+    # SIGNAL_SECRETS añade secretos extra separados por comas.
+    raw = os.environ.get("SIGNAL_SECRET", "")
+    raw_secrets = [v for v in dict.fromkeys([raw, raw.strip()]) if v.strip()] + _env_list("SIGNAL_SECRETS")
     if raw_secrets:
-        signal_secrets, secret_is_default = raw_secrets, False
+        signal_secrets, secret_is_default = list(dict.fromkeys(raw_secrets)), False
     else:
         signal_secrets, secret_is_default = list(LEGACY_SIGNAL_SECRETS), True
     signal_secret = signal_secrets[0]

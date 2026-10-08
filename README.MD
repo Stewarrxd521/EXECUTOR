@@ -129,7 +129,8 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
 ```
 
 - Tamaño de apertura: `quantity`/`qty` (con `price` define el notional deseado, como antes), o `notional`/`usdt`, o
-  `margin`. Sin ninguno se rechaza, salvo que `DEFAULT_NOTIONAL_USDT` > 0.
+  `margin`. Si llegan `quantity` y `notional`, manda `quantity × price` (se avisa si difieren). Sin ninguno se
+  rechaza, salvo que `DEFAULT_NOTIONAL_USDT` > 0.
 - La cantidad final se calcula con el precio real y las reglas del símbolo (redondeo exacto con `Decimal`).
 - Se mantiene la regla de leverage por precio: `HIGH_PRICE_LEVERAGE` si el precio supera `HIGH_PRICE_THRESHOLD`.
 - Los cierres por TP/SL de Binance, liquidaciones o cierres manuales en la app se **detectan en tiempo real** y la
@@ -139,7 +140,11 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
   se ejecutan y quedan en `levels`/`tranches` del trade. No hay antiduplicado por contenido (`SIGNAL_DEDUPE_TTL_S=0`).
 - Una señal con `signal_id` (o header `Idempotency-Key`) nunca se ejecuta dos veces: así los reintentos son seguros.
 - `close` acepta `close_price`, `pnl` (PnL del bot, se compara con el real), `quantity` (cierre parcial). Si llega
-  antes que su `open` (o mientras se abre) se aplica en cuanto la posición existe.
+  antes que su `open` (o mientras se abre) se aplica en cuanto la posición existe; un tramo de ese `trade_id` que
+  llegue hasta 30 s después del cierre se ignora (no reabre). El orden se respeta por símbolo: un `close` espera a
+  los `open` recibidos antes que él, nunca a los posteriores.
+- Si Binance no confirma una apertura (timeout, estado desconocido) el executor relee la posición real y la registra
+  si se abrió, así el `close` del bot siempre la cierra.
 - `POST /signal?wait=1` espera el resultado en Binance (hasta `SIGNAL_WAIT_TIMEOUT_S`) y lo devuelve en `result`.
 - Un secreto incorrecto responde 401 y queda visible en la pestaña Señales y en `GET /api/signals`.
 
@@ -164,7 +169,9 @@ python executor_client.py --url https://tu-executor.onrender.com demo
 | `GET /ws` · `GET /ws/signal` | WebSocket del dashboard · señales por WebSocket |
 
 - **Autenticación**: lectura abierta (o `X-Dashboard-Token` si definiste `DASHBOARD_TOKEN`); escritura con el secreto
-  de señales en `X-Signal-Secret`, `X-Dashboard-Token`, `Authorization: Bearer …` o `?secret=`.
+  de señales en `X-Signal-Secret`, `X-Dashboard-Token`, `Authorization: Bearer …` o `?secret=`. Con `DASHBOARD_TOKEN`
+  definido y sin `SIGNAL_SECRET`, la API solo acepta el token (los secretos por defecto de los bots siguen valiendo
+  únicamente para `/signal`).
 - Respuestas JSON `{"ok": true, "action", "data"}`; errores `{"ok": false, "error", "diagnosis"?}` con 400/401/404/409/502/503.
   Si Binance rechaza la orden, `diagnosis` explica el código y la solución.
 - CORS habilitado (`CORS_ORIGINS`), parámetros en JSON, formulario o query string, rutas con o sin `/` final.
@@ -206,7 +213,8 @@ ambos y las pruebas los ejecutan contra el executor.
 | `ADOPT_POSITIONS` | `true` | Al arrancar, registrar como trades las posiciones abiertas que no conocía |
 | `RESTORE_TRADING_PAUSE` | `true` | Mantener la pausa de trading tras reiniciar |
 | `API_WRITE_OPEN` | `false` | Permitir escritura HTTP sin secreto (no recomendado) |
-| `CORS_ORIGINS` | `*` | Orígenes permitidos para la API y el WebSocket del dashboard |
+| `SIGNAL_SECRETS` | — | Secretos adicionales aceptados, separados por comas (p. ej. al rotar el secreto) |
+| `CORS_ORIGINS` | `*` | Orígenes permitidos para la API (CORS). El WebSocket del dashboard solo acepta el mismo sitio o los orígenes listados explícitamente |
 | `TRUST_PROXY` | `true` en Render | Tomar la IP del cliente de `X-Forwarded-For` |
 | `KEEPALIVE_URL` / `KEEPALIVE_S` | `RENDER_EXTERNAL_URL` / `600` | Auto-ping para que Render no duerma el servicio |
 | `MAX_PRICE_AGE_S` | `5` | Antigüedad máxima del precio de referencia |

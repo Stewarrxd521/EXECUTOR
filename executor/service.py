@@ -110,6 +110,9 @@ class ExecutorService:
             log.warning("SIGNAL_SECRET no está definido: se aceptan los secretos por defecto de los bridges "
                         "(%s). Defínelo y usa el mismo valor en EXECUTOR_SECRET (app_25) / "
                         "ExecutorBridge(signal_secret=...)", ", ".join(s.signal_secrets))
+            if s.dashboard_token:
+                log.warning("DASHBOARD_TOKEN definido: la API HTTP y el dashboard solo aceptan ese token "
+                            "(los secretos por defecto de los bots solo sirven para /signal)")
         if not s.proxy_urls:
             log.critical("PROXY_URLS / FIXIE_URL no configurado: el cambio de leverage (REST) saldrá con la IP "
                          "directa del servidor; si Binance la bloquea, se abrirá con el leverage que ya tenga "
@@ -346,7 +349,8 @@ class ExecutorService:
         while True:
             await asyncio.sleep(1)
             now = time.time()
-            wanted = {s for s, ts in self.watch.items() if now - ts < 120}
+            self.watch = {s: ts for s, ts in self.watch.items() if now - ts < 120}
+            wanted = set(self.watch)
             wanted |= {p.symbol for p in self.core.account.positions.values()}
             wanted |= {b.symbol for b in self.grids.active_bots()}
             for sym in wanted:
@@ -356,6 +360,11 @@ class ExecutorService:
             for sym in list(self.history):
                 if sym not in wanted and now - (self.history[sym][-1][0] if self.history[sym] else 0) > 600:
                     del self.history[sym]
+
+    def note_watch(self, symbol: str) -> None:
+        """Marca un símbolo como observado (historial del gráfico). Solo símbolos reales."""
+        if len(symbol) <= 30 and (self.core.exinfo.known(symbol) or self.core.market.mark(symbol)):
+            self.watch[symbol] = time.time()
 
     # ── Vistas ────────────────────────────────────────────────────────────
     def positions_view(self, symbol: Optional[str] = None) -> list[dict]:
@@ -643,12 +652,12 @@ class ExecutorService:
 
     async def _cmd_symbol_info(self, a: dict):
         symbol = self._symbol(a)
-        self.watch[symbol] = time.time()
+        self.note_watch(symbol)
         return self.symbol_view(symbol)
 
     async def _cmd_price_history(self, a: dict):
         symbol = self._symbol(a)
-        self.watch[symbol] = time.time()
+        self.note_watch(symbol)
         return {"symbol": symbol, "points": list(self.history.get(symbol, []))}
 
     async def _cmd_exchange_info(self, a: dict):
@@ -666,6 +675,9 @@ class ExecutorService:
         status, body = await self.trades.submit_signal(dict(a), source="api", wait=parse_bool(a.get("wait"), True))
         if status >= 400:
             raise CommandError(body.get("error", "señal rechazada"), status)
+        if body.get("ok") is False and not body.get("duplicate"):
+            # Rechazada al validar (409) o falló al ejecutarse en Binance (502).
+            raise CommandError(body.get("error") or "señal rechazada", 502 if "result" in body else 409)
         return body
 
     async def _cmd_close_position(self, a: dict):

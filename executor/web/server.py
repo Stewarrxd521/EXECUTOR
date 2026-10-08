@@ -31,8 +31,8 @@ from .. import __version__
 from ..precision import parse_bool, safe_float
 from ..service import ExecutorService
 from .api import add_route, cors_middleware, json_errors_middleware, register_legacy, register_rest
-from .common import (Auth, client_ip, dumps, json_response, origin_allowed, read_body, request_secret,
-                     run_command)
+from .common import (Auth, any_valid, client_ip, dumps, json_response, origin_allowed, read_body,
+                     request_secrets, run_command)
 
 log = logging.getLogger("executor.web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -59,7 +59,7 @@ class DashboardHub:
     def __init__(self, service: ExecutorService):
         self.service = service
         self.clients: set[Client] = set()
-        self._failed_auth: dict[str, float] = {}
+        self._last_failed_auth = 0.0  # global: frena la fuerza bruta aunque cambie la IP
         self._task: Optional[asyncio.Task] = None
         self._sends: set[asyncio.Task] = set()
         service.core.bus.subscribe(self._on_event)
@@ -111,7 +111,7 @@ class DashboardHub:
                         await c.send(markets)
                     if c.symbol:
                         await c.send(dumps({"type": "ticker", "data": self.service.symbol_view(c.symbol)}))
-                        self.service.watch[c.symbol] = time.time()
+                        self.service.note_watch(c.symbol)
                     fresh = [ln for ln in logs if ln["id"] > c.log_seq]
                     if fresh:
                         c.log_seq = fresh[-1]["id"]
@@ -121,9 +121,11 @@ class DashboardHub:
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         settings = self.service.settings
-        if not origin_allowed(request, settings.cors_origins):
-            log.warning("WebSocket del dashboard rechazado: Origin %s no permitido (CORS_ORIGINS)",
-                        request.headers.get("Origin"))
+        # Solo el propio dashboard (mismo sitio) o los orígenes listados en CORS_ORIGINS
+        # (el comodín * no aplica aquí): una página ajena no puede controlar el executor.
+        if not origin_allowed(request, settings.cors_origins, strict=True):
+            log.warning("WebSocket del dashboard rechazado: Origin %s no permitido (añádelo a CORS_ORIGINS)",
+                        str(request.headers.get("Origin"))[:100])
             return json_response({"ok": False, "error": "origin no permitido"}, 403)
         ws = web.WebSocketResponse(heartbeat=25, max_msg_size=1 << 20)
         await ws.prepare(request)
@@ -138,7 +140,10 @@ class DashboardHub:
                 except ValueError:
                     continue
                 if isinstance(data, dict):
-                    await self._on_message(client, data)
+                    try:
+                        await self._on_message(client, data)
+                    except Exception:
+                        log.exception("Dashboard: mensaje no procesado")
         finally:
             self.clients.discard(client)
         return ws
@@ -148,7 +153,7 @@ class DashboardHub:
         if op == "auth":
             settings = self.service.settings
             required = settings.dashboard_auth_required
-            if required and time.time() - self._failed_auth.get(client.ip, 0) < 2:
+            if required and time.time() - self._last_failed_auth < 2:
                 await asyncio.sleep(2)
             if not required or settings.check_write_token(str(data.get("token", ""))):
                 client.authed = True
@@ -158,7 +163,7 @@ class DashboardHub:
                 await client.send(dumps({"type": "errors", "entries": self.service.core.journal.entries(150)}))
                 client.log_seq = 0
             else:
-                self._failed_auth[client.ip] = time.time()
+                self._last_failed_auth = time.time()
                 await client.send(dumps({"type": "auth", "ok": False, "required": True, "error": "token inválido"}))
             return
         if not client.authed:
@@ -169,7 +174,7 @@ class DashboardHub:
         elif op == "select":
             client.symbol = str(data.get("symbol", "")).upper()[:30]
             if client.symbol:
-                self.service.watch[client.symbol] = time.time()
+                self.service.note_watch(client.symbol)
                 await client.send(dumps({"type": "ticker", "data": self.service.symbol_view(client.symbol)}))
         elif op == "cmd":
             task = asyncio.create_task(self._run_command(client, data))
@@ -200,7 +205,7 @@ def build_app(service: ExecutorService) -> web.Application:
         data, invalid = await read_body(request)
         if invalid or not isinstance(data, dict):
             return json_response({"ok": False, "error": "invalid json"}, 400)
-        if not settings.check_signal_secret(request_secret(request, data)):
+        if not any_valid(request_secrets(request, data), settings.check_signal_secret):
             trades.note_unauthorized(ip, data, "http")
             return json_response({"ok": False, "error": "unauthorized"}, 401)
         wait = parse_bool(request.query.get("wait", data.pop("wait", None)), False)
@@ -213,7 +218,8 @@ def build_app(service: ExecutorService) -> web.Application:
         ip = client_ip(request, settings.trust_proxy)
         ws = web.WebSocketResponse(heartbeat=25, max_msg_size=1 << 20)
         await ws.prepare(request)
-        authed = settings.check_signal_secret(request_secret(request))
+        authed = any_valid(request_secrets(request), settings.check_signal_secret)
+        failures = 0
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
                 continue
@@ -231,6 +237,11 @@ def build_app(service: ExecutorService) -> web.Application:
                 if not settings.check_signal_secret(secret):
                     trades.note_unauthorized(ip, data, "ws")
                     await ws.send_str(dumps({"ok": False, "error": "unauthorized", "status": 401, "id": req_id}))
+                    failures += 1
+                    if failures >= 5:
+                        await ws.close(message=b"unauthorized")
+                        break
+                    await asyncio.sleep(min(2.0, 0.25 * failures))
                     continue
                 authed = True
                 if not data.get("action"):  # mensaje solo de autenticación
@@ -240,8 +251,12 @@ def build_app(service: ExecutorService) -> web.Application:
                 await ws.send_str(dumps({"ok": True, "pong": True, "id": req_id, "ready": trades.ready.is_set()}))
                 continue
             wait = parse_bool(data.pop("wait", None), False)
-            status, body = await trades.submit_signal(data, source="ws", ip=ip, wait=wait,
-                                                      signal_id=str(data.get("signal_id") or ""))
+            try:
+                status, body = await trades.submit_signal(data, source="ws", ip=ip, wait=wait,
+                                                          signal_id=str(data.get("signal_id") or ""))
+            except Exception:
+                log.exception("/ws/signal: señal no procesada")
+                status, body = 500, {"ok": False, "error": "error interno del executor"}
             body["status"] = status
             if req_id is not None:
                 body["id"] = req_id
@@ -250,7 +265,7 @@ def build_app(service: ExecutorService) -> web.Application:
 
     # ── GET /api/state (poll_state_loop de los bots) ─────────────────────────
     async def api_state(request: web.Request) -> web.Response:
-        if settings.state_requires_auth and not settings.check_write_token(request_secret(request)):
+        if settings.state_requires_auth and not any_valid(request_secrets(request), settings.check_write_token):
             auth.warn_denied(request, "/api/state")
             return json_response({"ok": False, "error": "unauthorized"}, 401)
         limit = int(safe_float(request.query.get("limit"), 200))

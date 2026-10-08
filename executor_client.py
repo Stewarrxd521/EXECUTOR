@@ -53,6 +53,8 @@ Autenticación
 * Escritura (``POST``/``DELETE`` de ``/api/*`` y ``/manual/*``): el secreto en
   ``X-Signal-Secret``, ``X-Dashboard-Token``, ``Authorization: Bearer <secreto>``
   o ``?secret=``. API_WRITE_OPEN=true en el executor lo desactiva.
+* Con DASHBOARD_TOKEN definido y SIGNAL_SECRET sin definir, ``/api/*`` y ``/ws``
+  solo aceptan el token (usa EXECUTOR_TOKEN); ``/signal`` sigue igual.
 
 Referencia de endpoints
 -----------------------
@@ -147,10 +149,11 @@ WebSockets::
 Contrato de señales (``POST /signal``)
 --------------------------------------
 * ``open``: ``trade_id``, ``symbol``, ``direction`` (LONG/SHORT) y el tamaño:
-  ``quantity`` (o ``qty``), ``notional`` (o ``usdt``) o ``margin``. Opcionales:
-  ``price``, ``level``, ``leverage``, ``tp``/``sl`` (precios), ``signal_id``.
-  Varios ``open`` con el mismo ``trade_id`` y símbolo son TRAMOS: se suman a la
-  misma posición (lo que hace app_25 al promediar).
+  ``quantity`` (o ``qty``) con ``price`` (manda ``quantity × price``, como antes),
+  o ``notional`` (o ``usdt``) o ``margin``. Opcionales: ``level``, ``leverage``,
+  ``tp``/``sl`` (precios), ``signal_id``. Varios ``open`` con el mismo
+  ``trade_id`` y símbolo son TRAMOS: se suman a la misma posición (lo que hace
+  app_25 al promediar); un tramo que llega ≤ 30 s después del ``close`` se ignora.
 * ``close``: ``trade_id`` y/o ``symbol`` (+ ``direction``), ``reason``,
   ``close_price``, ``pnl`` (PnL del bot, se compara con el real), ``quantity``
   (cierre parcial). Si llega antes que su ``open`` se aplica al abrirse.
@@ -194,6 +197,7 @@ import http.client
 import itertools
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -273,7 +277,7 @@ class ExecutorSignalConfig:
     retries: int = 4              # reintentos de una señal (executor despertando / caído)
     retry_backoff: float = 2.0    # espera 2 s, 4 s, 8 s, 16 s… (máx. 20 s) entre reintentos
     state_limit: int = 0          # cerrados en /api/state (0 = lo que decida el executor)
-    flush_on_exit: float = 30.0   # al salir, espera hasta N s a que se envíe lo pendiente
+    flush_on_exit: float = 75.0   # al salir, espera hasta N s a que se envíe lo pendiente (cubre los reintentos)
 
 
 _ExecutorSignalConfig = ExecutorSignalConfig  # nombre usado dentro de app_25.py
@@ -285,7 +289,8 @@ _BRIDGES: "weakref.WeakSet[ExecutorBridge]" = weakref.WeakSet()
 def _flush_bridges_at_exit() -> None:
     for bridge in list(_BRIDGES):
         try:
-            bridge.flush(bridge.config.flush_on_exit)
+            if bridge.pending and not bridge.flush(bridge.config.flush_on_exit):
+                bridge._log(f"[executor] {bridge.pending} señal(es) sin enviar al salir (executor sin respuesta)")
         except Exception:  # pragma: no cover
             pass
 
@@ -339,7 +344,7 @@ class ExecutorBridge:
             pass
 
     def _build_signal_request(self, payload: dict[str, Any]) -> urllib.request.Request:
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, default=str).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
             "X-Signal-Secret": self.config.signal_secret,
@@ -371,9 +376,14 @@ class ExecutorBridge:
                 time.sleep(delay)
             try:
                 status, body = _http(self._build_signal_request(payload), self.config.timeout_signal)
-            except _TRANSIENT as exc:
+            except _TRANSIENT + (OSError,) as exc:
                 problem = f"sin respuesta: {exc}"
                 continue
+            except Exception as exc:  # URL inválida, payload no serializable…: nunca se propaga
+                self.failed += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self._log(f"[executor] error enviando {what}: {self.last_error}")
+                return None
             if status in RETRY_STATUSES:
                 problem = _error_text(status, body)
                 continue
@@ -600,8 +610,9 @@ class ExecutorClient:
         retries: int = 2,
     ) -> None:
         self.base_url = _clean_url(base_url or os.getenv("EXECUTOR_URL", "") or "http://127.0.0.1:10000")
-        self.secret = secret if secret is not None else os.getenv("EXECUTOR_SECRET", DEFAULT_SECRET)
         self.token = token if token is not None else os.getenv("EXECUTOR_TOKEN", "")
+        # Con solo EXECUTOR_TOKEN no se envía el secreto por defecto (el token basta).
+        self.secret = secret if secret is not None else os.getenv("EXECUTOR_SECRET", "" if self.token else DEFAULT_SECRET)
         self.timeout = timeout
         self.retries = retries
 
@@ -707,9 +718,10 @@ class ExecutorClient:
 
     def is_ready(self) -> bool:
         try:
-            return bool(self.ready().get("ok"))
+            reply = self.ready()
         except ExecutorError:
             return False
+        return isinstance(reply, dict) and bool(reply.get("ok"))
 
     def wait_ready(self, timeout: float = 120.0, interval: float = 2.0) -> bool:
         """Espera a que el executor despierte (Render) y sincronice la cuenta."""
@@ -1065,22 +1077,34 @@ class SignalSocket:
         return self
 
     async def _read(self) -> None:
-        assert self._conn is not None
-        while True:
-            msg = await self._conn.recv()
-            if msg is None:
-                break
-            fut = self._waiters.pop(msg.get("id"), None)
-            if fut is not None and not fut.done():
-                fut.set_result(msg)
-        for fut in self._waiters.values():
-            if not fut.done():
-                fut.set_exception(ConnectionError("WebSocket /ws/signal cerrado"))
-        self._waiters.clear()
+        conn = self._conn
+        assert conn is not None
+        try:
+            while True:
+                msg = await conn.recv()
+                if msg is None:
+                    break
+                fut = self._waiters.pop(msg.get("id"), None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+        finally:
+            for fut in self._waiters.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("WebSocket /ws/signal cerrado"))
+            self._waiters.clear()
+            if self._conn is conn:
+                self._conn = None
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
     async def send(self, payload: dict, wait: bool = False) -> dict:
-        """Envía una señal y devuelve la respuesta (``status``, ``ok``, ``result`` si ``wait``)."""
-        if self._conn is None:
+        """Envía una señal y devuelve la respuesta (``status``, ``ok``, ``result`` si ``wait``).
+
+        Si la conexión se cayó, reconecta. El ``signal_id`` hace seguro reenviar.
+        """
+        if self._conn is None or self._reader is None or self._reader.done():
             await self.connect()
         assert self._conn is not None
         req_id = next(self._ids)
@@ -1089,8 +1113,11 @@ class SignalSocket:
         msg.update({"id": req_id, "wait": wait})
         fut = asyncio.get_running_loop().create_future()
         self._waiters[req_id] = fut
-        await self._conn.send(msg)
-        return await asyncio.wait_for(fut, self.timeout)
+        try:
+            await self._conn.send(msg)
+            return await asyncio.wait_for(fut, self.timeout)
+        finally:
+            self._waiters.pop(req_id, None)
 
     async def ping(self) -> dict:
         return await self.send({"action": "ping"})
@@ -1099,7 +1126,8 @@ class SignalSocket:
         if self._reader:
             self._reader.cancel()
         if self._conn:
-            await self._conn.close()
+            conn, self._conn = self._conn, None
+            await conn.close()
 
     async def __aenter__(self) -> "SignalSocket":
         return await self.connect()
@@ -1143,19 +1171,25 @@ class DashboardSocket:
 
     async def _read(self) -> None:
         assert self._conn is not None
-        while True:
-            msg = await self._conn.recv()
-            if msg is None:
-                break
-            if msg.get("type") == "reply":
-                fut = self._waiters.pop(msg.get("id"), None)
-                if fut is not None and not fut.done():
-                    fut.set_result(msg)
-                continue
-            if msg.get("type") == "state":
-                self.state = msg.get("data")
-            self._push(msg)
-        self._push(None)
+        try:
+            while True:
+                msg = await self._conn.recv()
+                if msg is None:
+                    break
+                if msg.get("type") == "reply":
+                    fut = self._waiters.pop(msg.get("id"), None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(msg)
+                    continue
+                if msg.get("type") == "state":
+                    self.state = msg.get("data")
+                self._push(msg)
+        finally:
+            for fut in self._waiters.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("WebSocket /ws cerrado"))
+            self._waiters.clear()
+            self._push(None)  # fin del stream para «async for»
 
     def _push(self, msg: Optional[dict]) -> None:
         if self._inbox.full():  # cliente lento: se descarta lo más viejo
@@ -1169,7 +1203,10 @@ class DashboardSocket:
         fut = asyncio.get_running_loop().create_future()
         self._waiters[req_id] = fut
         await self._conn.send({"op": "cmd", "id": req_id, "cmd": cmd, "args": _clean(args)})
-        reply = await asyncio.wait_for(fut, self.timeout)
+        try:
+            reply = await asyncio.wait_for(fut, self.timeout)
+        finally:
+            self._waiters.pop(req_id, None)
         if not reply.get("ok"):
             raise ExecutorError(int(reply.get("status") or 400), str(reply.get("error")), reply)
         return reply.get("data")
@@ -1210,19 +1247,17 @@ class DashboardSocket:
 # 4. CLI
 # ═════════════════════════════════════════════════════════════════════════════
 def _parse_value(text: str) -> Any:
+    """clave=valor: true/false/null, números «limpios» y JSON; el resto queda como texto
+    (un id como 0012 o 1e5 no se convierte en número)."""
     low = text.lower()
     if low in ("true", "false"):
         return low == "true"
     if low in ("null", "none"):
         return None
-    try:
+    if re.fullmatch(r"-?(0|[1-9]\d*)", text):
         return int(text)
-    except ValueError:
-        pass
-    try:
+    if re.fullmatch(r"-?(0|[1-9]\d*)\.\d+", text):
         return float(text)
-    except ValueError:
-        pass
     if text[:1] in "[{":
         try:
             return json.loads(text)
@@ -1248,7 +1283,9 @@ def _print(data: Any) -> None:
         print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
-def _state_line(st: dict) -> str:
+def _state_line(st: Any) -> str:
+    if not isinstance(st, dict):
+        return f"{time.strftime('%H:%M:%S')}  respuesta inesperada: {str(st)[:120]}"
     return (f"{time.strftime('%H:%M:%S')}  balance={st.get('balance', 0):.2f}  equity={st.get('equity', 0):.2f}  "
             f"realizado={st.get('realized_pnl', 0):+.4f}  no realizado={st.get('unrealized_pnl', 0):+.4f}  "
             f"abiertas={st.get('open_count', 0)}  win rate={st.get('win_rate', 0)}%  "
@@ -1292,7 +1329,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Variables: EXECUTOR_URL, EXECUTOR_SECRET, EXECUTOR_TOKEN. Referencia completa: "
                "python -c \"import executor_client; help(executor_client)\"")
     p.add_argument("--url", default=os.getenv("EXECUTOR_URL", "http://127.0.0.1:10000"), help="URL del executor")
-    p.add_argument("--secret", default=os.getenv("EXECUTOR_SECRET", DEFAULT_SECRET), help="SIGNAL_SECRET")
+    p.add_argument("--secret", default=None, help="SIGNAL_SECRET (por defecto EXECUTOR_SECRET o el de los bots)")
     p.add_argument("--token", default=os.getenv("EXECUTOR_TOKEN", ""), help="DASHBOARD_TOKEN (si existe)")
     p.add_argument("--timeout", type=float, default=15.0)
     sub = p.add_subparsers(dest="cmd", required=True)
