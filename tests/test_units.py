@@ -130,3 +130,31 @@ def test_grid_cells_by_mode(mode, expected):
     cells = GridManager._build_cells(None, cfg, levels, Decimal("1"), 100.0)
     assert [(c.kind, c.state) for c in cells] == expected
     assert GridManager._initial_hold_count(cfg, levels, 100.0) == sum(1 for _, s in expected if s == "HOLD")
+
+
+def test_repo_exchange_info_base_is_loaded(tmp_path):
+    """exchangeInfo.txt del repo (respuesta cruda de Binance) sirve de base."""
+    from executor.config import BUNDLED_EXCHANGE_INFO
+
+    ex = ExchangeInfo(tmp_path, BUNDLED_EXCHANGE_INFO)
+    ex.load()
+    assert len(ex) > 800 and "respuesta de Binance" in ex.meta.source
+    btc = ex.get("BTCUSDT")
+    assert btc.source == "snapshot" and btc.tick_size == Decimal("0.1") and btc.step_size == Decimal("0.001")
+    assert ex.get("SOLUSDT").step_size == Decimal("0.01")
+
+
+def test_newest_snapshot_wins(tmp_path):
+    import json
+
+    raw = exchange_info_payload()
+    raw["serverTime"] = 1_600_000_000_000  # 2020: más viejo que el snapshot de DATA_DIR
+    base = tmp_path / "exchangeInfo.txt"
+    base.write_text(json.dumps(raw))
+    ex = ExchangeInfo(tmp_path / "data", base)
+    ex.load()
+    assert ex.meta.path == str(base)                     # sin snapshot propio → base
+    ex.replace_all(parse_exchange_info(exchange_info_payload()), "descarga")
+    ex2 = ExchangeInfo(tmp_path / "data", base)
+    ex2.load()
+    assert ex2.meta.path.endswith("exchange_info.json")  # el descargado es más nuevo

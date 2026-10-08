@@ -6,6 +6,9 @@
 * ``POST /signal``      señales HTTP (compatibilidad con app.py).
 * ``GET  /api/state``   estado JSON (compatibilidad con app.py).
 * ``POST /api/command`` comandos del dashboard por HTTP (scripts).
+
+El dashboard se abre directamente con el link. Si se define ``DASHBOARD_TOKEN``
+pasa a pedir ese token (dashboard y ``/api/command``).
 * ``GET  /health``      salud del servicio.
 """
 
@@ -136,18 +139,20 @@ class DashboardHub:
     async def _on_message(self, client: Client, data: dict) -> None:
         op = data.get("op")
         if op == "auth":
-            if time.time() - self._failed_auth.get(client.ip, 0) < 2:
+            settings = self.service.settings
+            required = settings.dashboard_auth_required
+            if required and time.time() - self._failed_auth.get(client.ip, 0) < 2:
                 await asyncio.sleep(2)
-            if _safe_eq(str(data.get("token", "")), self.service.settings.dashboard_token):
+            if not required or _safe_eq(str(data.get("token", "")), settings.dashboard_token):
                 client.authed = True
-                await client.send(dumps({"type": "auth", "ok": True, "env": self.service.settings.env_label}))
+                await client.send(dumps({"type": "auth", "ok": True, "env": settings.env_label, "required": required}))
                 await client.send(dumps({"type": "state", "data": self.service.snapshot()}))
                 await client.send(dumps({"type": "markets", "rows": self.service.core.market.market_rows()}))
                 await client.send(dumps({"type": "errors", "entries": self.service.core.journal.entries(150)}))
                 client.log_seq = 0
             else:
                 self._failed_auth[client.ip] = time.time()
-                await client.send(dumps({"type": "auth", "ok": False, "error": "token inválido"}))
+                await client.send(dumps({"type": "auth", "ok": False, "required": True, "error": "token inválido"}))
             return
         if not client.authed:
             await client.send(dumps({"type": "auth", "ok": False, "error": "no autenticado"}))
@@ -238,7 +243,8 @@ def build_app(service: ExecutorService) -> web.Application:
         return web.Response(text=dumps(service.api_state()), content_type="application/json")
 
     async def api_command(request: web.Request) -> web.Response:
-        if not _safe_eq(request.headers.get("X-Dashboard-Token", ""), settings.dashboard_token):
+        if settings.dashboard_auth_required and not _safe_eq(request.headers.get("X-Dashboard-Token", ""),
+                                                             settings.dashboard_token):
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
         try:
             data = await request.json()

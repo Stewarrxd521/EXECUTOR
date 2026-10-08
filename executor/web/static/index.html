@@ -14,10 +14,14 @@
 <body>
   <!-- ── Acceso ─────────────────────────────────────────────── -->
   <div id="login" class="login">
-    <form id="login-form" class="login-box" autocomplete="off">
+    <div id="connecting" class="login-box connecting">
       <div class="brand big"><span class="logo"></span><b>FUTURES</b>&nbsp;EXECUTOR</div>
-      <p class="muted">Introduce el token del dashboard (<code>DASHBOARD_TOKEN</code> o <code>SIGNAL_SECRET</code>).</p>
-      <input id="login-token" type="password" placeholder="Token de acceso" required autofocus>
+      <p class="muted center-text" id="connecting-msg">Conectando con el executor…</p>
+    </div>
+    <form id="login-form" class="login-box" autocomplete="off" hidden>
+      <div class="brand big"><span class="logo"></span><b>FUTURES</b>&nbsp;EXECUTOR</div>
+      <p class="muted">Este executor tiene <code>DASHBOARD_TOKEN</code> configurado: introduce el token.</p>
+      <input id="login-token" type="password" placeholder="Token de acceso" autocomplete="current-password" required>
       <label class="check"><input type="checkbox" id="login-remember" checked> Recordar en este navegador</label>
       <button class="btn btn-primary btn-block" type="submit">Entrar</button>
       <p id="login-error" class="text-red small"></p>

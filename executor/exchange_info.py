@@ -1,11 +1,16 @@
 """Reglas de trading por símbolo desde un exchangeInfo local predefinido.
 
-El executor NO consulta ``/fapi/v1/exchangeInfo`` al operar. Usa, en orden:
+El executor NO consulta ``/fapi/v1/exchangeInfo`` al operar. Usa la versión
+más reciente entre:
 
-1. ``DATA_DIR/exchange_info.json`` — snapshot local (el más reciente).
-2. ``executor/data/exchange_info.json`` — snapshot empaquetado con el código.
-3. Reglas heurísticas derivadas del precio, para símbolos recién listados que
-   todavía no están en el snapshot.
+* ``exchangeInfo.txt`` (raíz del repositorio): respuesta cruda de Binance que
+  sirve de base cuando Binance bloquea la IP (configurable con
+  ``EXCHANGE_INFO_FILE``).
+* ``DATA_DIR/exchange_info.json``: snapshot que el executor guarda cuando logra
+  descargar uno más nuevo.
+
+Para símbolos recién listados que todavía no están en ninguno se usan reglas
+heurísticas derivadas del precio.
 
 Sobre eso aplica correcciones *aprendidas* (``exchange_info_learned.json``):
 cuando Binance rechaza una orden por precisión (-1111/-4014) en un símbolo sin
@@ -298,6 +303,28 @@ def parse_exchange_info(payload: dict) -> dict[str, SymbolRules]:
     return out
 
 
+def _iso_from_ms(ms) -> str:
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+def read_rules_file(path: Path) -> tuple[dict[str, "SymbolRules"], str, str]:
+    """Lee un snapshot en formato propio o la respuesta cruda de Binance.
+
+    Devuelve (reglas, generado_en_iso, origen).
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    symbols = data.get("symbols")
+    if isinstance(symbols, list):  # respuesta cruda de /fapi/v1/exchangeInfo
+        rules = parse_exchange_info(data)
+        apply_brackets(rules, data.get("_leverageBrackets") or [])
+        return rules, _iso_from_ms(data.get("serverTime")), f"{Path(path).name} (respuesta de Binance)"
+    rules = {s: SymbolRules.from_json(r) for s, r in (symbols or {}).items()}
+    return rules, data.get("generated_at", ""), data.get("source", "")
+
+
 def apply_brackets(rules: dict[str, SymbolRules], brackets: list) -> int:
     """Aplica el leverage máximo de /fapi/v1/leverageBracket (opcional)."""
     count = 0
@@ -358,23 +385,22 @@ class ExchangeInfo:
 
     # ── Carga / guardado ──────────────────────────────────────────────────
     def load(self) -> None:
+        best: Optional[tuple[str, Path, dict, str]] = None
         for candidate in (self.snapshot_path, self.bundled_path):
-            if candidate.exists():
-                try:
-                    data = json.loads(candidate.read_text(encoding="utf-8"))
-                    self._rules = {s: SymbolRules.from_json(r) for s, r in data.get("symbols", {}).items()}
-                    self.meta = SnapshotMeta(
-                        path=str(candidate),
-                        generated_at=data.get("generated_at", ""),
-                        source=data.get("source", ""),
-                        count=len(self._rules),
-                        loaded_at=time.time(),
-                    )
-                    log.info("exchangeInfo local: %d símbolos (%s, generado %s)",
-                             len(self._rules), candidate, self.meta.generated_at or "¿?")
-                    break
-                except Exception as exc:
-                    log.error("exchangeInfo: snapshot %s corrupto (%s); se ignora", candidate, exc)
+            if not candidate.exists():
+                continue
+            try:
+                rules, generated, source = read_rules_file(candidate)
+            except Exception as exc:
+                log.error("exchangeInfo: %s no se pudo leer (%s); se ignora", candidate, exc)
+                continue
+            if rules and (best is None or generated > best[0]):
+                best = (generated, candidate, rules, source)
+        if best is not None:
+            generated, path, self._rules, source = best
+            self.meta = SnapshotMeta(path=str(path), generated_at=generated, source=source,
+                                     count=len(self._rules), loaded_at=time.time())
+            log.info("exchangeInfo local: %d símbolos desde %s (fecha %s)", len(self._rules), path, generated or "¿?")
         if not self._rules:
             log.warning("exchangeInfo: no hay snapshot local; se usarán reglas heurísticas hasta generarlo")
 

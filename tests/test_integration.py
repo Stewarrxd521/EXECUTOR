@@ -257,3 +257,21 @@ async def test_http_command_api(service, fake):
         assert r.status == 200 and body["data"]["errors"]  # inversión insuficiente explicada
         r = await client.post("/api/command", json={"cmd": "nope"}, headers={"X-Dashboard-Token": "dash"})
         assert r.status == 400 and "desconocido" in (await r.json())["error"]
+
+
+async def test_dashboard_opens_with_just_the_link(fake, tmp_path, snapshot_file):
+    svc = ExecutorService(make_settings(fake, tmp_path, dashboard_token=""))
+    await svc.start()
+    app = build_app(svc)
+    async with TestClient(TestServer(app)) as client:
+        ws = await client.ws_connect("/ws")
+        await ws.send_json({"op": "auth", "token": ""})
+        reply = await ws.receive_json(timeout=5)
+        assert reply["ok"] is True and reply["required"] is False
+        await ws.close()
+        r = await client.post("/api/command", json={"cmd": "explain_error", "args": {"code": -1111}})
+        assert r.status == 200
+        # /signal sigue protegido por SIGNAL_SECRET (app.py ya lo envía).
+        r = await client.post("/signal", json={"action": "close_all"})
+        assert r.status == 401
+    await svc.stop()

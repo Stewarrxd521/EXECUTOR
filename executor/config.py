@@ -14,7 +14,8 @@ from pathlib import Path
 log = logging.getLogger("executor.config")
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-BUNDLED_EXCHANGE_INFO = PACKAGE_DIR / "data" / "exchange_info.json"
+ROOT_DIR = PACKAGE_DIR.parent
+BUNDLED_EXCHANGE_INFO = ROOT_DIR / "exchangeInfo.txt"
 DEFAULT_SIGNAL_SECRET = "cambiar-por-secreto-seguro"
 
 
@@ -87,6 +88,7 @@ class Settings:
     balance_poll_s: int = 60
     position_poll_s: int = 30
     data_dir: Path = Path("data")
+    exchange_info_file: Path = BUNDLED_EXCHANGE_INFO
     exchange_info_refresh_h: float = 0.0
     exchange_info_bootstrap: bool = True
     seed_open_orders_rest: bool = True
@@ -98,6 +100,11 @@ class Settings:
     # ── Grid bots ─────────────────────────────────────────────────────────
     grid_max_levels: int = 150
     grid_order_concurrency: int = 4
+
+    @property
+    def dashboard_auth_required(self) -> bool:
+        """El dashboard solo pide token si DASHBOARD_TOKEN está definido."""
+        return bool(self.dashboard_token)
 
     @property
     def has_credentials(self) -> bool:
@@ -141,7 +148,7 @@ def load_settings() -> Settings:
         api_secret=_env("BINANCE_API_SECRET"),
         testnet=testnet,
         signal_secret=signal_secret,
-        dashboard_token=_env("DASHBOARD_TOKEN") or signal_secret,
+        dashboard_token=_env("DASHBOARD_TOKEN"),
         port=_env_int("PORT", 10000),
         ws_api_url=_env(
             "BINANCE_WS_FAPI_URL",
@@ -174,6 +181,7 @@ def load_settings() -> Settings:
         balance_poll_s=max(10, _env_int("BALANCE_POLL_S", 60)),
         position_poll_s=max(10, _env_int("POSITION_POLL_S", 30)),
         data_dir=Path(_env("DATA_DIR", "data")),
+        exchange_info_file=Path(_env("EXCHANGE_INFO_FILE") or BUNDLED_EXCHANGE_INFO),
         exchange_info_refresh_h=_env_float("EXCHANGE_INFO_REFRESH_H", 0.0),
         exchange_info_bootstrap=_env_bool("EXCHANGE_INFO_BOOTSTRAP", True),
         seed_open_orders_rest=_env_bool("SEED_OPEN_ORDERS_REST", True),

@@ -44,11 +44,15 @@ Código en el paquete `executor/`:
 ## exchangeInfo predefinido
 
 Las reglas de todos los símbolos (tickSize, stepSize, minQty, maxQty, notional mínimo, banda PERCENT_PRICE, máximo de
-órdenes y, si hay API key, leverage máximo) se guardan en un JSON local y se usan sin consultar Binance:
+órdenes y, si se incluye, leverage máximo) se leen de archivos locales, sin consultar Binance:
 
-1. `DATA_DIR/exchange_info.json` (el más reciente) o `executor/data/exchange_info.json` (empaquetado con el código).
-2. Si no existe ninguno, el executor lo genera **una sola vez** al arrancar (`EXCHANGE_INFO_BOOTSTRAP=true`).
-3. Para empaquetarlo en el repositorio: `python tools/update_exchange_info.py --brackets` (acepta `--proxy`).
+1. **`exchangeInfo.txt`** (raíz del repositorio): la respuesta cruda de `/fapi/v1/exchangeInfo`. Es la base que funciona
+   aunque Binance bloquee la IP. Otra ruta: `EXCHANGE_INFO_FILE`.
+2. `DATA_DIR/exchange_info.json`: si el executor consigue descargar una versión más nueva, la guarda aquí. Siempre se
+   usa **la más reciente** de las dos (por la fecha `serverTime` / `generated_at`).
+3. Solo si no hay ninguna, se descarga una vez al arrancar (`EXCHANGE_INFO_BOOTSTRAP=true`), reintentando con espera.
+4. Para renovar la base: `python tools/update_exchange_info.py --brackets` (acepta `--proxy`) reescribe
+   `exchangeInfo.txt` en el mismo formato de Binance; luego haz commit.
 
 Mantenimiento automático sin REST:
 
@@ -106,11 +110,12 @@ Grids de futuros **Long, Short y Neutral**, aritméticos o geométricos:
 - Pestañas: posiciones (cierre, TP/SL, margen, cierre límite), órdenes abiertas, bots Grid, historial, señales,
   errores y sistema (conexiones, latencia, rate limits, REST usado, reloj, exchangeInfo y log en vivo).
 - Todo por **un WebSocket** (`/ws`): el estado llega empujado cada segundo y los comandos viajan por el mismo socket.
-- Requiere token (`DASHBOARD_TOKEN`, o `SIGNAL_SECRET` si no se define). El token ya no se incrusta en el HTML.
+- **Se entra directamente con el link**, sin usuario ni token. Si algún día quieres protegerlo, define
+  `DASHBOARD_TOKEN` y el dashboard pedirá ese token.
 
 ## Señales (compatibles con `app.py`)
 
-`POST /signal` con el header `X-Signal-Secret`, o por WebSocket en `/ws/signal` (header `X-Signal-Secret`, o un primer
+`POST /signal` con el header `X-Signal-Secret` (el mismo que ya envía `app.py`), o por WebSocket en `/ws/signal` (header `X-Signal-Secret`, o un primer
 mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
 
 ```json
@@ -131,7 +136,7 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
   operación se cierra localmente con su motivo y el PnL real reportado por Binance.
 
 Otros endpoints: `GET /api/state` (mismo formato que antes, lo consume `app.py`), `POST /api/command`
-(comandos del dashboard con `X-Dashboard-Token`) y `GET /health` (JSON con el estado de las conexiones).
+(comandos del dashboard; pide `X-Dashboard-Token` solo si definiste `DASHBOARD_TOKEN`) y `GET /health` (JSON con el estado de las conexiones).
 
 ## Variables de entorno
 
@@ -139,8 +144,8 @@ Otros endpoints: `GET /api/state` (mismo formato que antes, lo consume `app.py`)
 | --- | --- | --- |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Credenciales (Futuros habilitado) |
 | `USE_TESTNET` | `false` | Testnet de Binance Futures |
-| `SIGNAL_SECRET` | `cambiar-por-secreto-seguro` | Secreto de `/signal` y `/ws/signal` |
-| `DASHBOARD_TOKEN` | = `SIGNAL_SECRET` | Token del dashboard y de `/api/command` |
+| `SIGNAL_SECRET` | `cambiar-por-secreto-seguro` | Secreto que `app.py` envía en `X-Signal-Secret` (igual que antes). No afecta al dashboard |
+| `DASHBOARD_TOKEN` | — | Opcional. Vacío = dashboard abierto con el link; con valor, pide ese token |
 | `PORT` | `10000` | Puerto HTTP |
 | `PROXY_URLS` | — | Proxies HTTP separados por coma para REST (rotación y baneo por IP). `FIXIE_URL` sigue aceptándose |
 | `REST_PROXY_ALL` | `false` | Usar los proxies para todo el REST. Por defecto: leverage y exchangeInfo por proxy; el resto directo, pasando a un proxy si Binance bloquea la IP (403/451/-2015) |
@@ -155,7 +160,8 @@ Otros endpoints: `GET /api/state` (mismo formato que antes, lo consume `app.py`)
 | `MARGIN_AUTO_REDUCE` | `false` | Con -2019 reintentar con la mitad de cantidad |
 | `SIGNAL_DEDUPE_TTL_S` | `10` | Ventana anti-duplicados de señales |
 | `MAX_PRICE_AGE_S` | `5` | Antigüedad máxima del precio de referencia |
-| `DATA_DIR` | `data` | Estado persistente (trades, grids, exchangeInfo) |
+| `DATA_DIR` | `data` | Estado persistente (trades, grids, exchangeInfo descargado) |
+| `EXCHANGE_INFO_FILE` | `exchangeInfo.txt` | Base predefinida de reglas (respuesta cruda de Binance) |
 | `EXCHANGE_INFO_BOOTSTRAP` | `true` | Generar el exchangeInfo si no hay snapshot |
 | `EXCHANGE_INFO_REFRESH_H` | `0` | Refresco periódico del exchangeInfo (horas, 0 = nunca) |
 | `SEED_OPEN_ORDERS_REST` | `true` | Leer órdenes abiertas al arrancar |
@@ -181,7 +187,7 @@ algo orders, grids Neutral y Long, reconciliación tras reinicio, persistencia, 
 
 - Las credenciales del proxy Fixie ya no están en el código: configura `PROXY_URLS` (o `FIXIE_URL`). Conviene rotar
   esa contraseña, porque estuvo publicada en el historial del repositorio.
-- El dashboard pide token; antes el secreto de señales viajaba dentro del HTML público.
+- El dashboard se abre con el link, como antes, pero el secreto de señales ya no viaja dentro del HTML.
 - `GET /health` devuelve JSON con el estado de las conexiones (sigue respondiendo 200).
 - Si el cierre de una posición falla en Binance, la operación sigue abierta y se avisa (antes se marcaba cerrada).
 - Los cierres por TP/SL/liquidación hechos por Binance se detectan y registran automáticamente.
