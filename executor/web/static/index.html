@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Futures Executor</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23F0B90B' d='M16 3l4 4-4 4-4-4zm-9 9l4 4-4 4-4-4zm18 0l4 4-4 4-4-4zm-9 0l4 4-4 4-4-4zm0 9l4 4-4 4-4-4z'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <!-- ── Acceso ─────────────────────────────────────────────── -->
+  <div id="login" class="login">
+    <form id="login-form" class="login-box" autocomplete="off">
+      <div class="brand big"><span class="logo"></span><b>FUTURES</b>&nbsp;EXECUTOR</div>
+      <p class="muted">Introduce el token del dashboard (<code>DASHBOARD_TOKEN</code> o <code>SIGNAL_SECRET</code>).</p>
+      <input id="login-token" type="password" placeholder="Token de acceso" required autofocus>
+      <label class="check"><input type="checkbox" id="login-remember" checked> Recordar en este navegador</label>
+      <button class="btn btn-primary btn-block" type="submit">Entrar</button>
+      <p id="login-error" class="text-red small"></p>
+    </form>
+  </div>
+
+  <div id="app" hidden>
+    <!-- ── Barra superior ───────────────────────────────────── -->
+    <header class="topbar">
+      <div class="brand"><span class="logo"></span><b>EXECUTOR</b><span id="env-pill" class="pill">REAL</span></div>
+      <div class="conn" id="conn">
+        <span class="conn-item" title="WebSocket API (órdenes y cuenta)"><i class="dot" id="c-api"></i>WS API <b id="c-lat">–</b></span>
+        <span class="conn-item" title="Stream de mercado (todos los símbolos)"><i class="dot" id="c-mkt"></i>Mercado</span>
+        <span class="conn-item" title="User Data Stream (posiciones y fills en vivo)"><i class="dot" id="c-usr"></i>Cuenta</span>
+        <span class="conn-item" title="Conexión del panel"><i class="dot" id="c-dash"></i>Panel</span>
+      </div>
+      <div class="top-actions">
+        <label class="switch" title="Permitir nuevas aperturas por señal">
+          <input type="checkbox" id="trading-toggle"><span class="slider"></span><em>Trading</em>
+        </label>
+        <button id="lev-btn" class="chip" title="Leverage por defecto para señales">–x</button>
+        <button id="theme-btn" class="icon-btn" title="Tema claro/oscuro" aria-label="Cambiar tema">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <button id="logout-btn" class="icon-btn" title="Salir" aria-label="Salir">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg></button>
+      </div>
+    </header>
+
+    <!-- ── Cuerpo ───────────────────────────────────────────── -->
+    <main class="layout">
+      <aside class="panel markets" id="markets-panel">
+        <div class="panel-head">
+          <div class="search"><input id="mkt-search" type="search" placeholder="Buscar símbolo" autocomplete="off"></div>
+        </div>
+        <div class="seg small" id="mkt-sort">
+          <button data-sort="fav">★</button>
+          <button data-sort="vol" class="active">Volumen</button>
+          <button data-sort="chg">Cambio</button>
+          <button data-sort="name">A-Z</button>
+        </div>
+        <div class="mkt-head"><span>Par</span><span>Precio</span><span>24h</span></div>
+        <div class="mkt-list" id="mkt-list"><div class="empty">Conectando al mercado…</div></div>
+      </aside>
+
+      <section class="center">
+        <div class="panel symbol-bar" id="symbol-bar">
+          <div class="sym-title">
+            <button class="fav-btn" id="sym-fav" title="Favorito">☆</button>
+            <div><b id="sym-name">–</b><span class="tag">Perpetuo</span></div>
+          </div>
+          <div class="sym-price"><span id="sym-last" class="big">–</span><span id="sym-mark-usd" class="muted small"></span></div>
+          <div class="stat"><span>Cambio 24h</span><b id="sym-chg">–</b></div>
+          <div class="stat"><span>Mark</span><b id="sym-mark">–</b></div>
+          <div class="stat"><span>Índice</span><b id="sym-index">–</b></div>
+          <div class="stat"><span>Funding / Cuenta atrás</span><b id="sym-funding">–</b></div>
+          <div class="stat"><span>Máx 24h</span><b id="sym-high">–</b></div>
+          <div class="stat"><span>Mín 24h</span><b id="sym-low">–</b></div>
+          <div class="stat"><span>Vol 24h (USDT)</span><b id="sym-vol">–</b></div>
+          <div class="stat rules"><span>Reglas</span><b id="sym-rules">–</b></div>
+        </div>
+
+        <div class="panel chart-panel">
+          <div class="chart-top">
+            <span class="muted small">Mark price · 1s</span>
+            <span class="legend" id="chart-legend"></span>
+          </div>
+          <div class="chart-wrap"><canvas id="chart"></canvas><div id="chart-tip" class="chart-tip" hidden></div></div>
+        </div>
+
+        <div class="cards" id="cards">
+          <div class="card"><span>Balance de margen</span><b id="k-margin">–</b><small id="k-wallet"></small></div>
+          <div class="card"><span>Disponible</span><b id="k-avail">–</b><small id="k-mode"></small></div>
+          <div class="card"><span>PnL no realizado</span><b id="k-upnl">–</b><small id="k-pos"></small></div>
+          <div class="card"><span>PnL realizado</span><b id="k-rpnl">–</b><small id="k-fees"></small></div>
+          <div class="card"><span>Win rate</span><b id="k-wr">–</b><small id="k-wl"></small></div>
+          <div class="card"><span>Bots Grid</span><b id="k-grids">–</b><small id="k-gridpnl"></small></div>
+        </div>
+      </section>
+
+      <aside class="panel trade-panel">
+        <div class="seg big" id="trade-tabs">
+          <button data-tab="open" class="active">Abrir posición</button>
+          <button data-tab="grid">Bot Grid</button>
+        </div>
+
+        <!-- Abrir -->
+        <form id="open-form" class="trade-form" autocomplete="off">
+          <div class="row-between">
+            <div class="seg small" id="ord-type">
+              <button type="button" data-type="MARKET" class="active">Mercado</button>
+              <button type="button" data-type="LIMIT">Límite</button>
+            </div>
+            <button type="button" class="chip" id="open-lev">–x</button>
+          </div>
+          <label class="field" id="limit-field" hidden><span>Precio</span>
+            <input id="open-price" type="number" step="any" inputmode="decimal"><em>USDT</em></label>
+          <label class="field"><span>Tamaño</span>
+            <input id="open-amount" type="number" step="any" inputmode="decimal" placeholder="0">
+            <select id="open-mode" aria-label="Unidad del tamaño">
+              <option value="notional">USDT</option>
+              <option value="margin">Margen</option>
+              <option value="qty">Cantidad</option>
+            </select>
+          </label>
+          <div class="pct-row" id="pct-row">
+            <button type="button" data-pct="10">10%</button><button type="button" data-pct="25">25%</button>
+            <button type="button" data-pct="50">50%</button><button type="button" data-pct="75">75%</button>
+            <button type="button" data-pct="100">100%</button>
+          </div>
+          <label class="check"><input type="checkbox" id="open-tpsl"> TP / SL</label>
+          <div id="tpsl-fields" hidden>
+            <label class="field"><span>Take Profit</span><input id="open-tp" type="number" step="any" placeholder="Precio"><em>USDT</em></label>
+            <label class="field"><span>Stop Loss</span><input id="open-sl" type="number" step="any" placeholder="Precio"><em>USDT</em></label>
+            <div class="pct-row compact" id="roe-row">
+              <span class="muted small">ROE objetivo:</span>
+              <button type="button" data-roe="10">10%</button><button type="button" data-roe="25">25%</button>
+              <button type="button" data-roe="50">50%</button><button type="button" data-roe="100">100%</button>
+            </div>
+          </div>
+          <dl class="est" id="open-est">
+            <div><dt>Disponible</dt><dd id="est-avail">–</dd></div>
+            <div><dt>Notional</dt><dd id="est-notional">–</dd></div>
+            <div><dt>Margen</dt><dd id="est-margin">–</dd></div>
+            <div><dt>Cantidad aprox.</dt><dd id="est-qty">–</dd></div>
+          </dl>
+          <div class="buy-sell">
+            <button type="button" class="btn btn-buy" id="btn-long">Comprar / Long</button>
+            <button type="button" class="btn btn-sell" id="btn-short">Vender / Short</button>
+          </div>
+          <p class="muted small center-text">Órdenes por WebSocket API con autocorrección de errores.</p>
+        </form>
+
+        <!-- Grid -->
+        <form id="grid-form" class="trade-form" autocomplete="off" hidden>
+          <div class="seg small" id="grid-mode">
+            <button type="button" data-mode="LONG">Long</button>
+            <button type="button" data-mode="NEUTRAL" class="active">Neutral</button>
+            <button type="button" data-mode="SHORT">Short</button>
+          </div>
+          <div class="row-2">
+            <label class="field"><span>Precio inferior</span><input id="g-lower" type="number" step="any"></label>
+            <label class="field"><span>Precio superior</span><input id="g-upper" type="number" step="any"></label>
+          </div>
+          <div class="pct-row compact" id="g-range">
+            <span class="muted small">Rango auto:</span>
+            <button type="button" data-range="3">±3%</button><button type="button" data-range="5">±5%</button>
+            <button type="button" data-range="10">±10%</button><button type="button" data-range="20">±20%</button>
+          </div>
+          <div class="row-2">
+            <label class="field"><span>Grids</span><input id="g-grids" type="number" min="2" max="150" value="20"></label>
+            <label class="field"><span>Espaciado</span>
+              <select id="g-spacing"><option value="ARITHMETIC">Aritmético</option><option value="GEOMETRIC">Geométrico</option></select>
+            </label>
+          </div>
+          <div class="row-2">
+            <label class="field"><span>Inversión</span><input id="g-invest" type="number" step="any" placeholder="USDT"></label>
+            <label class="field"><span>Leverage</span><input id="g-lev" type="number" min="1" max="125" value="5"></label>
+          </div>
+          <details class="adv">
+            <summary>Avanzado (trigger, TP/SL del bot)</summary>
+            <div class="row-2">
+              <label class="field"><span>Stop loss</span><input id="g-sl" type="number" step="any" placeholder="opcional"></label>
+              <label class="field"><span>Take profit</span><input id="g-tp" type="number" step="any" placeholder="opcional"></label>
+            </div>
+            <label class="field"><span>Precio de activación</span><input id="g-trigger" type="number" step="any" placeholder="opcional"></label>
+            <label class="check"><input type="checkbox" id="g-close" checked> Cerrar la posición al detener</label>
+            <label class="check"><input type="checkbox" id="g-postonly"> Solo maker (post-only)</label>
+          </details>
+          <div class="preview" id="grid-preview"><p class="muted small">Completa el formulario para ver la vista previa.</p></div>
+          <button type="button" class="btn btn-primary btn-block" id="grid-create">Crear bot Grid</button>
+        </form>
+      </aside>
+    </main>
+
+    <!-- ── Pestañas inferiores ─────────────────────────────── -->
+    <section class="panel bottom">
+      <div class="tabs" id="tabs">
+        <button data-tab="positions" class="active">Posiciones <i id="n-positions">0</i></button>
+        <button data-tab="orders">Órdenes abiertas <i id="n-orders">0</i></button>
+        <button data-tab="grids">Bots Grid <i id="n-grids">0</i></button>
+        <button data-tab="history">Historial</button>
+        <button data-tab="signals">Señales</button>
+        <button data-tab="errors">Errores <i id="n-errors" class="warn">0</i></button>
+        <button data-tab="system">Sistema</button>
+        <span class="tabs-spacer"></span>
+        <label class="check small only-sym"><input type="checkbox" id="only-sym"> Solo símbolo actual</label>
+      </div>
+
+      <div class="tab-body" data-body="positions">
+        <div class="table-actions"><button class="btn btn-ghost btn-sm" id="close-all-btn">Cerrar todas las posiciones</button></div>
+        <div class="table-wrap"><table class="tbl" id="tbl-positions"></table></div>
+      </div>
+      <div class="tab-body" data-body="orders" hidden>
+        <div class="table-wrap"><table class="tbl" id="tbl-orders"></table></div>
+      </div>
+      <div class="tab-body" data-body="grids" hidden>
+        <div class="grid-cards" id="grid-cards"></div>
+      </div>
+      <div class="tab-body" data-body="history" hidden>
+        <div class="table-actions">
+          <span class="muted small" id="hist-summary"></span>
+          <button class="btn btn-ghost btn-sm" id="clear-history-btn">Borrar historial</button>
+        </div>
+        <div class="table-wrap"><table class="tbl" id="tbl-history"></table></div>
+      </div>
+      <div class="tab-body" data-body="signals" hidden>
+        <div class="mini-cards" id="signal-cards"></div>
+        <div class="table-wrap"><table class="tbl" id="tbl-signals"></table></div>
+      </div>
+      <div class="tab-body" data-body="errors" hidden>
+        <div class="errors-layout">
+          <div class="err-reader panel-inner">
+            <h4>Lector de códigos de error</h4>
+            <form id="err-lookup" class="inline-form">
+              <input id="err-code" placeholder="Ej. -2019, -1111, 418" autocomplete="off">
+              <button class="btn btn-primary btn-sm" type="submit">Explicar</button>
+            </form>
+            <div id="err-result" class="err-result"><p class="muted small">Escribe un código de Binance para ver qué significa, por qué ocurre y cómo lo soluciona el executor.</p></div>
+            <button class="btn btn-ghost btn-sm" id="err-catalog-btn">Ver catálogo completo</button>
+          </div>
+          <div class="err-journal">
+            <div class="table-actions">
+              <span class="muted small" id="err-summary"></span>
+              <button class="btn btn-ghost btn-sm" id="clear-errors-btn">Limpiar</button>
+            </div>
+            <div id="err-list" class="err-list"></div>
+          </div>
+        </div>
+      </div>
+      <div class="tab-body" data-body="system" hidden>
+        <div class="sys-grid" id="sys-grid"></div>
+        <div class="table-actions">
+          <span class="muted small">Registro en vivo</span>
+          <span>
+            <button class="btn btn-ghost btn-sm" id="sync-btn">Resincronizar cuenta</button>
+            <button class="btn btn-ghost btn-sm" id="sync-orders-btn">Releer órdenes</button>
+            <button class="btn btn-ghost btn-sm" id="exinfo-btn">Actualizar exchangeInfo</button>
+          </span>
+        </div>
+        <pre class="logbox" id="logbox"></pre>
+      </div>
+    </section>
+
+    <footer class="foot muted small" id="foot"></footer>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="modal" class="modal" hidden>
+    <div class="modal-box" role="dialog" aria-modal="true">
+      <header><h3 id="modal-title"></h3><button class="icon-btn" id="modal-x" aria-label="Cerrar">✕</button></header>
+      <div class="modal-body" id="modal-body"></div>
+      <footer id="modal-foot"></footer>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
