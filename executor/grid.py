@@ -34,7 +34,7 @@ from .account import OrderUpdate
 from .core import Core
 from .errors import BinanceAPIError, ErrorDoctor
 from .orders import OrderContext, OrderExecutor
-from .precision import D, ceil_step, decimals_of, floor_step, fmt, safe_float
+from .precision import D, ceil_step, decimals_of, floor_step, fmt, parse_bool, safe_float
 from .storage import JsonStore
 
 log = logging.getLogger("executor.grid")
@@ -47,6 +47,10 @@ MAKER_FEE = 0.0002
 
 class GridError(ValueError):
     """Configuración de grid inválida (mensaje listo para el usuario)."""
+
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -80,8 +84,8 @@ class GridConfig:
                 stop_loss=float(data.get("stop_loss") or 0),
                 take_profit=float(data.get("take_profit") or 0),
                 trigger_price=float(data.get("trigger_price") or 0),
-                close_on_stop=bool(data.get("close_on_stop", True)),
-                post_only=bool(data.get("post_only", False)),
+                close_on_stop=parse_bool(data.get("close_on_stop"), True),
+                post_only=parse_bool(data.get("post_only"), False),
             )
         except (TypeError, ValueError) as exc:
             raise GridError(f"parámetros numéricos inválidos: {exc}") from exc
@@ -324,7 +328,7 @@ class GridManager:
     def detail(self, bot_id: str) -> dict:
         bot = self.bots.get(bot_id)
         if bot is None:
-            raise GridError("grid no encontrado")
+            raise GridError("grid no encontrado", 404)
         return bot.detail(self.core.market.price(bot.symbol))
 
     # ── Diseño del grid ───────────────────────────────────────────────────
@@ -550,7 +554,7 @@ class GridManager:
     async def stop(self, bot_id: str, close_position: Optional[bool] = None, reason: str = "MANUAL") -> GridBot:
         bot = self.bots.get(bot_id)
         if bot is None:
-            raise GridError("grid no encontrado")
+            raise GridError("grid no encontrado", 404)
         if bot.status in ("STOPPED", "ERROR") and not any(c.order_id for c in bot.cells):
             bot.status = "STOPPED"
             return bot
@@ -624,7 +628,7 @@ class GridManager:
     def delete(self, bot_id: str) -> None:
         bot = self.bots.get(bot_id)
         if bot is None:
-            raise GridError("grid no encontrado")
+            raise GridError("grid no encontrado", 404)
         if bot.status in ACTIVE or bot.status == "STOPPING":
             raise GridError("detén el grid antes de eliminarlo")
         del self.bots[bot_id]

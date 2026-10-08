@@ -78,6 +78,7 @@ class FakeBinance:
         app.router.add_get("/fapi/v1/openAlgoOrders", self._rest_open_algos)
         app.router.add_get("/fapi/v1/exchangeInfo", self._rest_exinfo)
         app.router.add_get("/fapi/v1/leverageBracket", self._rest_brackets)
+        app.router.add_get("/fapi/v1/positionSide/dual", self._rest_position_mode)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -356,6 +357,10 @@ class FakeBinance:
         self.leverage[sym] = lev
         self.push({"e": "ACCOUNT_CONFIG_UPDATE", "E": int(time.time() * 1000), "ac": {"s": sym, "l": lev}})
         return web.json_response({"symbol": sym, "leverage": lev, "maxNotionalValue": "1000000"})
+
+    async def _rest_position_mode(self, request: web.Request) -> web.Response:
+        self.rest_calls.append("positionSide")
+        return web.json_response({"dualSidePosition": self.hedge})
 
     async def _rest_open_orders(self, request: web.Request) -> web.Response:
         self.rest_calls.append("openOrders")

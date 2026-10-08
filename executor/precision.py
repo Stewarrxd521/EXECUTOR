@@ -32,6 +32,26 @@ def D(value: Number) -> Decimal:
         raise ValueError(f"número inválido: {value!r}") from exc
 
 
+_TRUE = {"1", "true", "yes", "y", "si", "sí", "s", "on", "t"}
+_FALSE = {"0", "false", "no", "n", "off", "f", "", "none", "null"}
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    """Booleano tolerante: acepta bool, números y textos ('true', 'false', '0', 'sí'...)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    return default
+
+
 def safe_float(value, default: float = 0.0) -> float:
     try:
         out = float(value)
