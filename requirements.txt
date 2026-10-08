@@ -1,4 +1,10 @@
+# Executor (futures_executor.py + paquete executor/)
 aiohttp>=3.9.0
+orjson>=3.9.0
+
+# Otros scripts del repositorio (app.py, WS.py, binance_api_mejorado.py)
+flask>=3.0.0
+websockets>=12.0
 python-binance>=1.0.19
 pandas>=2.0.0
 matplotlib>=3.7.0
