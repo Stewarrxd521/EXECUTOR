@@ -165,6 +165,7 @@ class AccountState:
         self.hedge_hint = hedge_hint
         self.last_sync = 0.0
         self.balance_sync = 0.0  # cuándo se recibió por última vez el saldo USDT (lectura o evento)
+        self.balance_read = 0.0  # cuándo se leyó el saldo completo (incluye el disponible)
         self.last_event = 0.0
         self.version = 0
 
@@ -255,7 +256,7 @@ class AccountState:
             b.available = safe_float(r.get("availableBalance"), b.available)
             b.cross_unpnl = safe_float(r.get("crossUnPnl"), b.cross_unpnl)
             if asset == "USDT":
-                self.balance_sync = time.time()
+                self.balance_sync = self.balance_read = time.time()
         self._touch()
 
     def seed_orders(self, rows: Iterable[dict]) -> None:
@@ -433,4 +434,5 @@ class AccountState:
             "algos": len(self.algos),
             "last_sync": self.last_sync,
             "balance_sync": self.balance_sync,
+            "balance_read": self.balance_read,
         }

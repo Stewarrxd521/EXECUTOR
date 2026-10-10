@@ -154,9 +154,22 @@ class Multiplier:
             return
         names = set(MultiplierState.__dataclass_fields__)
         try:
-            self.state = MultiplierState(**{k: v for k, v in saved.items() if k in names})
+            restored = MultiplierState(**{k: v for k, v in saved.items() if k in names})
         except TypeError:
             return
+        if not restored.updated_ts:
+            # Nunca se ajustó desde el dashboard: la configuración sale del entorno (validada ahora);
+            # del archivo solo se conserva el nivel automático (histéresis) y su historial.
+            env = self.state
+            env.level = min(max(0, int(restored.level or 0)), int(env.max_factor))
+            env.level_balance, env.level_ts, env.history = restored.level_balance, restored.level_ts, restored.history
+            return
+        restored.max_factor = min(MAX_LIMIT, max(1.0, safe_float(restored.max_factor, 10.0)))
+        if not 0 < safe_float(restored.factor) <= restored.max_factor:
+            restored.factor = min(max(safe_float(restored.factor, 1.0), 0.01), restored.max_factor)
+        restored.step_usdt = max(1.0, safe_float(restored.step_usdt, 100.0))
+        restored.level = min(int(restored.level or 0), int(restored.max_factor))
+        self.state = restored
         if self.state.enabled:
             log.info("Multiplicador restaurado: %s", self.describe())
 
@@ -174,8 +187,11 @@ class Multiplier:
         st = self.state
         summary = self._balances() or {}
         bal = self.balance()
-        if bal <= 0 and not summary.get("balance_sync"):
-            # Saldo aún no recibido (arranque, lectura fallida): se conserva el nivel guardado, sin superar el máximo.
+        # El disponible solo llega en la lectura completa del saldo; billetera/margen también por eventos.
+        marker = "balance_read" if st.source == "available" else "balance_sync"
+        if not summary.get(marker):
+            # Saldo aún no recibido (arranque, lectura fallida): se conserva el nivel guardado, sin superar el
+            # máximo. (Con source=margin el PnL no realizado podría parecer saldo: tampoco se usa.)
             capped = auto_level(st.level, 0.0, st.step_usdt, int(st.max_factor))
             if st.level and capped != st.level:
                 st.level = capped

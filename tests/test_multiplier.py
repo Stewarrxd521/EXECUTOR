@@ -52,7 +52,7 @@ class _FakeSettings:
 
 
 def test_multiplier_configure_and_persist(tmp_path):
-    balance = {"wallet": 250.0}
+    balance = {"wallet": 250.0, "balance_sync": 1.0, "balance_read": 1.0}
     events = []
     m = Multiplier(_FakeSettings(tmp_path), lambda: balance, lambda msg, lvl: events.append(msg))
     assert m.effective() == 1.0
@@ -242,18 +242,19 @@ async def test_close_all_does_not_close_opens_received_after_it(open_service, fa
 
 
 def test_max_factor_caps_auto_level_without_balance(tmp_path):
-    balance = {"wallet": 1000.0}
+    balance = {"wallet": 1000.0, "balance_sync": 1.0}
     m = Multiplier(_FakeSettings(tmp_path), lambda: balance)
     m.configure({"enabled": True, "mode": "auto"})
     assert m.effective() == 10.0
-    balance["wallet"] = 0.0
+    balance.update(wallet=0.0, balance_sync=0.0)  # saldo desconocido (p. ej. tras reiniciar)
     m.configure({"max_factor": 3})
     assert m.effective() == 3.0 and m.view()["effective"] == 3.0
 
 
 def test_invalid_env_values_fall_back_to_defaults(tmp_path):
     m = Multiplier(_FakeSettings(tmp_path, multiplier_mode="auto", multiplier_step_usdt=0.0,
-                                 multiplier_max=float("nan"), multiplier_factor=-2), lambda: {"wallet": 250})
+                                 multiplier_max=float("nan"), multiplier_factor=-2),
+                   lambda: {"wallet": 250, "balance_sync": 1.0})
     assert m.state.step_usdt == 100.0 and m.state.max_factor == 10.0 and m.state.factor == 1.0
     assert m.effective() == 2.0
 
@@ -269,16 +270,46 @@ async def test_ws_api_connect_failure_is_retryable_error():
 
 
 def test_known_zero_balance_drops_to_x1(tmp_path):
-    summary = {"available": 800.0, "balance_sync": 0.0}
+    summary = {"available": 800.0, "balance_sync": 1.0, "balance_read": 1.0}
     m = Multiplier(_FakeSettings(tmp_path), lambda: summary)
     m.configure({"enabled": True, "mode": "auto", "source": "available"})
     assert m.effective() == 8.0
-    summary["available"] = 0.0          # aún sin sincronizar: se conserva el nivel
+    summary.update(available=0.0, balance_read=0.0)   # solo llegó un evento (sin disponible): se conserva
     assert m.effective() == 8.0
-    summary["balance_sync"] = 1.0       # saldo confirmado en 0 → x1
+    summary["balance_read"] = 2.0                      # lectura completa confirma 0 → x1
     assert m.effective() == 1.0
     summary["available"] = 250.0
     assert m.effective() == 2.0
+
+
+def test_margin_source_ignores_unrealized_pnl_until_balance_arrives(tmp_path):
+    summary = {"margin_balance": 1000.0, "balance_sync": 1.0}
+    m = Multiplier(_FakeSettings(tmp_path), lambda: summary)
+    m.configure({"enabled": True, "mode": "auto", "source": "margin", "step_usdt": 200})
+    assert m.effective() == 5.0
+    summary.update(margin_balance=12.5, balance_sync=0.0)  # reinicio: solo PnL abierto, saldo sin leer
+    assert m.effective() == 5.0
+
+
+def test_old_persisted_state_without_dashboard_changes_uses_env(tmp_path):
+    import json
+    (tmp_path / "multiplier.json").write_text(json.dumps({
+        "state": {"enabled": True, "mode": "auto", "factor": 1.0, "step_usdt": 100.0, "max_factor": 10.0,
+                  "source": "wallet", "level": 7, "updated_ts": 0},
+        "env": {"mode": "auto", "factor": 1.0, "step": 100.0, "max": 0.5, "source": "wallet"}}))
+    m = Multiplier(_FakeSettings(tmp_path, multiplier_mode="auto", multiplier_max=0.5),
+                   lambda: {"wallet": 5000, "balance_sync": 1.0})
+    m.load()
+    assert m.state.max_factor == 1.0 and m.effective() == 1.0
+
+
+def test_sync_quantity_is_proportional_and_reversible():
+    from executor.trading import Trade
+    tr = Trade(id=1, symbol="ETHUSDT", direction="SHORT", entry_price=3000, quantity=0.03, open_time="",
+               leverage=5, bot_quantity=0.01, multiplier=3.0)
+    tr.sync_quantity(0.02)   # lectura atrasada
+    tr.sync_quantity(0.03)   # lectura correcta
+    assert tr.bot_quantity == pytest.approx(0.01)
 
 
 def test_env_out_of_range_values_are_bounded(tmp_path):
@@ -352,3 +383,17 @@ def test_external_reduction_shrinks_bot_quantity():
                leverage=5, bot_quantity=0.01, multiplier=3.0)
     tr.sync_quantity(0.015)  # se cerró la mitad desde la app de Binance
     assert tr.quantity == 0.015 and tr.bot_quantity == pytest.approx(0.005)
+
+
+async def test_partial_close_with_unknown_status_is_not_repeated(open_service, fake):
+    t = open_service.trades
+    t.handle_signal({"action": "open", "trade_id": 88, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.03})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    fake.inject_after.append(("order.place", -1007, "Timeout waiting for response from backend server."))
+    for _ in range(3):
+        fake.inject.append(("order.status", -1006, "An unexpected response was received from the message bus."))
+    t.handle_signal({"action": "close", "trade_id": 88, "symbol": "ETHUSDT", "direction": "SHORT",
+                     "quantity": 0.01, "reason": "PARTIAL"})
+    await asyncio.sleep(4)
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == pytest.approx(-0.02)  # nunca -0.01 (cierre doble)

@@ -150,9 +150,13 @@ class Trade:
         return data
 
     def sync_quantity(self, real_qty: float) -> None:
-        """Ajusta la cantidad a la real; una reducción externa reduce también la del bot."""
-        if real_qty < self.quantity and self.bot_quantity > 0:
-            self.bot_quantity = max(0.0, self.bot_quantity - (self.quantity - real_qty) / (self.multiplier or 1.0))
+        """Ajusta la cantidad a la real conservando la proporción bot/real.
+
+        Proporcional y reversible: una lectura atrasada que muestra menos cantidad y
+        la lectura correcta posterior dejan ``bot_quantity`` como estaba.
+        """
+        if self.quantity > 0 and self.bot_quantity > 0 and real_qty >= 0:
+            self.bot_quantity = self.bot_quantity * real_qty / self.quantity
         self.quantity = real_qty
 
     def note_tranche_scale(self, factor: float, bot_qty: float, real_qty: float) -> None:
@@ -1306,7 +1310,11 @@ class TradeManager:
                             if attempt == 0:
                                 qty = min(pos2.qty, qty) if partial else pos2.qty
                                 continue
-                        retryable = diag.action in (Action.RETRY, Action.CHECK_STATUS)
+                        # RETRY = Binance no procesó la orden → reintento seguro. CHECK_STATUS = pudo
+                        # ejecutarse: solo se reintenta un cierre total (relee la posición); un parcial
+                        # repetido cerraría de más.
+                        retryable = diag.action == Action.RETRY or (diag.action == Action.CHECK_STATUS
+                                                                    and not partial)
                         self._close_retryable[key] = retryable
                         if alert or not retryable:
                             self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",
@@ -1316,9 +1324,11 @@ class TradeManager:
                         return False
                 if partial:
                     done = filled or qty
-                    trade.quantity = max(0.0, base - done)
+                    if base < trade.quantity:
+                        trade.sync_quantity(base)  # reducción externa aún no registrada
                     if trade.bot_quantity > 0:
                         trade.bot_quantity = max(0.0, trade.bot_quantity - done / (trade.multiplier or 1.0))
+                    trade.quantity = max(0.0, base - done)
                     self.save()
                     self.core.bus.emit("partial_close", f"Cierre parcial {trade.symbol}: {filled or qty:g}", "info")
                     return True
