@@ -164,6 +164,7 @@ class AccountState:
         self.hedge_mode: Optional[bool] = None
         self.hedge_hint = hedge_hint
         self.last_sync = 0.0
+        self.balance_sync = 0.0  # cuándo se recibió por última vez el saldo USDT (lectura o evento)
         self.last_event = 0.0
         self.version = 0
 
@@ -253,6 +254,8 @@ class AccountState:
             b.cross_wallet = safe_float(r.get("crossWalletBalance"), b.cross_wallet)
             b.available = safe_float(r.get("availableBalance"), b.available)
             b.cross_unpnl = safe_float(r.get("crossUnPnl"), b.cross_unpnl)
+            if asset == "USDT":
+                self.balance_sync = time.time()
         self._touch()
 
     def seed_orders(self, rows: Iterable[dict]) -> None:
@@ -299,6 +302,8 @@ class AccountState:
             bal = self.balances.setdefault(b.get("a", ""), Balance(b.get("a", "")))
             bal.wallet = safe_float(b.get("wb"), bal.wallet)
             bal.cross_wallet = safe_float(b.get("cw"), bal.cross_wallet)
+            if b.get("a") == "USDT":
+                self.balance_sync = time.time()
         changed = []
         for p in a.get("P", []):
             sym, side = p.get("s", ""), p.get("ps", "BOTH")
@@ -427,4 +432,5 @@ class AccountState:
             "orders": len(self.orders),
             "algos": len(self.algos),
             "last_sync": self.last_sync,
+            "balance_sync": self.balance_sync,
         }

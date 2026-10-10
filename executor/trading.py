@@ -149,6 +149,12 @@ class Trade:
         data["pnl_diff"] = (self.pnl_usdt - self.bot_pnl * mult) if self.has_bot_pnl else None
         return data
 
+    def sync_quantity(self, real_qty: float) -> None:
+        """Ajusta la cantidad a la real; una reducción externa reduce también la del bot."""
+        if real_qty < self.quantity and self.bot_quantity > 0:
+            self.bot_quantity = max(0.0, self.bot_quantity - (self.quantity - real_qty) / (self.multiplier or 1.0))
+        self.quantity = real_qty
+
     def note_tranche_scale(self, factor: float, bot_qty: float, real_qty: float) -> None:
         """Acumula la cantidad pedida por el bot y recalcula el factor medio del trade."""
         factor = factor or 1.0
@@ -227,6 +233,7 @@ class TradeManager:
         self._unauth_warned: OrderedDict = OrderedDict()
         self._unknown_open: dict[tuple[str, str], float] = {}
         self._open_alerts: dict[str, float] = {}
+        self._close_retryable: dict[tuple[str, str], bool] = {}
         self._reconciling: set[tuple[str, str]] = set()
         self._skipped_closed: dict[str, float] = {}
         self._recent_closed: dict[tuple[int, str, str], float] = {}
@@ -821,18 +828,25 @@ class TradeManager:
                             bot_pnl: Optional[float], prior_opens: Optional[list] = None) -> dict:
         """Cierre por señal. Un error inesperado (p. ej. sin conexión) se reintenta: un
         cierre perdido deja la posición abierta."""
-        for attempt, delay in enumerate((0.0, 3.0, 10.0)):
+        delays = (0.0, 3.0, 10.0)
+        for attempt, delay in enumerate(delays):
             if delay:
                 await asyncio.sleep(delay)
+            final = attempt == len(delays) - 1
             try:
                 result = await self._signal_close_once(sig, reason, close_price, quantity, bot_pnl,
-                                                       prior_opens if attempt == 0 else None)
+                                                       prior_opens if attempt == 0 else None, final=final)
             except Exception as exc:
                 log.exception("Cierre %s %s (trade_id %s) falló (intento %d)", sig.symbol, sig.direction,
                               sig.trade_id, attempt + 1)
                 last = f"{type(exc).__name__}: {exc}"
                 continue
-            return result  # un rechazo de Binance ya se avisa en close_trade (close_failed + Telegram)
+            if result.get("retryable"):  # sin conexión / estado desconocido: se relee y se reintenta
+                log.warning("Cierre %s %s (trade_id %s): fallo transitorio, reintento %d", sig.symbol,
+                            sig.direction, sig.trade_id, attempt + 1)
+                last = result.get("detail", "fallo transitorio")
+                continue
+            return result  # un rechazo definitivo de Binance ya se avisa en close_trade (close_failed + Telegram)
         self.status["signals_rejected"] += 1
         self._log_signal("close", sig.symbol, sig.direction, False, f"no se pudo cerrar: {last}", sig)
         self._alert_close_failed(sig, last)
@@ -846,7 +860,8 @@ class TradeManager:
                                 f"{why}\nRevisa la posición en Binance")
 
     async def _signal_close_once(self, sig: Signal, reason: str, close_price: float, quantity: float,
-                                 bot_pnl: Optional[float], prior_opens: Optional[list] = None) -> dict:
+                                 bot_pnl: Optional[float], prior_opens: Optional[list] = None,
+                                 final: bool = True) -> dict:
         symbol, direction = sig.symbol, sig.direction or None
         await self._await_ready()
         await self._wait_tasks(prior_opens or [])  # solo las aperturas aceptadas antes que este close
@@ -860,8 +875,11 @@ class TradeManager:
             if quantity and (trade.multiplier or 1.0) != 1.0:
                 # Cierre parcial: la cantidad del bot se escala con el factor que recibió la operación.
                 quantity *= trade.multiplier
+            self._close_retryable.pop(trade.key, None)
             ok = await self.close_trade(trade, reason, close_price=close_price, max_qty=quantity or None,
-                                        bot_pnl=bot_pnl, closed_by="signal")
+                                        bot_pnl=bot_pnl, closed_by="signal", alert=final)
+            if not ok and not final and self._close_retryable.pop(trade.key, False):
+                return {"ok": False, "retryable": True, "detail": "fallo transitorio de conexión con Binance"}
             detail = "cerrada" if ok else "error al cerrar (ver pestaña Errores)"
             if ok and not quantity:
                 self._note_closed(sig.trade_id, trade.symbol, trade.direction)
@@ -1232,7 +1250,7 @@ class TradeManager:
 
     async def close_trade(self, trade: Trade, reason: str, close_price: float = 0.0,
                           max_qty: Optional[float] = None, bot_pnl: Optional[float] = None,
-                          closed_by: str = "signal") -> bool:
+                          closed_by: str = "signal", alert: bool = True) -> bool:
         key = trade.key
         if key in self._closing or self.trades.get(key) is not trade:
             return False
@@ -1267,6 +1285,7 @@ class TradeManager:
                     qty = min(rounded, base)
                     partial = qty < base - step / 2
                 if not partial:
+                    qty = base  # cierre total: la cantidad real exacta (nunca una fracción del step)
                     await self.orders.cancel_protection(trade.symbol, trade.direction)
                 side = "SELL" if trade.direction == "LONG" else "BUY"
                 ctx = OrderContext(trade.symbol, side, trade.direction, "close", rules, reduce_only=True)
@@ -1287,10 +1306,13 @@ class TradeManager:
                             if attempt == 0:
                                 qty = min(pos2.qty, qty) if partial else pos2.qty
                                 continue
-                        self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",
-                                           symbol=trade.symbol, code=diag.code, solution=diag.info.solution)
-                        self.core.telegram.send(f"⚠️ <b>No se pudo cerrar</b> <code>{trade.symbol}</code>\n"
-                                                f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
+                        retryable = diag.action in (Action.RETRY, Action.CHECK_STATUS)
+                        self._close_retryable[key] = retryable
+                        if alert or not retryable:
+                            self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",
+                                               symbol=trade.symbol, code=diag.code, solution=diag.info.solution)
+                            self.core.telegram.send(f"⚠️ <b>No se pudo cerrar</b> <code>{trade.symbol}</code>\n"
+                                                    f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
                         return False
                 if partial:
                     done = filled or qty
@@ -1470,7 +1492,7 @@ class TradeManager:
             if pos is None:
                 self._schedule_external_check(trade)
             elif abs(pos.qty - trade.quantity) > 1e-12 and not self._lock(symbol).locked():
-                trade.quantity = pos.qty
+                trade.sync_quantity(pos.qty)
                 if pos.entry_price:
                     trade.entry_price = pos.entry_price
                 self.save()
@@ -1527,7 +1549,7 @@ class TradeManager:
             if pos is None:
                 self._schedule_external_check(trade)
             elif abs(pos.qty - trade.quantity) > 1e-12:
-                trade.quantity = pos.qty
+                trade.sync_quantity(pos.qty)
                 trade.entry_price = pos.entry_price or trade.entry_price
 
     # ── Acciones manuales ─────────────────────────────────────────────────

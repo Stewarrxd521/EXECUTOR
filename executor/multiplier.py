@@ -110,10 +110,15 @@ class Multiplier:
         s = self.settings
 
         def valid(value: float, default: float, low: float, high: float, name: str) -> float:
-            if isinstance(value, (int, float)) and math.isfinite(value) and low <= value <= high:
-                return float(value)
-            log.warning("%s=%r no es válido (entre %g y %g); se usa %g", name, value, low, high, default)
-            return default
+            """Valores fuera de rango se acotan (un tope bajo nunca se vuelve permisivo); no numéricos → defecto."""
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                log.warning("%s=%r no es un número; se usa %g", name, value, default)
+                return default
+            if value < low or value > high:
+                bounded = min(high, max(low, float(value)))
+                log.warning("%s=%r fuera de rango (%g-%g); se usa %g", name, value, low, high, bounded)
+                return bounded
+            return float(value)
 
         if s.multiplier_mode not in MODES + ("off", ""):
             log.warning("MULTIPLIER_MODE=%r no es válido (off, manual o auto); multiplicador desactivado",
@@ -121,8 +126,17 @@ class Multiplier:
         mode = s.multiplier_mode if s.multiplier_mode in MODES else "manual"
         source = s.multiplier_source if s.multiplier_source in SOURCES else "wallet"
         max_factor = valid(s.multiplier_max, 10.0, 1.0, MAX_LIMIT, "MULTIPLIER_MAX")
-        factor = valid(s.multiplier_factor, 1.0, 0.01, max_factor, "MULTIPLIER")
-        step = valid(s.multiplier_step_usdt, 100.0, 1.0, 1e9, "MULTIPLIER_STEP_USDT")
+        factor = s.multiplier_factor
+        if not isinstance(factor, (int, float)) or not math.isfinite(factor) or factor <= 0:
+            log.warning("MULTIPLIER=%r no es válido (mayor que 0); se usa 1", factor)
+            factor = 1.0
+        elif factor > max_factor:
+            log.warning("MULTIPLIER=%r supera MULTIPLIER_MAX=%g; se usa %g", factor, max_factor, max_factor)
+            factor = max_factor
+        step = s.multiplier_step_usdt
+        if not isinstance(step, (int, float)) or not math.isfinite(step) or step < 1:
+            log.warning("MULTIPLIER_STEP_USDT=%r no es válido (mínimo 1); se usa 100", step)
+            step = 100.0
         return MultiplierState(enabled=s.multiplier_mode in MODES, mode=mode, factor=factor, step_usdt=step,
                                max_factor=max_factor, source=source)
 
@@ -160,8 +174,8 @@ class Multiplier:
         st = self.state
         summary = self._balances() or {}
         bal = self.balance()
-        if bal <= 0 and not summary.get("last_sync"):
-            # Balance aún desconocido (sin sincronizar): se conserva el nivel guardado, sin superar el máximo.
+        if bal <= 0 and not summary.get("balance_sync"):
+            # Saldo aún no recibido (arranque, lectura fallida): se conserva el nivel guardado, sin superar el máximo.
             capped = auto_level(st.level, 0.0, st.step_usdt, int(st.max_factor))
             if st.level and capped != st.level:
                 st.level = capped

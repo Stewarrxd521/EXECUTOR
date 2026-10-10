@@ -269,13 +269,86 @@ async def test_ws_api_connect_failure_is_retryable_error():
 
 
 def test_known_zero_balance_drops_to_x1(tmp_path):
-    summary = {"available": 800.0, "last_sync": 0.0}
+    summary = {"available": 800.0, "balance_sync": 0.0}
     m = Multiplier(_FakeSettings(tmp_path), lambda: summary)
     m.configure({"enabled": True, "mode": "auto", "source": "available"})
     assert m.effective() == 8.0
     summary["available"] = 0.0          # aún sin sincronizar: se conserva el nivel
     assert m.effective() == 8.0
-    summary["last_sync"] = 1.0          # saldo confirmado en 0 → x1
+    summary["balance_sync"] = 1.0       # saldo confirmado en 0 → x1
     assert m.effective() == 1.0
     summary["available"] = 250.0
     assert m.effective() == 2.0
+
+
+def test_env_out_of_range_values_are_bounded(tmp_path):
+    lo = Multiplier(_FakeSettings(tmp_path, multiplier_mode="auto", multiplier_max=0.5), lambda: {"wallet": 5000})
+    assert lo.state.max_factor == 1.0 and lo.effective() == 1.0  # un tope bajo nunca se vuelve x10
+    hi = Multiplier(_FakeSettings(tmp_path, multiplier_mode="manual", multiplier_factor=20), lambda: {})
+    assert hi.effective() == 10.0
+
+
+async def test_failed_balance_read_keeps_restored_level(fake, tmp_path, snapshot_file):
+    svc = ExecutorService(legacy_settings(fake, tmp_path))
+    await svc.start()
+    await wait_for(lambda: svc.trades.ready.is_set() and svc.core.account.usdt().wallet > 0)
+    svc.multiplier.configure({"enabled": True, "mode": "auto", "step_usdt": 2000})
+    assert svc.multiplier.effective() == 5.0
+    await svc.stop()
+    # Reinicio con la lectura de saldo fallando: se conserva x5 (no es un saldo 0 confirmado).
+    for _ in range(9):
+        fake.inject.append(("v2/account.balance", -1001, "Internal error; unable to process your request."))
+    svc2 = ExecutorService(legacy_settings(fake, tmp_path))
+    events = []
+    svc2.core.bus.subscribe(lambda e: events.append(e))
+    await svc2.start()
+    try:
+        await wait_for(lambda: svc2.trades.ready.is_set())
+        assert svc2.core.account.usdt().wallet == 0.0
+        assert svc2.multiplier.effective() == 5.0
+        assert not [e for e in events if e["kind"] == "multiplier"]
+    finally:
+        await svc2.stop()
+
+
+async def test_near_full_close_quantity_uses_real_position(open_service, fake):
+    t = open_service.trades
+    open_service.multiplier.configure({"enabled": True, "mode": "manual", "factor": 3})
+    t.handle_signal({"action": "open", "trade_id": 86, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.0035})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    step = open_service.core.exinfo.get("ETHUSDT").step_size
+    t.handle_signal({"action": "close", "trade_id": 86, "symbol": "ETHUSDT", "direction": "SHORT",
+                     "quantity": 0.0035, "reason": "TP"})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is None)
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0
+    assert open_service.core.exinfo.get("ETHUSDT").step_size == step
+
+
+async def test_close_retries_through_short_ws_outage(open_service, fake, monkeypatch):
+    from executor.errors import BinanceAPIError
+    t = open_service.trades
+    t.handle_signal({"action": "open", "trade_id": 87, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    original = open_service.orders.market
+    calls = {"n": 0}
+
+    async def flaky_market(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise BinanceAPIError(-1, "ws-api: sin conexión: ConnectionRefusedError()", method="order.place")
+        return await original(*a, **k)
+
+    monkeypatch.setattr(open_service.orders, "market", flaky_market)
+    t.handle_signal({"action": "close", "trade_id": 87, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "SL"})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is None, timeout=12)
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0 and calls["n"] >= 2
+
+
+def test_external_reduction_shrinks_bot_quantity():
+    from executor.trading import Trade
+    tr = Trade(id=1, symbol="ETHUSDT", direction="SHORT", entry_price=3000, quantity=0.03, open_time="",
+               leverage=5, bot_quantity=0.01, multiplier=3.0)
+    tr.sync_quantity(0.015)  # se cerró la mitad desde la app de Binance
+    assert tr.quantity == 0.015 and tr.bot_quantity == pytest.approx(0.005)
