@@ -180,7 +180,7 @@ class AccountState:
         self.last_event = time.time()
 
     # ── Snapshots por WS API ──────────────────────────────────────────────
-    def apply_positions_snapshot(self, rows: Iterable[dict]) -> None:
+    def _parse_position_rows(self, rows: Iterable[dict]) -> dict[tuple[str, str], Position]:
         rows = list(rows)
         sides = {r.get("positionSide") for r in rows}
         if sides & {"LONG", "SHORT"}:
@@ -211,8 +211,36 @@ class AccountState:
                 isolated_wallet=safe_float(r.get("isolatedWallet") or r.get("isolatedMargin")),
                 liquidation_price=safe_float(r.get("liquidationPrice")),
             )
+        return fresh
+
+    def apply_positions_snapshot(self, rows: Iterable[dict], as_of: Optional[float] = None) -> None:
+        """Reemplaza las posiciones con un snapshot de ``account.position``.
+
+        ``as_of`` es el instante en que se PIDIÓ el snapshot: las posiciones que
+        el user stream actualizó después (p. ej. una apertura que se llenó
+        mientras la respuesta viajaba) se conservan en vez de pisarse con datos
+        viejos.
+        """
+        fresh = self._parse_position_rows(rows)
+        if as_of is not None:
+            for key, pos in self.positions.items():
+                if pos.update_ts > as_of:
+                    fresh[key] = pos
         self.positions = fresh
         self.last_sync = time.time()
+        self._touch()
+
+    def apply_symbol_positions(self, symbol: str, rows: Iterable[dict], as_of: Optional[float] = None) -> None:
+        """Igual que el snapshot completo pero solo para ``symbol``."""
+        symbol = symbol.upper()
+        fresh = {k: v for k, v in self._parse_position_rows(
+            [r for r in rows if r.get("symbol") == symbol]).items()}
+        for key in [k for k in self.positions if k[0] == symbol]:
+            pos = self.positions[key]
+            if as_of is not None and pos.update_ts > as_of and key not in fresh:
+                continue
+            del self.positions[key]
+        self.positions.update(fresh)
         self._touch()
 
     def apply_balances(self, rows: Iterable[dict]) -> None:
@@ -335,6 +363,12 @@ class AccountState:
             self._touch()
 
     # ── Consultas ─────────────────────────────────────────────────────────
+    def mark_updated(self, symbol: str, direction: str) -> None:
+        """Marca la posición como recién actualizada (tras un fill confirmado)."""
+        pos = self.position(symbol, direction)
+        if pos is not None:
+            pos.update_ts = time.time()
+
     def position(self, symbol: str, direction: Optional[str] = None) -> Optional[Position]:
         symbol = symbol.upper()
         if direction:

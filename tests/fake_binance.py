@@ -61,6 +61,7 @@ class FakeBinance:
         self.seq = 1000
         self.user_ws: set[web.WebSocketResponse] = set()
         self.inject: list[tuple[str, int, str]] = []
+        self.inject_after: list = []
         self.requests: list[tuple[str, dict]] = []
         self.rest_calls: list[str] = []
         self._tasks: list[asyncio.Task] = []
@@ -78,6 +79,7 @@ class FakeBinance:
         app.router.add_get("/fapi/v1/openAlgoOrders", self._rest_open_algos)
         app.router.add_get("/fapi/v1/exchangeInfo", self._rest_exinfo)
         app.router.add_get("/fapi/v1/leverageBracket", self._rest_brackets)
+        app.router.add_get("/fapi/v1/positionSide/dual", self._rest_position_mode)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -217,6 +219,10 @@ class FakeBinance:
                         self.inject.pop(i)
                         raise _Err(code, text)
                 result = self._dispatch(method, params)
+                for i, (m, code, text) in enumerate(self.inject_after):
+                    if m == method:  # se ejecuta, pero la respuesta es un error (estado desconocido)
+                        self.inject_after.pop(i)
+                        raise _Err(code, text)
                 await ws.send_str(json.dumps({"id": req["id"], "status": 200, "result": result,
                                               "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE",
                                                               "intervalNum": 1, "limit": 2400, "count": len(self.requests)}]}))
@@ -356,6 +362,10 @@ class FakeBinance:
         self.leverage[sym] = lev
         self.push({"e": "ACCOUNT_CONFIG_UPDATE", "E": int(time.time() * 1000), "ac": {"s": sym, "l": lev}})
         return web.json_response({"symbol": sym, "leverage": lev, "maxNotionalValue": "1000000"})
+
+    async def _rest_position_mode(self, request: web.Request) -> web.Response:
+        self.rest_calls.append("positionSide")
+        return web.json_response({"dualSidePosition": self.hedge})
 
     async def _rest_open_orders(self, request: web.Request) -> web.Response:
         self.rest_calls.append("openOrders")

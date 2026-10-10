@@ -19,6 +19,7 @@ from aiohttp import web
 from executor import __version__
 from executor.config import configure_logging, load_settings
 from executor.service import ExecutorService
+from executor.web.api import build_access_logger
 from executor.web.server import build_app
 
 log = logging.getLogger("executor")
@@ -34,7 +35,8 @@ async def main() -> None:
 
     service = ExecutorService(settings)
     app = build_app(service)
-    runner = web.AppRunner(app, access_log=None)
+    runner = web.AppRunner(app, access_log_class=build_access_logger(settings.trust_proxy),
+                           access_log=logging.getLogger("executor.http"))
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", settings.port)
     await site.start()
@@ -51,6 +53,8 @@ async def main() -> None:
             pass
     await stop.wait()
     log.info("Deteniendo executor…")
+    # Primero se deja de aceptar señales y se terminan las que están en curso
+    # (service.stop drena), y después se cierra el servidor HTTP.
     await service.stop()
     await runner.cleanup()
 

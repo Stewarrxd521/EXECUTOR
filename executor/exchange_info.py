@@ -457,19 +457,25 @@ class ExchangeInfo:
             base = heuristic_rules(symbol, ref_price or 1.0, self.min_notional_floor)
         learned = self._learned.get(symbol)
         if learned:
-            changes = {k: (D(v) if k in _DECIMAL_FIELDS else v) for k, v in learned.items() if k != "_ts"}
+            changes = {k: (D(v) if k in _DECIMAL_FIELDS else v) for k, v in learned.items()
+                       if not k.startswith("_")}
             base = replace(base, **changes, source="learned" if base.source == "heuristic" else base.source)
         return base
 
     def tradable(self, symbol: str) -> tuple[bool, str]:
+        """¿Se permite abrir? Solo se bloquea si Binance CONFIRMÓ en vivo (stream
+        !contractInfo) que el contrato no está en TRADING. Un estado distinto en
+        el snapshot local puede estar desactualizado: ahí decide Binance (como
+        el executor anterior) y el doctor explica el rechazo si lo hay."""
         symbol = symbol.upper()
-        rules = self._rules.get(symbol)
-        if rules is None:
-            if self._rules:
-                return True, "símbolo fuera del snapshot: se usan reglas heurísticas"
-            return True, ""
-        if rules.status != "TRADING":
-            return False, f"{symbol} está en estado {rules.status} (no operable)"
+        learned = self._learned.get(symbol, {})
+        status = learned.get("status") or (self._rules[symbol].status if symbol in self._rules else "TRADING")
+        if status != "TRADING" and learned.get("_status_ts"):
+            return False, f"{symbol} está en estado {status} (confirmado por Binance en vivo)"
+        if symbol not in self._rules:
+            return True, "símbolo fuera del snapshot: se usan reglas heurísticas" if self._rules else ""
+        if status != "TRADING":
+            return True, f"{symbol} figura como {status} en el snapshot local; se intenta igualmente"
         return True, ""
 
     # ── Aprendizaje por errores ───────────────────────────────────────────
@@ -511,11 +517,17 @@ class ExchangeInfo:
         self.meta.contract_updates += 1
         rules = self._rules.get(symbol)
         status = event.get("cs")
-        if rules is None:
-            if status == "TRADING" and self._rules:
+        if status:
+            # Se persiste con marca de tiempo: sobrevive a reinicios y prevalece
+            # sobre el snapshot (más antiguo) hasta que se descargue uno nuevo.
+            entry = self._learned.setdefault(symbol, {})
+            if entry.get("status") != status:
+                entry["status"] = status
+                entry["_status_ts"] = int(event.get("E") or time.time() * 1000)
+                self._save_learned()
+            if rules is None and status == "TRADING" and self._rules:
                 log.info("contractInfo: nuevo contrato %s (no está en el snapshot; reglas heurísticas)", symbol)
-            if status:
-                self._learned.setdefault(symbol, {})["status"] = status
+        if rules is None:
             return
         if status and status != rules.status:
             log.info("contractInfo: %s %s → %s", symbol, rules.status, status)

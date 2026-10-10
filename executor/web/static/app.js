@@ -11,6 +11,7 @@
     del(k) { try { localStorage.removeItem('fx.' + k); } catch { /* idem */ } },
   };
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const dcls = (d) => (d === 'LONG' ? 'long' : d === 'SHORT' ? 'short' : '');  // clase CSS segura
   const num = (v) => (Number.isFinite(+v) ? +v : 0);
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
@@ -683,8 +684,8 @@
       <th class="r">Liq.</th><th class="r">Margen</th><th class="r">PnL (ROE %)</th><th class="r">TP / SL</th><th>Origen</th><th class="r">Cerrar</th></tr></thead>`;
     const body = rows.length ? rows.map((p) => `
       <tr data-sym="${p.symbol}" data-dir="${p.direction}">
-        <td class="sym ${p.direction.toLowerCase()}"><b class="link" data-act="select">${esc(p.symbol)}</b>
-          <span class="badge ${p.direction.toLowerCase()}">${p.direction === 'LONG' ? 'Long' : 'Short'}</span> <span class="badge">${p.leverage}x</span>
+        <td class="sym ${dcls(p.direction)}"><b class="link" data-act="select">${esc(p.symbol)}</b>
+          <span class="badge ${dcls(p.direction)}">${p.direction === 'LONG' ? 'Long' : 'Short'}</span> <span class="badge">${p.leverage}x</span>
           ${p.assumed ? '<span class="badge y" title="Registrada sin orden real (margen insuficiente)">ASUMIDA</span>' : ''}
           <span class="sub">${p.margin_type === 'isolated' ? 'Aislado' : p.margin_type ? 'Cruzado' : ''}${p.trade_id ? ` · #${p.trade_id}` : ''}${p.paper_id ? ` · paper #${p.paper_id}` : ''}</span></td>
         <td class="r ${p.direction === 'LONG' ? 'up' : 'down'}">${fq(p.qty)} ${esc(baseOf(p.symbol))}<span class="sub">${fn(p.notional)} USDT</span></td>
@@ -766,7 +767,7 @@
     const body = rows.length ? rows.map((t) => {
       const [rTxt, rCls] = REASON[t.status] || [t.status, ''];
       return `<tr><td>${esc(t.close_time.replace(' UTC', ''))}</td>
-        <td class="sym ${t.direction.toLowerCase()}"><b>${esc(t.symbol)}</b> <span class="badge ${t.direction.toLowerCase()}">${t.direction === 'LONG' ? 'Long' : 'Short'}</span> <span class="badge">${t.leverage}x</span></td>
+        <td class="sym ${dcls(t.direction)}"><b>${esc(t.symbol)}</b> <span class="badge ${dcls(t.direction)}">${t.direction === 'LONG' ? 'Long' : 'Short'}</span> <span class="badge">${t.leverage}x</span></td>
         <td class="r">${fq(t.quantity)}</td><td class="r">${fp(t.entry_price, t.symbol)}</td><td class="r">${fp(t.close_price, t.symbol)}</td>
         <td class="r ${cl(t.pnl_usdt)}"><b>${sg(t.pnl_usdt, 4)}</b></td><td class="r ${cl(t.roe_pct)}">${sg(t.roe_pct)}%</td>
         <td><span class="badge ${rCls}">${esc(rTxt)}</span></td><td><span class="badge">${SRC[t.source] || esc(t.source)}</span></td>
@@ -786,7 +787,7 @@
     const rows = S.snap.signals.filter((r) => !S.onlySym || r.symbol === S.symbol);
     const head = '<thead><tr><th>Hora</th><th>Acción</th><th>Símbolo</th><th>Dirección</th><th>Resultado</th><th>Detalle</th></tr></thead>';
     const body = rows.length ? rows.map((r) => `<tr><td>${hms(r.ts)}</td><td><b>${esc(r.action.toUpperCase())}</b></td><td>${esc(r.symbol)}</td>
-      <td>${r.direction ? `<span class="badge ${r.direction.toLowerCase()}">${esc(r.direction)}</span>` : ''}</td>
+      <td>${r.direction ? `<span class="badge ${dcls(r.direction)}">${esc(r.direction)}</span>` : ''}</td>
       <td><span class="badge ${r.ok ? 'ok' : 'err'}">${r.ok ? 'OK' : 'Rechazada'}</span></td><td class="muted">${esc(r.detail)}</td></tr>`).join('')
       : emptyRow(6, 'Aún no llegan señales de app.py');
     $('#tbl-signals').innerHTML = head + `<tbody>${body}</tbody>`;
@@ -1108,7 +1109,7 @@
       if (btn.dataset.act === 'tpsl') tpslModal(p);
       if (btn.dataset.act === 'manage') manageModal(p);
       if (btn.dataset.act === 'close') {
-        if (!(await confirmBox(`Cerrar ${p.symbol} ${p.direction}`, `<p>Cierre a mercado de ${fq(p.qty)} ${esc(baseOf(p.symbol))}. PnL actual <b class="${cl(p.pnl)}">${sg(p.pnl, 4)} USDT</b>.</p>`, 'Cerrar posición', 'btn-sell'))) return;
+        if (!(await confirmBox(`Cerrar ${esc(p.symbol)} ${esc(p.direction)}`, `<p>Cierre a mercado de ${fq(p.qty)} ${esc(baseOf(p.symbol))}. PnL actual <b class="${cl(p.pnl)}">${sg(p.pnl, 4)} USDT</b>.</p>`, 'Cerrar posición', 'btn-sell'))) return;
         run('close_position', { symbol: p.symbol, direction: p.direction }, `${p.symbol} ${p.direction} cerrada`);
       }
     });

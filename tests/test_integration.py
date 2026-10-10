@@ -228,10 +228,14 @@ async def test_trades_persist_and_reconcile_after_restart(fake, tmp_path, snapsh
 
     svc2 = ExecutorService(make_settings(fake, tmp_path))
     await svc2.start()
-    assert svc2.trades.find_by_paper_id(11) is not None
-    assert svc2.trades.find_by_paper_id(12) is None
-    assert svc2.trades.closed[-1].symbol == "BTCUSDT" and svc2.trades.closed[-1].status == "EXTERNAL"
-    await svc2.stop()
+    try:
+        assert svc2.trades.find_by_paper_id(11, "ETHUSDT") is not None
+        # La verificación externa confirma por WS API (account.position) antes de cerrar el registro.
+        await wait_for(lambda: svc2.trades.find_by_paper_id(12, "BTCUSDT") is None)
+        assert svc2.trades.closed[-1].symbol == "BTCUSDT" and svc2.trades.closed[-1].status == "EXTERNAL"
+        assert svc2.trades.closed[-1].closed_by == "binance"
+    finally:
+        await svc2.stop()
 
 
 async def test_close_all_spares_grid_positions(service, fake):
@@ -256,7 +260,7 @@ async def test_http_command_api(service, fake):
         body = await r.json()
         assert r.status == 200 and body["data"]["errors"]  # inversión insuficiente explicada
         r = await client.post("/api/command", json={"cmd": "nope"}, headers={"X-Dashboard-Token": "dash"})
-        assert r.status == 400 and "desconocido" in (await r.json())["error"]
+        assert r.status == 404 and "desconocido" in (await r.json())["error"]
 
 
 async def test_dashboard_opens_with_just_the_link(fake, tmp_path, snapshot_file):

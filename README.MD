@@ -129,14 +129,65 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
 ```
 
 - Tamaño de apertura: `quantity`/`qty` (con `price` define el notional deseado, como antes), o `notional`/`usdt`, o
-  `margin`. Sin ninguno se rechaza, salvo que `DEFAULT_NOTIONAL_USDT` > 0.
+  `margin`. Si llegan `quantity` y `notional`, manda `quantity × price` (se avisa si difieren). Sin ninguno se
+  rechaza, salvo que `DEFAULT_NOTIONAL_USDT` > 0.
 - La cantidad final se calcula con el precio real y las reglas del símbolo (redondeo exacto con `Decimal`).
 - Se mantiene la regla de leverage por precio: `HIGH_PRICE_LEVERAGE` si el precio supera `HIGH_PRICE_THRESHOLD`.
 - Los cierres por TP/SL de Binance, liquidaciones o cierres manuales en la app se **detectan en tiempo real** y la
   operación se cierra localmente con su motivo y el PnL real reportado por Binance.
 
-Otros endpoints: `GET /api/state` (mismo formato que antes, lo consume `app.py`), `POST /api/command`
-(comandos del dashboard; pide `X-Dashboard-Token` solo si definiste `DASHBOARD_TOKEN`) y `GET /health` (JSON con el estado de las conexiones).
+- Varios `open` con el mismo `trade_id` y símbolo son **tramos** de la misma posición (app_25 promedia así): todos
+  se ejecutan y quedan en `levels`/`tranches` del trade. No hay antiduplicado por contenido (`SIGNAL_DEDUPE_TTL_S=0`).
+- Una señal con `signal_id` (o header `Idempotency-Key`) nunca se ejecuta dos veces: así los reintentos son seguros.
+- `close` acepta `close_price`, `pnl` (PnL del bot, se compara con el real), `quantity` (cierre parcial). Si llega
+  antes que su `open` (o mientras se abre) se aplica en cuanto la posición existe; un tramo de ese `trade_id` que
+  llegue hasta 30 s después del cierre se ignora (no reabre). El orden se respeta por símbolo: un `close` espera a
+  los `open` recibidos antes que él, nunca a los posteriores.
+- Si Binance no confirma una apertura (timeout, estado desconocido) el executor relee la posición real y la registra
+  si se abrió, así el `close` del bot siempre la cierra.
+- `POST /signal?wait=1` espera el resultado en Binance (hasta `SIGNAL_WAIT_TIMEOUT_S`) y lo devuelve en `result`.
+- Un secreto incorrecto responde 401 y queda visible en la pestaña Señales y en `GET /api/signals`.
+- Las peticiones de un navegador desde otro sitio (`Origin` ajeno) se rechazan en `/signal`, `/ws/signal` y `/ws`
+  salvo que el origen esté en `CORS_ORIGINS`; los bots y scripts no envían `Origin` y no se ven afectados.
+
+## API HTTP y cliente (`executor_client.py`)
+
+Todo lo que hace el dashboard se puede hacer con peticiones HTTP simples. La referencia completa (rutas, parámetros,
+ejemplos con curl y Python) está en el docstring de [`executor_client.py`](executor_client.py):
+
+```bash
+python -c "import executor_client; help(executor_client)"   # referencia
+python executor_client.py --url https://tu-executor.onrender.com demo
+```
+
+| Ruta | Uso |
+| --- | --- |
+| `POST /signal` · `GET /api/state` | Las dos rutas que usan los bots desplegados (sin cambios de formato) |
+| `GET /health` · `GET /ready` | Salud de conexiones · 200 cuando ya sincronizó la cuenta (503 mientras arranca) |
+| `GET /api/snapshot` `/api/status` `/api/account` `/api/positions` `/api/orders` `/api/trades` `/api/trades.csv` `/api/stats` `/api/signals` `/api/live` `/api/markets` `/api/symbol/{s}` `/api/logs` `/api/commands` `/api/errors/{code}` `/api/grids` | Lectura |
+| `POST /api/open` `/api/close/{s}` `/api/force-close/{s}` `/api/close-all` `/api/set-tp/{s}` `/api/set-sl/{s}` `/api/cancel-tp-sl/{s}` `/api/limit-order` `/api/cancel-order` `/api/leverage[/{s}]` `/api/margin-type/{s}` `/api/margin/{s}` `/api/position-mode` `/api/trading` `/api/grids` … | Operación |
+| `POST /api/command` `{"cmd": "...", "args": {...}}` | Cualquier comando del catálogo (`GET /api/commands`) |
+| `POST /manual/*` | Rutas del executor anterior (`close`, `close_all`, `toggle_trading`, `set_leverage`, `set_tp`, `set_sl`, …) con las mismas respuestas |
+| `GET /ws` · `GET /ws/signal` | WebSocket del dashboard · señales por WebSocket |
+
+- **Autenticación**: lectura abierta (o `X-Dashboard-Token` si definiste `DASHBOARD_TOKEN`); escritura con el secreto
+  de señales en `X-Signal-Secret`, `X-Dashboard-Token`, `Authorization: Bearer …` o `?secret=`. Con `DASHBOARD_TOKEN`
+  definido y sin `SIGNAL_SECRET`, la API solo acepta el token (los secretos por defecto de los bots siguen valiendo
+  únicamente para `/signal`).
+- Respuestas JSON `{"ok": true, "action", "data"}`; errores `{"ok": false, "error", "diagnosis"?}` con 400/401/404/409/502/503.
+  Si Binance rechaza la orden, `diagnosis` explica el código y la solución.
+- CORS habilitado (`CORS_ORIGINS`), parámetros en JSON, formulario o query string, rutas con o sin `/` final.
+
+`executor_client.py` (un archivo, solo biblioteca estándar) trae:
+
+- `ExecutorBridge`: reemplazo directo del de `app.py`/`app_25.py` (misma firma). No bloquea, mantiene el orden de
+  las señales, reintenta si el executor está despertando en Render y no duplica (`signal_id`).
+- `ExecutorClient`: un método por endpoint (`positions()`, `open_signal()`, `close()`, `set_sl()`, `grid_create()`…).
+- `SignalSocket` / `DashboardSocket`: WebSockets `/ws/signal` y `/ws` (con `aiohttp` o `websockets`).
+- CLI: `python executor_client.py positions`, `open BTCUSDT SHORT --quantity 0.001`, `cmd set_sl symbol=… trigger_price=…`.
+
+Los bots que siguen con su `ExecutorBridge` original funcionan igual; `tests/compat/` contiene copias literales de
+ambos y las pruebas los ejecutan contra el executor.
 
 ## Variables de entorno
 
@@ -144,7 +195,7 @@ Otros endpoints: `GET /api/state` (mismo formato que antes, lo consume `app.py`)
 | --- | --- | --- |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Credenciales (Futuros habilitado) |
 | `USE_TESTNET` | `false` | Testnet de Binance Futures |
-| `SIGNAL_SECRET` | `cambiar-por-secreto-seguro` | Secreto que `app.py` envía en `X-Signal-Secret` (igual que antes). No afecta al dashboard |
+| `SIGNAL_SECRET` | — | Secreto de `/signal` y de la escritura por HTTP, usado tal cual (como antes; puede contener comas). Sin definir acepta los valores por defecto de los bots: `clave-secreta-aleatoria` y `cambiar-por-secreto-seguro`. Debe coincidir con `EXECUTOR_SECRET` de app_25 |
 | `DASHBOARD_TOKEN` | — | Opcional. Vacío = dashboard abierto con el link; con valor, pide ese token |
 | `PORT` | `10000` | Puerto HTTP |
 | `PROXY_URLS` | — | Proxies HTTP separados por coma para REST (rotación y baneo por IP). `FIXIE_URL` sigue aceptándose |
@@ -158,14 +209,23 @@ Otros endpoints: `GET /api/state` (mismo formato que antes, lo consume `app.py`)
 | `DEFAULT_NOTIONAL_USDT` | `0` | Tamaño por defecto si la señal no trae cantidad (0 = rechazar) |
 | `ASSUME_ON_MARGIN_ERROR` | `true` | Con -2019 registrar la posición como asumida |
 | `MARGIN_AUTO_REDUCE` | `false` | Con -2019 reintentar con la mitad de cantidad |
-| `SIGNAL_DEDUPE_TTL_S` | `10` | Ventana anti-duplicados de señales |
+| `SIGNAL_DEDUPE_TTL_S` | `0` | Antiduplicado por contenido (0 = desactivado: los tramos con el mismo `trade_id` se ejecutan todos). Las señales con `signal_id` nunca se repiten |
+| `SIGNAL_WAIT_TIMEOUT_S` | `7` | Espera máxima de `?wait=1` |
+| `LEVERAGE_REQUIRED` | `false` | Rechazar la apertura si Binance no confirma el leverage pedido |
+| `ADOPT_POSITIONS` | `true` | Al arrancar, registrar como trades las posiciones abiertas que no conocía |
+| `RESTORE_TRADING_PAUSE` | `true` | Mantener la pausa de trading tras reiniciar |
+| `API_WRITE_OPEN` | `false` | Permitir escritura HTTP sin secreto (no recomendado) |
+| `SIGNAL_SECRETS` | — | Secretos adicionales aceptados, separados por comas (p. ej. al rotar el secreto) |
+| `CORS_ORIGINS` | `*` | Orígenes permitidos para la API (CORS). El WebSocket del dashboard solo acepta el mismo sitio o los orígenes listados explícitamente |
+| `TRUST_PROXY` | `true` en Render | Tomar la IP del cliente de `X-Forwarded-For` |
+| `KEEPALIVE_URL` / `KEEPALIVE_S` | `RENDER_EXTERNAL_URL` / `600` | Auto-ping para que Render no duerma el servicio |
 | `MAX_PRICE_AGE_S` | `5` | Antigüedad máxima del precio de referencia |
 | `DATA_DIR` | `data` | Estado persistente (trades, grids, exchangeInfo descargado) |
 | `EXCHANGE_INFO_FILE` | `exchangeInfo.txt` | Base predefinida de reglas (respuesta cruda de Binance) |
 | `EXCHANGE_INFO_BOOTSTRAP` | `true` | Generar el exchangeInfo si no hay snapshot |
 | `EXCHANGE_INFO_REFRESH_H` | `0` | Refresco periódico del exchangeInfo (horas, 0 = nunca) |
 | `SEED_OPEN_ORDERS_REST` | `true` | Leer órdenes abiertas al arrancar |
-| `STATE_REQUIRES_AUTH` | `false` | Exigir token en `/api/state` |
+| `STATE_REQUIRES_AUTH` | `false` | Exigir el secreto en `/api/state` (los bots desplegados no lo envían: déjalo en `false`) |
 | `GRID_MAX_LEVELS` / `GRID_ORDER_CONCURRENCY` | `150` / `4` | Límites de los bots Grid |
 | `BALANCE_POLL_S` | `60` | Refresco de seguridad del balance (WS API) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Avisos por Telegram |
@@ -182,6 +242,8 @@ pytest
 Las pruebas de integración levantan un Binance simulado (`tests/fake_binance.py`) con WS API, streams y REST mínimo,
 y cubren: apertura/cierre por señal, autocorrección de errores (-1111, -4164, -4061, estado desconocido), TP/SL por
 algo orders, grids Neutral y Long, reconciliación tras reinicio, persistencia, dashboard por WebSocket y `/ws/signal`.
+`tests/test_api.py` ejecuta los `ExecutorBridge` desplegados (copias literales en `tests/compat/`), el cliente
+`executor_client.py`, todas las rutas REST y `/manual/*`, autenticación, CORS, errores JSON, reintentos y apagado.
 
 ## Cambios respecto a la versión anterior
 
@@ -191,4 +253,6 @@ algo orders, grids Neutral y Long, reconciliación tras reinicio, persistencia, 
 - `GET /health` devuelve JSON con el estado de las conexiones (sigue respondiendo 200).
 - Si el cierre de una posición falla en Binance, la operación sigue abierta y se avisa (antes se marcaba cerrada).
 - Los cierres por TP/SL/liquidación hechos por Binance se detectan y registran automáticamente.
-- El win rate cuenta como ganadas las operaciones con PnL > 0.
+- En `/api/state`, `wins`/`losses`/`win_rate` mantienen la definición anterior (cierres por TP); la definición por
+  PnL > 0 está en `wins_pnl`/`losses_pnl`/`win_rate_pnl`.
+- Vuelven las rutas `/manual/*` y se añade la API REST completa (`/api/*`) y `executor_client.py`.
