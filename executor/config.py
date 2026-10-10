@@ -108,6 +108,12 @@ class Settings:
     trust_proxy: bool = False
     adopt_positions: bool = True
     restore_trading_pause: bool = True
+    # Multiplicador de operaciones (off | manual | auto); el dashboard puede cambiarlo.
+    multiplier_mode: str = "off"
+    multiplier_factor: float = 1.0
+    multiplier_step_usdt: float = 100.0
+    multiplier_max: float = 10.0
+    multiplier_source: str = "wallet"
     keepalive_url: str = ""
     keepalive_s: int = 0
     telegram_bot_token: str = ""
@@ -253,6 +259,11 @@ def load_settings() -> Settings:
         trust_proxy=_env_bool("TRUST_PROXY", on_render),
         adopt_positions=_env_bool("ADOPT_POSITIONS", True),
         restore_trading_pause=_env_bool("RESTORE_TRADING_PAUSE", True),
+        multiplier_mode=_env("MULTIPLIER_MODE", "off").lower(),
+        multiplier_factor=_env_float("MULTIPLIER", 1.0),
+        multiplier_step_usdt=_env_float("MULTIPLIER_STEP_USDT", 100.0),
+        multiplier_max=_env_float("MULTIPLIER_MAX", 10.0),
+        multiplier_source=_env("MULTIPLIER_BALANCE", "wallet").lower(),
         keepalive_url=keepalive_url,
         keepalive_s=_env_int("KEEPALIVE_S", 600 if keepalive_url else 0),
         telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),

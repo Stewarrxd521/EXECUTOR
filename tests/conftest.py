@@ -8,8 +8,11 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from executor.config import Settings  # noqa: E402
+from aiohttp.test_utils import TestServer  # noqa: E402
+
+from executor.config import LEGACY_SIGNAL_SECRETS, Settings  # noqa: E402
 from executor.service import ExecutorService  # noqa: E402
+from executor.web.server import build_app  # noqa: E402
 from tests.fake_binance import FakeBinance, exchange_info_payload  # noqa: E402
 
 
@@ -64,3 +67,31 @@ async def service(fake, tmp_path, snapshot_file):
     await wait_for(lambda: svc.core.market.marks and svc.user.conn.connected)
     yield svc
     await svc.stop()
+
+
+SECRET = "clave-secreta-aleatoria"
+
+
+def legacy_settings(fake, tmp_path, **over):
+    """Executor desplegado sin SIGNAL_SECRET ni DASHBOARD_TOKEN (como en Render)."""
+    over.setdefault("dashboard_token", "")
+    return make_settings(fake, tmp_path, signal_secret=LEGACY_SIGNAL_SECRETS[0],
+                         signal_secrets=list(LEGACY_SIGNAL_SECRETS), signal_secret_is_default=True, **over)
+
+
+@pytest.fixture
+async def open_service(fake, tmp_path, snapshot_file):
+    svc = ExecutorService(legacy_settings(fake, tmp_path))
+    await svc.start()
+    await wait_for(lambda: svc.core.market.marks and svc.user.conn.connected and svc.trades.ready.is_set())
+    yield svc
+    await svc.stop()
+
+
+@pytest.fixture
+async def live_url(open_service):
+    """Servidor HTTP real (los bridges usan urllib en hilos)."""
+    server = TestServer(build_app(open_service))
+    await server.start_server()
+    yield str(server.make_url("")).rstrip("/")
+    await server.close()

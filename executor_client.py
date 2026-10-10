@@ -118,6 +118,9 @@ Operación (requiere el secreto)::
     POST /api/margin/{symbol}        {amount, add?=true, direction?}
     POST /api/position-mode          {hedge_mode: true|false}
     POST /api/trading                {enabled?}   sin enabled alterna pausa/activo
+    GET  /api/multiplier             multiplicador: modo, factor efectivo, balance, nivel y umbrales
+    POST /api/multiplier             {enabled?, mode?=manual|auto|off, factor?, step_usdt?=100,
+                                      max_factor?=10, source?=wallet|margin|available}
     POST /api/clear-history
     POST /api/grids                  {symbol, lower, upper, grids, investment, leverage?, mode?,
                                       spacing?, stop_loss?, take_profit?, trigger_price?}
@@ -159,6 +162,18 @@ Contrato de señales (``POST /signal``)
   (cierre parcial). Si llega antes que su ``open`` se aplica al abrirse.
 * ``close_all``; ``open_tp``/``open_sl`` {symbol, trigger_price}; ``close_tp``/``close_sl`` {symbol}.
 
+Multiplicador
+-------------
+Con el multiplicador activo, cada ``open`` se ejecuta con ``quantity``/``notional``
+multiplicados (x2 → el doble) y los cierres parciales del bot se escalan igual.
+
+* Manual: factor fijo (``set_multiplier(True, "manual", factor=2)``).
+* Automático por balance de la billetera, niveles de ``step_usdt`` (100):
+  x1 con < 200; x2 se activa con 200 y se mantiene entre 101 y 299; x3 se activa
+  con 300 y se mantiene entre 201 y 399; y así sucesivamente.
+* Dashboard: botón «×1» de la barra superior. Variables: MULTIPLIER_MODE=off|manual|auto,
+  MULTIPLIER, MULTIPLIER_STEP_USDT, MULTIPLIER_MAX, MULTIPLIER_BALANCE.
+
 curl
 ----
 ::
@@ -184,6 +199,9 @@ CLI
     python executor_client.py signals --limit 20
     python executor_client.py cmd set_sl symbol=BTCUSDT trigger_price=67000
     python executor_client.py call GET /api/live symbols=BTCUSDT,ETHUSDT
+    python executor_client.py multiplier on --mode manual --factor 2
+    python executor_client.py multiplier on --mode auto --step 100
+    python executor_client.py multiplier off
     python executor_client.py watch
     python executor_client.py demo          # recorrido de solo lectura
 """
@@ -897,6 +915,23 @@ class ExecutorClient:
     def set_position_mode(self, hedge_mode: bool) -> dict:
         return self._rpost("/api/position-mode", {"hedge_mode": hedge_mode})
 
+    def multiplier(self) -> dict:
+        """Estado del multiplicador: modo, factor efectivo, balance, nivel automático y umbrales."""
+        return self._rget("/api/multiplier")
+
+    def set_multiplier(self, enabled: Optional[bool] = None, mode: Optional[str] = None,
+                       factor: Optional[float] = None, step_usdt: Optional[float] = None,
+                       max_factor: Optional[float] = None, source: Optional[str] = None) -> dict:
+        """Activa/ajusta el multiplicador.
+
+        * Manual: ``set_multiplier(True, "manual", factor=2)`` → cada señal x2.
+        * Automático: ``set_multiplier(True, "auto", step_usdt=100)`` → x1 con < 200 USDT, x2 desde 200
+          (se mantiene de 101 a 299), x3 desde 300 (se mantiene de 201 a 399)…
+        * Desactivar: ``set_multiplier(False)``.
+        """
+        return self._rpost("/api/multiplier", {"enabled": enabled, "mode": mode, "factor": factor,
+                                               "step_usdt": step_usdt, "max_factor": max_factor, "source": source})
+
     def set_trading(self, enabled: Optional[bool] = None) -> dict:
         """Pausa (False) / reactiva (True) las aperturas por señal; None alterna."""
         return self._rpost("/api/trading", {"enabled": enabled})
@@ -1289,7 +1324,8 @@ def _state_line(st: Any) -> str:
     return (f"{time.strftime('%H:%M:%S')}  balance={st.get('balance', 0):.2f}  equity={st.get('equity', 0):.2f}  "
             f"realizado={st.get('realized_pnl', 0):+.4f}  no realizado={st.get('unrealized_pnl', 0):+.4f}  "
             f"abiertas={st.get('open_count', 0)}  win rate={st.get('win_rate', 0)}%  "
-            f"trading={'ON' if st.get('trading_enabled') else 'PAUSA'}  ready={st.get('ready')}")
+            f"trading={'ON' if st.get('trading_enabled') else 'PAUSA'}  multiplicador=x{st.get('multiplier', 1):g}  "
+            f"ready={st.get('ready')}")
 
 
 def _demo(client: ExecutorClient) -> None:
@@ -1414,6 +1450,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("leverage", type=int)
     s.add_argument("--symbol")
 
+    s = sub.add_parser("multiplier", help="GET/POST /api/multiplier (ver o ajustar el multiplicador)")
+    s.add_argument("action", nargs="?", choices=["show", "on", "off"], default="show")
+    s.add_argument("--mode", choices=["manual", "auto"])
+    s.add_argument("--factor", type=float, help="factor manual (2 = el doble)")
+    s.add_argument("--step", type=float, help="USDT por nivel en modo automático (100)")
+    s.add_argument("--max", type=float, help="factor máximo permitido")
+    s.add_argument("--source", choices=["wallet", "margin", "available"], help="balance del modo automático")
     s = sub.add_parser("cmd", help="cualquier comando: cmd NOMBRE clave=valor …")
     s.add_argument("name")
     s.add_argument("args", nargs="*")
@@ -1487,6 +1530,13 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
         elif c == "leverage":
             _print(client.set_symbol_leverage(args.symbol, args.leverage) if args.symbol
                    else client.set_leverage(args.leverage))
+        elif c == "multiplier":
+            changes = [args.mode, args.factor, args.step, args.max, args.source]
+            if args.action == "show" and all(v is None for v in changes):
+                _print(client.multiplier())
+            else:
+                enabled = None if args.action == "show" else args.action == "on"
+                _print(client.set_multiplier(enabled, args.mode, args.factor, args.step, args.max, args.source))
         elif c == "cmd":
             _print(client.command(args.name, **_kv(args.args)))
         elif c == "call":

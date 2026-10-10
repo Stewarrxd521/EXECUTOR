@@ -137,7 +137,10 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
   operación se cierra localmente con su motivo y el PnL real reportado por Binance.
 
 - Varios `open` con el mismo `trade_id` y símbolo son **tramos** de la misma posición (app_25 promedia así): todos
-  se ejecutan y quedan en `levels`/`tranches` del trade. No hay antiduplicado por contenido (`SIGNAL_DEDUPE_TTL_S=0`).
+  se ejecutan y quedan en `levels`/`tranches` del trade, aunque lleguen varios en el mismo segundo con el mismo
+  contenido. Ningún antiduplicado por contenido se aplica a `open` (las versiones anteriores a la 3.0 descartaban
+  como «señal duplicada» los tramos del mismo `trade_id` recibidos en menos de 10 s).
+- Si una apertura del bot no se ejecuta (rechazada o fallida en Binance) se avisa en el dashboard y por Telegram.
 - Una señal con `signal_id` (o header `Idempotency-Key`) nunca se ejecuta dos veces: así los reintentos son seguros.
 - `close` acepta `close_price`, `pnl` (PnL del bot, se compara con el real), `quantity` (cierre parcial). Si llega
   antes que su `open` (o mientras se abre) se aplica en cuanto la posición existe; un tramo de ese `trade_id` que
@@ -149,6 +152,29 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
 - Un secreto incorrecto responde 401 y queda visible en la pestaña Señales y en `GET /api/signals`.
 - Las peticiones de un navegador desde otro sitio (`Origin` ajeno) se rechazan en `/signal`, `/ws/signal` y `/ws`
   salvo que el origen esté en `CORS_ORIGINS`; los bots y scripts no envían `Origin` y no se ven afectados.
+
+## Multiplicador de operaciones
+
+Botón **×1** de la barra superior (o `POST /api/multiplier`): multiplica el tamaño de cada señal `open` de los bots
+(`quantity`, `notional` y `margin`). Con ×2, una señal de 0.01 abre 0.02; los cierres parciales del bot se escalan con
+el mismo factor que recibió la operación y los cierres totales cierran la posición real completa. Las órdenes manuales
+del dashboard y los bots Grid no se multiplican.
+
+- **Manual**: factor fijo (×1.5, ×2, ×3…), activable y desactivable.
+- **Automático**: el factor sale del saldo de la billetera, en niveles de `MULTIPLIER_STEP_USDT` (100) con histéresis:
+
+| Nivel | Se activa con | Se mantiene mientras el saldo esté entre |
+| --- | --- | --- |
+| ×1 | < 200 | 0 – 199.99 |
+| ×2 | ≥ 200 | 100.01 – 299.99 (101-299) |
+| ×3 | ≥ 300 | 200.01 – 399.99 (201-399) |
+| ×N | ≥ N·100 | (N−1)·100 – (N+1)·100 |
+
+  Sube un nivel al llegar al siguiente múltiplo y baja uno al caer al múltiplo anterior o menos; cada cambio de nivel
+  se avisa en el dashboard y por Telegram. `MULTIPLIER_MAX` (10) pone un tope.
+
+La configuración elegida en el dashboard se guarda en `DATA_DIR/multiplier.json`; en Render (disco efímero) conviene
+fijarla también con las variables `MULTIPLIER_*` para que sobreviva a un redeploy.
 
 ## API HTTP y cliente (`executor_client.py`)
 
@@ -209,7 +235,12 @@ ambos y las pruebas los ejecutan contra el executor.
 | `DEFAULT_NOTIONAL_USDT` | `0` | Tamaño por defecto si la señal no trae cantidad (0 = rechazar) |
 | `ASSUME_ON_MARGIN_ERROR` | `true` | Con -2019 registrar la posición como asumida |
 | `MARGIN_AUTO_REDUCE` | `false` | Con -2019 reintentar con la mitad de cantidad |
-| `SIGNAL_DEDUPE_TTL_S` | `0` | Antiduplicado por contenido (0 = desactivado: los tramos con el mismo `trade_id` se ejecutan todos). Las señales con `signal_id` nunca se repiten |
+| `SIGNAL_DEDUPE_TTL_S` | `0` | Antiduplicado por contenido para `close`/TP/SL (nunca para `open`: los tramos se ejecutan todos). Las señales con `signal_id` nunca se repiten |
+| `MULTIPLIER_MODE` | `off` | Multiplicador al arrancar: `off`, `manual` o `auto` (se cambia desde el dashboard) |
+| `MULTIPLIER` | `1` | Factor del modo manual (2 = el doble) |
+| `MULTIPLIER_STEP_USDT` | `100` | USDT por nivel del modo automático |
+| `MULTIPLIER_MAX` | `10` | Factor máximo permitido |
+| `MULTIPLIER_BALANCE` | `wallet` | Saldo del modo automático: `wallet` (billetera), `margin` (con PnL abierto) o `available` |
 | `SIGNAL_WAIT_TIMEOUT_S` | `7` | Espera máxima de `?wait=1` |
 | `LEVERAGE_REQUIRED` | `false` | Rechazar la apertura si Binance no confirma el leverage pedido |
 | `ADOPT_POSITIONS` | `true` | Al arrancar, registrar como trades las posiciones abiertas que no conocía |

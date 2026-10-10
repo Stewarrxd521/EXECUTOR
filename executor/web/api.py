@@ -57,6 +57,7 @@ REST_ROUTES: list[tuple[str, str, str, dict]] = [
     ("GET", "/api/errors/catalog", "error_catalog", {}),
     ("GET", "/api/errors/{code}", "explain_error", {}),
     ("GET", "/api/position-mode", "position_mode", {}),
+    ("GET", "/api/multiplier", "multiplier", {}),
     # Escritura
     ("POST", "/api/signal", "signal", {}),
     ("POST", "/api/open", "open", {}),
@@ -77,6 +78,7 @@ REST_ROUTES: list[tuple[str, str, str, dict]] = [
     ("POST", "/api/margin/{symbol}", "modify_margin", {}),
     ("POST", "/api/position-mode", "set_position_mode", {}),
     ("POST", "/api/trading", "toggle_trading", {}),
+    ("POST", "/api/multiplier", "set_multiplier", {}),
     ("POST", "/api/clear-history", "clear_history", {}),
     ("POST", "/api/grids", "grid_create", {}),
     ("POST", "/api/grids/{id}/stop", "grid_stop", {}),

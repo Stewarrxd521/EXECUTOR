@@ -15,4 +15,4 @@ Arquitectura WebSocket-first:
   tipo de margen, modo de posición y margen aislado).
 """
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"

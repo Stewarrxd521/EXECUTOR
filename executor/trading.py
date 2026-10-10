@@ -107,6 +107,9 @@ class Trade:
     has_bot_pnl: bool = False
     signal_close_price: float = 0.0
     closed_by: str = ""
+    # Multiplicador: cantidad que pidió el bot y factor medio aplicado (real ≈ bot × factor).
+    bot_quantity: float = 0.0
+    multiplier: float = 1.0
 
     @property
     def key(self) -> tuple[str, str]:
@@ -141,13 +144,37 @@ class Trade:
         data["margin"] = self.margin_usdt
         data["roe_pct"] = self.roe_pct
         data["levels"] = [t.get("level") for t in self.tranches if t.get("level")]
-        data["pnl_diff"] = (self.pnl_usdt - self.bot_pnl) if self.has_bot_pnl else None
+        mult = self.multiplier or 1.0
+        data["bot_pnl_scaled"] = self.bot_pnl * mult if self.has_bot_pnl else None
+        data["pnl_diff"] = (self.pnl_usdt - self.bot_pnl * mult) if self.has_bot_pnl else None
         return data
+
+    def sync_quantity(self, real_qty: float) -> None:
+        """Ajusta la cantidad a la real conservando la proporción bot/real.
+
+        Proporcional y reversible: una lectura atrasada que muestra menos cantidad y
+        la lectura correcta posterior dejan ``bot_quantity`` como estaba.
+        """
+        if self.quantity > 0 and self.bot_quantity > 0 and real_qty >= 0:
+            self.bot_quantity = self.bot_quantity * real_qty / self.quantity
+        self.quantity = real_qty
+
+    def note_tranche_scale(self, factor: float, bot_qty: float, real_qty: float) -> None:
+        """Acumula la cantidad pedida por el bot y recalcula el factor medio del trade."""
+        factor = factor or 1.0
+        bot_qty = bot_qty if bot_qty > 0 else (real_qty / factor if factor else real_qty)
+        prev_bot = self.bot_quantity
+        self.bot_quantity = prev_bot + bot_qty
+        if self.bot_quantity > 0:
+            self.multiplier = round((prev_bot * (self.multiplier or 1.0) + bot_qty * factor) / self.bot_quantity, 6)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Trade":
         names = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in data.items() if k in names})
+        trade = cls(**{k: v for k, v in data.items() if k in names})
+        if "bot_quantity" not in data:  # guardado antes del multiplicador: todo cuenta como x1
+            trade.bot_quantity = trade.quantity / (trade.multiplier or 1.0)
+        return trade
 
 
 @dataclass
@@ -196,6 +223,7 @@ class TradeManager:
         self.leverage_override: Optional[int] = None
         self.signal_log: deque[dict] = deque(maxlen=300)
         self.grid_owner: Callable[[str, str], bool] = lambda symbol, direction: False
+        self.multiplier = None  # Multiplier (lo asigna el servicio)
         self.accepting = True
         self.ready = asyncio.Event()
         self._session_start = time.time()
@@ -208,6 +236,8 @@ class TradeManager:
         self._tasks: set[asyncio.Task] = set()
         self._unauth_warned: OrderedDict = OrderedDict()
         self._unknown_open: dict[tuple[str, str], float] = {}
+        self._open_alerts: dict[str, float] = {}
+        self._close_retryable: dict[tuple[str, str], bool] = {}
         self._reconciling: set[tuple[str, str]] = set()
         self._skipped_closed: dict[str, float] = {}
         self._recent_closed: dict[tuple[int, str, str], float] = {}
@@ -215,6 +245,7 @@ class TradeManager:
         # open espera a los close aceptados antes que él (nunca a los posteriores).
         self._open_tasks: dict[str, list[tuple[str, asyncio.Task]]] = {}
         self._close_tasks: dict[str, list[tuple[str, asyncio.Task]]] = {}
+        self._close_all_tasks: set[asyncio.Task] = set()
         self._last_close_fill: dict[str, OrderUpdate] = {}
         self._pending_external: set[tuple[str, str]] = set()
         self.store = JsonStore(core.settings.data_dir / "trades.json", self._serialize)
@@ -395,9 +426,26 @@ class TradeManager:
             log.warning("Señal %s %s rechazada desde %s: secreto incorrecto. El valor debe coincidir con "
                         "EXECUTOR_SECRET (app_25) / ExecutorBridge(signal_secret=...)", action, symbol, ip or "?")
 
+    def _alert_open_failed(self, sig: Signal, why: str) -> None:
+        """Aviso visible (dashboard + Telegram) cuando una apertura del bot NO se ejecuta."""
+        key = f"{sig.symbol}|{why[:40]}"
+        now = time.time()
+        if now - self._open_alerts.get(key, 0) < 60:
+            return
+        self._open_alerts[key] = now
+        if len(self._open_alerts) > 256:
+            self._open_alerts = {k: v for k, v in self._open_alerts.items() if now - v < 60}
+        tid = f" trade_id {sig.trade_id}" if sig.trade_id else ""
+        self.core.bus.emit("signal_failed", f"Apertura NO ejecutada: {sig.direction} {sig.symbol}{tid} — {why}",
+                           "error", symbol=sig.symbol)
+        self.core.telegram.send(f"⚠️ <b>Señal OPEN no ejecutada</b> {sig.direction} <code>{sig.symbol}</code>{tid}\n"
+                                f"{why}")
+
     def _reject(self, sig: Signal, error: str, status: int = 400, **extra) -> tuple[int, dict, None]:
         self.status["signals_rejected"] += 1
         self._log_signal(sig.action, sig.symbol, sig.direction, False, error, sig)
+        if sig.action == "open" and status != 503:
+            self._alert_open_failed(sig, error)
         if sig.action == "open" and sig.trade_id and status != 503:  # 503 = reintentable, no es definitivo
             self._mark_rejected(sig.trade_id, sig.symbol)
         log.warning("Señal %s %s %s rechazada: %s", sig.action.upper(), sig.symbol, sig.direction, error)
@@ -486,7 +534,10 @@ class TradeManager:
         if not self.accepting:
             return self._reject(sig, "executor reiniciándose: reintenta en unos segundos", 503, retry=True)
 
-        if explicit_id or self.settings.signal_dedupe_ttl_s > 0:
+        # El antiduplicado por contenido NUNCA aplica a «open»: los tramos de un mismo
+        # trade_id pueden llegar idénticos y en el mismo segundo (app_25 al promediar).
+        content_dedupe = self.settings.signal_dedupe_ttl_s > 0 and action != "open"
+        if explicit_id or content_dedupe:
             sig.dedupe_key = f"id:{explicit_id}" if explicit_id else self._dedupe_key(data)
             if self._dedupe_seen(sig.dedupe_key):
                 self.status["signals_duplicate"] += 1
@@ -534,6 +585,7 @@ class TradeManager:
             return self._reject(sig, f"{symbol} {direction} está gestionado por un bot Grid", 200)
         self._inflight[(symbol, direction)] += 1
         prior_closes = self._pending_tasks(self._close_tasks, symbol, direction)
+        prior_closes += [t for t in self._close_all_tasks if not t.done()]  # un close_all anterior va primero
         task = self._spawn(self._signal_open(sig, quantity, notional, margin, prior_closes))
         self._track(self._open_tasks, symbol, direction, task)
         return 200, {"ok": True, "action": "open", "symbol": symbol, "direction": direction}, task
@@ -588,12 +640,20 @@ class TradeManager:
         note = ""
         unknown = False
         baseline = 0.0
+        factor = 1.0
+        bot_quantity = quantity
         already_closed: Optional[float] = None
         try:
             await self._await_ready()
             await self._wait_tasks(prior_closes or [])
             already_closed = self._closed_recently(sig.trade_id, symbol, direction)
             if already_closed is None:
+                # Multiplicador (manual o automático por balance): escala el tamaño pedido.
+                factor = self.multiplier.effective() if self.multiplier is not None else 1.0
+                if quantity <= 0 and notional <= 0 and margin <= 0:
+                    notional = self.settings.default_notional_usdt  # señal sin tamaño (app.py): también se escala
+                if factor != 1.0:
+                    quantity, notional, margin = quantity * factor, notional * factor, margin * factor
                 # Tamaño como antes: quantity × price; notional/margin solo si no hay quantity.
                 if quantity > 0 and price > 0:
                     q_notional = quantity * price
@@ -608,7 +668,8 @@ class TradeManager:
                 baseline = before.qty if before is not None else 0.0
                 trade = await self.open_trade(symbol, direction, signal_price=price, quantity=quantity,
                                               notional=notional, paper_trade_id=sig.trade_id, source="signal",
-                                              leverage=lev, level=level, signal_id=sig.signal_id)
+                                              leverage=lev, level=level, signal_id=sig.signal_id,
+                                              multiplier=factor, bot_quantity=bot_quantity)
                 already_closed = self._skipped_closed.pop(sig.signal_id, None)
                 unknown = trade is None and self._unknown_open.pop((symbol, direction), None) is not None
         except Exception:
@@ -633,13 +694,15 @@ class TradeManager:
                 # Pudo ejecutarse en Binance: no se marca como rechazada (su close debe
                 # funcionar) y se relee la posición real para registrarla si existe.
                 self._reconciling.add((symbol, direction))
-                self._spawn(self._reconcile_unknown_open(symbol, direction, sig.trade_id, baseline))
+                self._spawn(self._reconcile_unknown_open(symbol, direction, sig.trade_id, baseline, factor,
+                                                         bot_quantity))
                 entry = self._log_signal("open", symbol, direction, False,
                                          "estado desconocido: se verifica la posición real en Binance", sig)
             else:
                 if sig.trade_id:
                     self._mark_rejected(sig.trade_id, symbol)
                 entry = self._log_signal("open", symbol, direction, False, "no ejecutada (ver pestaña Errores)", sig)
+                self._alert_open_failed(sig, "Binance la rechazó (ver pestaña Errores)")
             return {"ok": False, "detail": entry["detail"]}
 
         self.status["signals_open"] += 1
@@ -650,6 +713,8 @@ class TradeManager:
         if pending is not None:
             self._note_closed(sig.trade_id, symbol, direction)
         detail = f"#{trade.id} qty={trade.quantity:g} @ {trade.entry_price:g}" + (" (ASUMIDA)" if trade.order_assumed else "")
+        if factor != 1.0:
+            detail += f" — multiplicador x{factor:g}"
         if note:
             detail += f" — {note}"
         protections = []
@@ -677,7 +742,8 @@ class TradeManager:
                              sig)
         return {"ok": True, "detail": detail, "trade": trade.to_dict()}
 
-    async def _reconcile_unknown_open(self, symbol: str, direction: str, paper_id: int, baseline: float) -> None:
+    async def _reconcile_unknown_open(self, symbol: str, direction: str, paper_id: int, baseline: float,
+                                      factor: float = 1.0, bot_quantity: float = 0.0) -> None:
         """Tras una apertura de estado desconocido, registra lo que Binance sí abrió.
 
         Solo se atribuye a la señal la cantidad que supera lo que ya había
@@ -699,15 +765,19 @@ class TradeManager:
                         continue
                     if self.grid_owner(symbol, direction):
                         return
+                    added = real - max(baseline, tracked)
                     if trade is None:
                         trade = self.adopt_position(pos, paper_id=paper_id, source="signal")
+                        trade.bot_quantity, trade.multiplier = 0.0, 1.0
+                        trade.note_tranche_scale(factor, bot_quantity, pos.qty)
                         self._announce_open(trade)
                     else:
+                        trade.note_tranche_scale(factor, bot_quantity, added)
                         trade.quantity = pos.qty
                         trade.entry_price = pos.entry_price or trade.entry_price
                         if paper_id:
                             self._map_paper(trade, paper_id)
-                        self.save()
+                    self.save()
                     log.warning("%s %s: la apertura de estado desconocido SÍ se ejecutó (posición %s); registrada",
                                 direction, symbol, pos.qty)
                     self._rejected_ids.pop((paper_id, symbol), None)
@@ -760,6 +830,42 @@ class TradeManager:
 
     async def _signal_close(self, sig: Signal, reason: str, close_price: float, quantity: float,
                             bot_pnl: Optional[float], prior_opens: Optional[list] = None) -> dict:
+        """Cierre por señal. Un error inesperado (p. ej. sin conexión) se reintenta: un
+        cierre perdido deja la posición abierta."""
+        delays = (0.0, 3.0, 10.0)
+        for attempt, delay in enumerate(delays):
+            if delay:
+                await asyncio.sleep(delay)
+            final = attempt == len(delays) - 1
+            try:
+                result = await self._signal_close_once(sig, reason, close_price, quantity, bot_pnl,
+                                                       prior_opens if attempt == 0 else None, final=final)
+            except Exception as exc:
+                log.exception("Cierre %s %s (trade_id %s) falló (intento %d)", sig.symbol, sig.direction,
+                              sig.trade_id, attempt + 1)
+                last = f"{type(exc).__name__}: {exc}"
+                continue
+            if result.get("retryable"):  # sin conexión / estado desconocido: se relee y se reintenta
+                log.warning("Cierre %s %s (trade_id %s): fallo transitorio, reintento %d", sig.symbol,
+                            sig.direction, sig.trade_id, attempt + 1)
+                last = result.get("detail", "fallo transitorio")
+                continue
+            return result  # un rechazo definitivo de Binance ya se avisa en close_trade (close_failed + Telegram)
+        self.status["signals_rejected"] += 1
+        self._log_signal("close", sig.symbol, sig.direction, False, f"no se pudo cerrar: {last}", sig)
+        self._alert_close_failed(sig, last)
+        return {"ok": False, "detail": last}
+
+    def _alert_close_failed(self, sig: Signal, why: str) -> None:
+        tid = f" trade_id {sig.trade_id}" if sig.trade_id else ""
+        self.core.bus.emit("signal_failed", f"Cierre NO ejecutado: {sig.direction} {sig.symbol}{tid} — {why}. "
+                                            "Revisa la posición", "error", symbol=sig.symbol)
+        self.core.telegram.send(f"🚨 <b>Señal CLOSE no ejecutada</b> {sig.direction} <code>{sig.symbol}</code>{tid}\n"
+                                f"{why}\nRevisa la posición en Binance")
+
+    async def _signal_close_once(self, sig: Signal, reason: str, close_price: float, quantity: float,
+                                 bot_pnl: Optional[float], prior_opens: Optional[list] = None,
+                                 final: bool = True) -> dict:
         symbol, direction = sig.symbol, sig.direction or None
         await self._await_ready()
         await self._wait_tasks(prior_opens or [])  # solo las aperturas aceptadas antes que este close
@@ -770,8 +876,14 @@ class TradeManager:
         detail = ""
         if trade is not None:
             symbol = symbol or trade.symbol
+            if quantity and (trade.multiplier or 1.0) != 1.0:
+                # Cierre parcial: la cantidad del bot se escala con el factor que recibió la operación.
+                quantity *= trade.multiplier
+            self._close_retryable.pop(trade.key, None)
             ok = await self.close_trade(trade, reason, close_price=close_price, max_qty=quantity or None,
-                                        bot_pnl=bot_pnl, closed_by="signal")
+                                        bot_pnl=bot_pnl, closed_by="signal", alert=final)
+            if not ok and not final and self._close_retryable.pop(trade.key, False):
+                return {"ok": False, "retryable": True, "detail": "fallo transitorio de conexión con Binance"}
             detail = "cerrada" if ok else "error al cerrar (ver pestaña Errores)"
             if ok and not quantity:
                 self._note_closed(sig.trade_id, trade.symbol, trade.direction)
@@ -832,14 +944,15 @@ class TradeManager:
     # ── close_all / TP / SL ───────────────────────────────────────────────
     def _accept_close_all(self, sig: Signal):
         total = len(self.trades)
-        task = self._spawn(self._signal_close_all(sig))
+        prior_opens = self._pending_tasks(self._open_tasks, "", None)  # todas las aperturas ya aceptadas
+        task = self._spawn(self._signal_close_all(sig, prior_opens))
+        self._close_all_tasks.add(task)
+        task.add_done_callback(self._close_all_tasks.discard)
         return 200, {"ok": True, "action": "close_all", "positions_targeted": total}, task
 
-    async def _signal_close_all(self, sig: Signal) -> dict:
+    async def _signal_close_all(self, sig: Signal, prior_opens: Optional[list] = None) -> dict:
         await self._await_ready()
-        deadline = time.time() + INFLIGHT_WAIT_S
-        while self._inflight and time.time() < deadline:
-            await asyncio.sleep(0.05)
+        await self._wait_tasks(prior_opens or [])  # no espera (ni cierra) aperturas recibidas después
         closed = await self.close_all("CLOSE_ALL")
         self.status["signals_close"] += len(closed)
         detail = f"{len(closed)} posición(es) cerradas"
@@ -924,7 +1037,7 @@ class TradeManager:
     async def open_trade(self, symbol: str, direction: str, *, signal_price: float = 0.0, quantity: float = 0.0,
                          notional: float = 0.0, paper_trade_id: int = 0, source: str = "signal",
                          leverage: Optional[int] = None, level: float = 0.0,
-                         signal_id: str = "") -> Optional[Trade]:
+                         signal_id: str = "", multiplier: float = 1.0, bot_quantity: float = 0.0) -> Optional[Trade]:
         symbol, direction = symbol.upper(), direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
         async with self._lock(symbol):
@@ -964,7 +1077,8 @@ class TradeManager:
                      float(qty) * ref, ref, applied_lev)
             owner = {"kind": "open", "symbol": symbol, "direction": direction}
             tranche = {"level": level, "notional_req": desired, "signal_price": signal_price,
-                       "signal_id": signal_id, "ts": time.time()}
+                       "signal_id": signal_id, "ts": time.time(), "multiplier": multiplier,
+                       "bot_qty": bot_quantity}
             try:
                 fill = await self.orders.market(ctx, qty, prefix=f"X{paper_trade_id or 0}", owner=owner)
             except BinanceAPIError as err:
@@ -978,6 +1092,8 @@ class TradeManager:
                                                  assumed=True, source=source)
                     if trade is not None:
                         trade.tranches.append({**tranche, "qty": float(qty), "fill_price": ref, "assumed": True})
+                        if source == "signal":
+                            trade.note_tranche_scale(multiplier, bot_quantity, float(qty))
                         self._announce_open(trade)
                     return trade
                 self.core.bus.emit("open_failed", f"{symbol}: {diag.info.title}", "error", symbol=symbol,
@@ -1003,6 +1119,8 @@ class TradeManager:
                 trade.tranches.append({**tranche, "qty": fill.qty, "fill_price": fill.avg_price,
                                        "order_id": fill.order_id, "leverage": applied_lev,
                                        "leverage_target": target_lev})
+                if source == "signal":
+                    trade.note_tranche_scale(multiplier, bot_quantity, fill.qty)
                 self.save()
                 self._announce_open(trade)
             return trade
@@ -1075,7 +1193,8 @@ class TradeManager:
                       quantity=pos.qty, open_time=utc_now_str(),
                       leverage=self.core.account.leverage.get(pos.symbol) or self.settings.leverage,
                       paper_trade_id=paper_id, current_price=self.core.market.price(pos.symbol) or pos.entry_price,
-                      hedge_mode=pos.side != "BOTH", step_size=fmt(rules.step_size), source=source)
+                      hedge_mode=pos.side != "BOTH", step_size=fmt(rules.step_size), source=source,
+                      bot_quantity=pos.qty, multiplier=1.0)
         self.trades[trade.key] = trade
         self._map_paper(trade, paper_id)
         self.save()
@@ -1135,7 +1254,7 @@ class TradeManager:
 
     async def close_trade(self, trade: Trade, reason: str, close_price: float = 0.0,
                           max_qty: Optional[float] = None, bot_pnl: Optional[float] = None,
-                          closed_by: str = "signal") -> bool:
+                          closed_by: str = "signal", alert: bool = True) -> bool:
         key = trade.key
         if key in self._closing or self.trades.get(key) is not trade:
             return False
@@ -1160,7 +1279,17 @@ class TradeManager:
                 step = float(rules.qty_step(True))
                 qty = min(base, max_qty) if max_qty and max_qty > 0 else base
                 partial = bool(max_qty) and qty < base - step / 2
+                if partial:
+                    # Cantidad parcial al múltiplo exacto del step (p. ej. 0.003 × 3 = 0.009000000000000001).
+                    rounded = float(rules.round_qty(D(fmt(qty)), True, "nearest"))
+                    if rounded <= 0:
+                        log.warning("%s: cierre parcial de %s es menor que el step %s; se ignora", trade.symbol,
+                                    qty, step)
+                        return False
+                    qty = min(rounded, base)
+                    partial = qty < base - step / 2
                 if not partial:
+                    qty = base  # cierre total: la cantidad real exacta (nunca una fracción del step)
                     await self.orders.cancel_protection(trade.symbol, trade.direction)
                 side = "SELL" if trade.direction == "LONG" else "BUY"
                 ctx = OrderContext(trade.symbol, side, trade.direction, "close", rules, reduce_only=True)
@@ -1179,15 +1308,34 @@ class TradeManager:
                                          diag.info.name)
                                 break
                             if attempt == 0:
-                                qty = min(pos2.qty, qty) if partial else pos2.qty
+                                if partial:
+                                    # Descuenta lo que ya se cerró (p. ej. partes de una orden dividida).
+                                    remaining = qty - max(0.0, base - pos2.qty)
+                                    remaining = float(rules.round_qty(D(fmt(max(0.0, remaining))), True, "nearest"))
+                                    if remaining <= 0:
+                                        break
+                                    qty = min(pos2.qty, remaining)
+                                else:
+                                    qty = pos2.qty
                                 continue
-                        self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",
-                                           symbol=trade.symbol, code=diag.code, solution=diag.info.solution)
-                        self.core.telegram.send(f"⚠️ <b>No se pudo cerrar</b> <code>{trade.symbol}</code>\n"
-                                                f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
+                        # Solo se reintenta automáticamente un cierre TOTAL (cada intento relee la posición
+                        # real). Un parcial nunca: si una parte ya se ejecutó (orden dividida o respuesta
+                        # perdida), repetirlo cerraría de más; se avisa para revisarlo.
+                        retryable = not partial and diag.action in (Action.RETRY, Action.CHECK_STATUS)
+                        self._close_retryable[key] = retryable
+                        if alert or not retryable:
+                            self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",
+                                               symbol=trade.symbol, code=diag.code, solution=diag.info.solution)
+                            self.core.telegram.send(f"⚠️ <b>No se pudo cerrar</b> <code>{trade.symbol}</code>\n"
+                                                    f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
                         return False
                 if partial:
-                    trade.quantity = max(0.0, base - (filled or qty))
+                    done = filled or qty
+                    if base < trade.quantity:
+                        trade.sync_quantity(base)  # reducción externa aún no registrada
+                    if trade.bot_quantity > 0:
+                        trade.bot_quantity = max(0.0, trade.bot_quantity - done / (trade.multiplier or 1.0))
+                    trade.quantity = max(0.0, base - done)
                     self.save()
                     self.core.bus.emit("partial_close", f"Cierre parcial {trade.symbol}: {filled or qty:g}", "info")
                     return True
@@ -1361,7 +1509,7 @@ class TradeManager:
             if pos is None:
                 self._schedule_external_check(trade)
             elif abs(pos.qty - trade.quantity) > 1e-12 and not self._lock(symbol).locked():
-                trade.quantity = pos.qty
+                trade.sync_quantity(pos.qty)
                 if pos.entry_price:
                     trade.entry_price = pos.entry_price
                 self.save()
@@ -1418,7 +1566,7 @@ class TradeManager:
             if pos is None:
                 self._schedule_external_check(trade)
             elif abs(pos.qty - trade.quantity) > 1e-12:
-                trade.quantity = pos.qty
+                trade.sync_quantity(pos.qty)
                 trade.entry_price = pos.entry_price or trade.entry_price
 
     # ── Acciones manuales ─────────────────────────────────────────────────

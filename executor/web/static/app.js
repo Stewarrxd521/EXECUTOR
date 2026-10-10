@@ -252,6 +252,13 @@
     setDot('c-usr', h.user.connected ? 'on' : (h.credentials ? 'off' : ''));
     $('#trading-toggle').checked = !!s.trading_enabled;
     $('#lev-btn').textContent = `${s.leverage}x`;
+    const m = s.multiplier;
+    if (m) {
+      const mb = $('#mult-btn');
+      mb.classList.toggle('on', !!m.enabled);
+      mb.textContent = m.enabled ? `×${fn(m.effective, m.effective % 1 ? 2 : 0)}${m.mode === 'auto' ? ' AUTO' : ''}` : '×1';
+      mb.title = `Multiplicador: ${m.description}`;
+    }
     const ex = h.exchange_info;
     $('#foot').innerHTML = [
       `v${esc(s.version)}`, `activo ${dur(s.uptime_s)}`,
@@ -605,6 +612,67 @@
     });
   }
 
+  // ── Multiplicador de operaciones ───────────────────────────────────────
+  function multiplierModal() {
+    const m = (S.snap && S.snap.multiplier) || {};
+    const st = { enabled: !!m.enabled, mode: m.mode || 'manual' };
+    const usd = (v) => (v === null || v === undefined ? '–' : fn(v, 2));
+    const autoInfo = (v) => {
+      const a = v.auto || {};
+      const rows = (a.table || []).map((r) => `<tr class="${r.level === a.level ? 'cur' : ''}"><td>×${r.level}</td>
+        <td>${r.level > 1 ? '≥ ' + usd(r.activates_at) : '—'}</td>
+        <td>${r.hold_min === null ? '0' : usd(r.hold_min + 0.01)} – ${r.hold_max === null ? '∞' : usd(r.hold_max - 0.01)}</td></tr>`).join('');
+      return `<div class="box">${esc(v.source_label || '')}: <b>${usd(v.balance)} USDT</b> → nivel <b>×${a.level || 1}</b>
+          ${a.up_at ? ` · sube a ×${a.level + 1} con <b>${usd(a.up_at)}</b>` : ''}${a.down_at ? ` · baja a ×${a.level - 1} con <b>${usd(a.down_at)}</b> o menos` : ''}</div>
+        <table><thead><tr><th>Nivel</th><th>Se activa con</th><th>Se mantiene entre</th></tr></thead><tbody>${rows}</tbody></table>`;
+    };
+    openModal({
+      title: 'Multiplicador de operaciones',
+      body: `<div class="mult-modal">
+        <div class="switch-row"><span>Multiplicar el tamaño de las señales</span>
+          <label class="switch"><input type="checkbox" id="mm-on" ${st.enabled ? 'checked' : ''}><span class="slider"></span></label></div>
+        <div class="seg" id="mm-mode"><button type="button" data-mode="manual">Manual</button><button type="button" data-mode="auto">Automático</button></div>
+        <div id="mm-manual">
+          <label class="field"><span>Factor</span><input id="mm-factor" type="number" min="0.1" step="0.1" value="${num(m.factor) || 1}"><em>×</em></label>
+          <div class="pct-row">${[1, 1.5, 2, 3, 4, 5, 10].map((x) => `<button type="button" data-f="${x}">×${x}</button>`).join('')}</div>
+          <p class="muted small">Cada señal de apertura multiplica su quantity y su notional por este factor.</p>
+        </div>
+        <div id="mm-auto">
+          <label class="field"><span>Tamaño de nivel</span><input id="mm-step" type="number" min="1" step="1" value="${num(m.step_usdt) || 100}"><em>USDT</em></label>
+          <label class="field"><span>Balance</span><select id="mm-source">
+            <option value="wallet">Billetera</option><option value="margin">Margen (con PnL abierto)</option><option value="available">Disponible</option></select></label>
+          <div id="mm-auto-info">${autoInfo(m)}</div>
+          <p class="muted small">Sube un nivel al alcanzar el siguiente múltiplo y se mantiene hasta caer al múltiplo anterior (p. ej. ×2 se activa con 200 y se mantiene de 101 a 299).</p>
+        </div>
+        <label class="field"><span>Máximo</span><input id="mm-max" type="number" min="1" max="100" step="1" value="${num(m.max_factor) || 10}"><em>×</em></label>
+        <p class="muted small">Solo afecta a las señales de los bots (aperturas y cierres parciales). Las órdenes manuales y los grids no cambian.</p>
+      </div>`,
+      buttons: [
+        { label: 'Cancelar', onClick: closeModal },
+        { label: 'Guardar', cls: 'btn-primary', onClick: async (b) => {
+          b.disabled = true;
+          const args = { enabled: $('#mm-on').checked, mode: st.mode, max_factor: num($('#mm-max').value) || 10,
+            step_usdt: num($('#mm-step').value) || 100, source: $('#mm-source').value };
+          if (st.mode === 'manual') args.factor = num($('#mm-factor').value) || 1;
+          const r = await run('set_multiplier', args, (d) => `Multiplicador ${d.description}`);
+          b.disabled = false;
+          if (r) closeModal();
+        } },
+      ],
+      onOpen: (body) => {
+        $('#mm-source', body).value = m.source || 'wallet';
+        const paint = () => {
+          $$('#mm-mode button', body).forEach((x) => x.classList.toggle('active', x.dataset.mode === st.mode));
+          $('#mm-manual', body).hidden = st.mode !== 'manual';
+          $('#mm-auto', body).hidden = st.mode !== 'auto';
+        };
+        $$('#mm-mode button', body).forEach((x) => { x.onclick = () => { st.mode = x.dataset.mode; paint(); }; });
+        body.querySelectorAll('[data-f]').forEach((x) => { x.onclick = () => { $('#mm-factor', body).value = x.dataset.f; }; });
+        paint();
+      },
+    });
+  }
+
   // ── Grid: formulario y vista previa ────────────────────────────────────
   function setGridRange(pct) {
     const p = S.ticker ? (S.ticker.last || S.ticker.mark) : (S.marketMap.get(S.symbol) || [])[1];
@@ -685,7 +753,7 @@
     const body = rows.length ? rows.map((p) => `
       <tr data-sym="${p.symbol}" data-dir="${p.direction}">
         <td class="sym ${dcls(p.direction)}"><b class="link" data-act="select">${esc(p.symbol)}</b>
-          <span class="badge ${dcls(p.direction)}">${p.direction === 'LONG' ? 'Long' : 'Short'}</span> <span class="badge">${p.leverage}x</span>
+          <span class="badge ${dcls(p.direction)}">${p.direction === 'LONG' ? 'Long' : 'Short'}</span> <span class="badge">${p.leverage}x</span>${num(p.multiplier) && num(p.multiplier) !== 1 ? ` <span class="badge y" title="Tamaño multiplicado">×${fn(p.multiplier, num(p.multiplier) % 1 ? 2 : 0)}</span>` : ''}
           ${p.assumed ? '<span class="badge y" title="Registrada sin orden real (margen insuficiente)">ASUMIDA</span>' : ''}
           <span class="sub">${p.margin_type === 'isolated' ? 'Aislado' : p.margin_type ? 'Cruzado' : ''}${p.trade_id ? ` · #${p.trade_id}` : ''}${p.paper_id ? ` · paper #${p.paper_id}` : ''}</span></td>
         <td class="r ${p.direction === 'LONG' ? 'up' : 'down'}">${fq(p.qty)} ${esc(baseOf(p.symbol))}<span class="sub">${fn(p.notional)} USDT</span></td>
@@ -1026,6 +1094,7 @@
       if (!enabled && !(await confirmBox('Pausar trading', '<p>Las nuevas señales de apertura se rechazarán. Las posiciones abiertas, cierres, TP/SL y grids siguen funcionando.</p>', 'Pausar', 'btn-sell'))) { e.target.checked = true; return; }
       await run('toggle_trading', { enabled }, enabled ? 'Trading activado' : 'Trading pausado');
     };
+    $('#mult-btn').onclick = () => multiplierModal();
     $('#lev-btn').onclick = () => leverageModal('señales (por defecto)', S.snap ? S.snap.leverage : 4, (lev) => run('set_default_leverage', { leverage: lev }, `Leverage por defecto: ${lev}x`));
 
     // Mercados
