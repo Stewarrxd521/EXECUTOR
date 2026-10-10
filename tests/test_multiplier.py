@@ -266,3 +266,16 @@ async def test_ws_api_connect_failure_is_retryable_error():
         await ws.request("ticker.price", {"symbol": "BTCUSDT"}, timeout=2)
     assert exc.value.code == -1
     await ws.close()
+
+
+def test_known_zero_balance_drops_to_x1(tmp_path):
+    summary = {"available": 800.0, "last_sync": 0.0}
+    m = Multiplier(_FakeSettings(tmp_path), lambda: summary)
+    m.configure({"enabled": True, "mode": "auto", "source": "available"})
+    assert m.effective() == 8.0
+    summary["available"] = 0.0          # aún sin sincronizar: se conserva el nivel
+    assert m.effective() == 8.0
+    summary["last_sync"] = 1.0          # saldo confirmado en 0 → x1
+    assert m.effective() == 1.0
+    summary["available"] = 250.0
+    assert m.effective() == 2.0

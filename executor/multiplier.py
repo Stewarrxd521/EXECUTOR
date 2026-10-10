@@ -158,14 +158,17 @@ class Multiplier:
     def refresh(self, reason: str = "") -> int:
         """Recalcula el nivel automático con el balance actual. Devuelve el nivel."""
         st = self.state
+        summary = self._balances() or {}
         bal = self.balance()
-        if bal <= 0:  # balance aún desconocido: se conserva el nivel guardado, sin superar el máximo
+        if bal <= 0 and not summary.get("last_sync"):
+            # Balance aún desconocido (sin sincronizar): se conserva el nivel guardado, sin superar el máximo.
             capped = auto_level(st.level, 0.0, st.step_usdt, int(st.max_factor))
             if st.level and capped != st.level:
                 st.level = capped
                 self.save()
             return capped
-        new = auto_level(st.level, bal, st.step_usdt, int(st.max_factor))
+        # Balance conocido: si es 0 o negativo el nivel baja a x1 (nunca se mantiene uno alto sin saldo).
+        new = auto_level(st.level, bal, st.step_usdt, int(st.max_factor)) if bal > 0 else 1
         if new != st.level:
             old = st.level
             st.level, st.level_balance, st.level_ts = new, bal, time.time()
