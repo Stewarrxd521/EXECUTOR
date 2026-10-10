@@ -107,6 +107,9 @@ class Trade:
     has_bot_pnl: bool = False
     signal_close_price: float = 0.0
     closed_by: str = ""
+    # Multiplicador: cantidad que pidió el bot y factor medio aplicado (real ≈ bot × factor).
+    bot_quantity: float = 0.0
+    multiplier: float = 1.0
 
     @property
     def key(self) -> tuple[str, str]:
@@ -141,8 +144,19 @@ class Trade:
         data["margin"] = self.margin_usdt
         data["roe_pct"] = self.roe_pct
         data["levels"] = [t.get("level") for t in self.tranches if t.get("level")]
-        data["pnl_diff"] = (self.pnl_usdt - self.bot_pnl) if self.has_bot_pnl else None
+        mult = self.multiplier or 1.0
+        data["bot_pnl_scaled"] = self.bot_pnl * mult if self.has_bot_pnl else None
+        data["pnl_diff"] = (self.pnl_usdt - self.bot_pnl * mult) if self.has_bot_pnl else None
         return data
+
+    def note_tranche_scale(self, factor: float, bot_qty: float, real_qty: float) -> None:
+        """Acumula la cantidad pedida por el bot y recalcula el factor medio del trade."""
+        factor = factor or 1.0
+        bot_qty = bot_qty if bot_qty > 0 else (real_qty / factor if factor else real_qty)
+        prev_bot = self.bot_quantity
+        self.bot_quantity = prev_bot + bot_qty
+        if self.bot_quantity > 0:
+            self.multiplier = round((prev_bot * (self.multiplier or 1.0) + bot_qty * factor) / self.bot_quantity, 6)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Trade":
@@ -196,6 +210,7 @@ class TradeManager:
         self.leverage_override: Optional[int] = None
         self.signal_log: deque[dict] = deque(maxlen=300)
         self.grid_owner: Callable[[str, str], bool] = lambda symbol, direction: False
+        self.multiplier = None  # Multiplier (lo asigna el servicio)
         self.accepting = True
         self.ready = asyncio.Event()
         self._session_start = time.time()
@@ -208,6 +223,7 @@ class TradeManager:
         self._tasks: set[asyncio.Task] = set()
         self._unauth_warned: OrderedDict = OrderedDict()
         self._unknown_open: dict[tuple[str, str], float] = {}
+        self._open_alerts: dict[str, float] = {}
         self._reconciling: set[tuple[str, str]] = set()
         self._skipped_closed: dict[str, float] = {}
         self._recent_closed: dict[tuple[int, str, str], float] = {}
@@ -395,9 +411,26 @@ class TradeManager:
             log.warning("Señal %s %s rechazada desde %s: secreto incorrecto. El valor debe coincidir con "
                         "EXECUTOR_SECRET (app_25) / ExecutorBridge(signal_secret=...)", action, symbol, ip or "?")
 
+    def _alert_open_failed(self, sig: Signal, why: str) -> None:
+        """Aviso visible (dashboard + Telegram) cuando una apertura del bot NO se ejecuta."""
+        key = f"{sig.symbol}|{why[:40]}"
+        now = time.time()
+        if now - self._open_alerts.get(key, 0) < 60:
+            return
+        self._open_alerts[key] = now
+        if len(self._open_alerts) > 256:
+            self._open_alerts = {k: v for k, v in self._open_alerts.items() if now - v < 60}
+        tid = f" trade_id {sig.trade_id}" if sig.trade_id else ""
+        self.core.bus.emit("signal_failed", f"Apertura NO ejecutada: {sig.direction} {sig.symbol}{tid} — {why}",
+                           "error", symbol=sig.symbol)
+        self.core.telegram.send(f"⚠️ <b>Señal OPEN no ejecutada</b> {sig.direction} <code>{sig.symbol}</code>{tid}\n"
+                                f"{why}")
+
     def _reject(self, sig: Signal, error: str, status: int = 400, **extra) -> tuple[int, dict, None]:
         self.status["signals_rejected"] += 1
         self._log_signal(sig.action, sig.symbol, sig.direction, False, error, sig)
+        if sig.action == "open" and status != 503:
+            self._alert_open_failed(sig, error)
         if sig.action == "open" and sig.trade_id and status != 503:  # 503 = reintentable, no es definitivo
             self._mark_rejected(sig.trade_id, sig.symbol)
         log.warning("Señal %s %s %s rechazada: %s", sig.action.upper(), sig.symbol, sig.direction, error)
@@ -486,7 +519,10 @@ class TradeManager:
         if not self.accepting:
             return self._reject(sig, "executor reiniciándose: reintenta en unos segundos", 503, retry=True)
 
-        if explicit_id or self.settings.signal_dedupe_ttl_s > 0:
+        # El antiduplicado por contenido NUNCA aplica a «open»: los tramos de un mismo
+        # trade_id pueden llegar idénticos y en el mismo segundo (app_25 al promediar).
+        content_dedupe = self.settings.signal_dedupe_ttl_s > 0 and action != "open"
+        if explicit_id or content_dedupe:
             sig.dedupe_key = f"id:{explicit_id}" if explicit_id else self._dedupe_key(data)
             if self._dedupe_seen(sig.dedupe_key):
                 self.status["signals_duplicate"] += 1
@@ -588,12 +624,18 @@ class TradeManager:
         note = ""
         unknown = False
         baseline = 0.0
+        factor = 1.0
         already_closed: Optional[float] = None
         try:
             await self._await_ready()
             await self._wait_tasks(prior_closes or [])
             already_closed = self._closed_recently(sig.trade_id, symbol, direction)
             if already_closed is None:
+                # Multiplicador (manual o automático por balance): escala el tamaño pedido.
+                factor = self.multiplier.effective() if self.multiplier is not None else 1.0
+                bot_quantity = quantity
+                if factor != 1.0:
+                    quantity, notional, margin = quantity * factor, notional * factor, margin * factor
                 # Tamaño como antes: quantity × price; notional/margin solo si no hay quantity.
                 if quantity > 0 and price > 0:
                     q_notional = quantity * price
@@ -608,7 +650,8 @@ class TradeManager:
                 baseline = before.qty if before is not None else 0.0
                 trade = await self.open_trade(symbol, direction, signal_price=price, quantity=quantity,
                                               notional=notional, paper_trade_id=sig.trade_id, source="signal",
-                                              leverage=lev, level=level, signal_id=sig.signal_id)
+                                              leverage=lev, level=level, signal_id=sig.signal_id,
+                                              multiplier=factor, bot_quantity=bot_quantity)
                 already_closed = self._skipped_closed.pop(sig.signal_id, None)
                 unknown = trade is None and self._unknown_open.pop((symbol, direction), None) is not None
         except Exception:
@@ -640,6 +683,7 @@ class TradeManager:
                 if sig.trade_id:
                     self._mark_rejected(sig.trade_id, symbol)
                 entry = self._log_signal("open", symbol, direction, False, "no ejecutada (ver pestaña Errores)", sig)
+                self._alert_open_failed(sig, "Binance la rechazó (ver pestaña Errores)")
             return {"ok": False, "detail": entry["detail"]}
 
         self.status["signals_open"] += 1
@@ -650,6 +694,8 @@ class TradeManager:
         if pending is not None:
             self._note_closed(sig.trade_id, symbol, direction)
         detail = f"#{trade.id} qty={trade.quantity:g} @ {trade.entry_price:g}" + (" (ASUMIDA)" if trade.order_assumed else "")
+        if factor != 1.0:
+            detail += f" — multiplicador x{factor:g}"
         if note:
             detail += f" — {note}"
         protections = []
@@ -770,6 +816,9 @@ class TradeManager:
         detail = ""
         if trade is not None:
             symbol = symbol or trade.symbol
+            if quantity and (trade.multiplier or 1.0) != 1.0:
+                # Cierre parcial: la cantidad del bot se escala con el factor que recibió la operación.
+                quantity *= trade.multiplier
             ok = await self.close_trade(trade, reason, close_price=close_price, max_qty=quantity or None,
                                         bot_pnl=bot_pnl, closed_by="signal")
             detail = "cerrada" if ok else "error al cerrar (ver pestaña Errores)"
@@ -924,7 +973,7 @@ class TradeManager:
     async def open_trade(self, symbol: str, direction: str, *, signal_price: float = 0.0, quantity: float = 0.0,
                          notional: float = 0.0, paper_trade_id: int = 0, source: str = "signal",
                          leverage: Optional[int] = None, level: float = 0.0,
-                         signal_id: str = "") -> Optional[Trade]:
+                         signal_id: str = "", multiplier: float = 1.0, bot_quantity: float = 0.0) -> Optional[Trade]:
         symbol, direction = symbol.upper(), direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
         async with self._lock(symbol):
@@ -964,7 +1013,8 @@ class TradeManager:
                      float(qty) * ref, ref, applied_lev)
             owner = {"kind": "open", "symbol": symbol, "direction": direction}
             tranche = {"level": level, "notional_req": desired, "signal_price": signal_price,
-                       "signal_id": signal_id, "ts": time.time()}
+                       "signal_id": signal_id, "ts": time.time(), "multiplier": multiplier,
+                       "bot_qty": bot_quantity}
             try:
                 fill = await self.orders.market(ctx, qty, prefix=f"X{paper_trade_id or 0}", owner=owner)
             except BinanceAPIError as err:
@@ -978,6 +1028,7 @@ class TradeManager:
                                                  assumed=True, source=source)
                     if trade is not None:
                         trade.tranches.append({**tranche, "qty": float(qty), "fill_price": ref, "assumed": True})
+                        trade.note_tranche_scale(multiplier, bot_quantity, float(qty))
                         self._announce_open(trade)
                     return trade
                 self.core.bus.emit("open_failed", f"{symbol}: {diag.info.title}", "error", symbol=symbol,
@@ -1003,6 +1054,7 @@ class TradeManager:
                 trade.tranches.append({**tranche, "qty": fill.qty, "fill_price": fill.avg_price,
                                        "order_id": fill.order_id, "leverage": applied_lev,
                                        "leverage_target": target_lev})
+                trade.note_tranche_scale(multiplier, bot_quantity, fill.qty)
                 self.save()
                 self._announce_open(trade)
             return trade

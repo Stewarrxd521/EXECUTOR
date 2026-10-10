@@ -17,6 +17,7 @@ from .core import Core
 from .errors import BinanceAPIError, ErrorDoctor, ErrorJournal
 from .exchange_info import ExchangeInfo, apply_brackets, parse_exchange_info
 from .grid import GridManager
+from .multiplier import Multiplier
 from .notifier import EventBus, TelegramNotifier
 from .orders import OrderContext, OrderExecutor
 from .precision import D, fmt, parse_bool, safe_float
@@ -81,6 +82,9 @@ class ExecutorService:
         self.orders = OrderExecutor(self.core)
         self.trades = TradeManager(self.core, self.orders)
         self.grids = GridManager(self.core, self.orders)
+        self.multiplier = Multiplier(settings, lambda: self.core.account.summary(self.core.market.marks),
+                                     self._on_multiplier_change)
+        self.trades.multiplier = self.multiplier
         self.trades.grid_owner = self.grids.owns
         self.grids.trade_owner = lambda s, d: self.trades.get_trade(s, d) is not None
         self.user = UserDataStream(settings.stream_base_url, ws, clock, self._on_user_event, self._on_user_connect)
@@ -103,9 +107,13 @@ class ExecutorService:
         self.core.exinfo.load()
         self.trades.load()
         self.grids.load()
+        self.multiplier.load()
         self.core.telegram.start()
         self.core.market.start()
 
+        if s.signal_dedupe_ttl_s > 0:
+            log.warning("SIGNAL_DEDUPE_TTL_S=%gs: antiduplicado por contenido activo para close/TP/SL (nunca para "
+                        "open: los tramos con el mismo trade_id siempre se ejecutan)", s.signal_dedupe_ttl_s)
         if not s.signal_secret_is_default and "," in s.signal_secret:
             log.warning("SIGNAL_SECRET contiene comas y se usa como UN solo secreto (como en la versión original). "
                         "Para aceptar varios secretos usa SIGNAL_SECRETS=secreto1,secreto2")
@@ -199,6 +207,7 @@ class ExecutorService:
             t.cancel()
         self.trades.store.save_now()
         self.grids.store.save_now()
+        self.multiplier.store.save_now()
         await self.user.stop()
         await self.core.market.stop()
         await self.core.telegram.stop()
@@ -343,6 +352,10 @@ class ExecutorService:
             self.core.bus.emit("algo", f"Orden condicional {info.get('s', '')} rechazada al dispararse: "
                                        f"{info.get('r', '')}", "error")
 
+    def _on_multiplier_change(self, message: str, level: str) -> None:
+        self.core.bus.emit("multiplier", message, level)
+        self.core.telegram.send(f"✖️ <b>{message}</b>")
+
     def _on_market_tick(self) -> None:
         self.trades.refresh_marks()
         self.grids.on_tick()
@@ -396,6 +409,7 @@ class ExecutorService:
                 "source": "grid" if grid else (trade.source if trade else "externa"),
                 "trade_id": trade.id if trade else None, "paper_id": trade.paper_trade_id if trade else None,
                 "paper_ids": trade.paper_ids if trade else [], "levels": trade.to_dict()["levels"] if trade else [],
+                "multiplier": trade.multiplier if trade else 1.0,
                 "open_time": trade.open_time if trade else "", "assumed": False,
                 "fees": trade.fees_usdt if trade else 0.0,
             })
@@ -410,7 +424,7 @@ class ExecutorService:
                 "roe": t.roe_pct, "notional": t.notional_usdt, "margin": t.margin_usdt, "leverage": t.leverage,
                 "margin_type": "", "liq": 0.0, "tp": t.tp_price, "sl": t.sl_price,
                 "source": t.source, "trade_id": t.id, "paper_id": t.paper_trade_id, "paper_ids": t.paper_ids,
-                "levels": t.to_dict()["levels"], "open_time": t.open_time,
+                "levels": t.to_dict()["levels"], "open_time": t.open_time, "multiplier": t.multiplier,
                 "assumed": t.order_assumed or not self.settings.has_credentials, "fees": t.fees_usdt,
             })
         rows.sort(key=lambda r: (r["symbol"], r["direction"]))
@@ -480,6 +494,7 @@ class ExecutorService:
             "status": trades.status,
             "trading_enabled": trades.trading_enabled,
             "leverage": self.settings.leverage,
+            "multiplier": self.multiplier.view(),
             "settings": self.settings.public_view(),
             "positions": self.positions_view(),
             "orders": self.orders_view(),
@@ -554,6 +569,8 @@ class ExecutorService:
             "hedge_mode": acct["hedge_mode"],
             "ready": t.ready.is_set(),
             "proxy_configured": bool(self.settings.proxy_urls),
+            "multiplier": self.multiplier.effective(),
+            "multiplier_mode": self.multiplier.describe(),
             "version": __version__,
             "grids": [{k: g[k] for k in ("id", "symbol", "mode", "status", "grid_profit", "total_pnl")}
                       for g in self.grids.list()],
@@ -727,6 +744,17 @@ class ExecutorService:
             raise CommandError("leverage entre 1 y 125")
         self.trades.set_default_leverage(lev)
         return {"leverage": lev}
+
+    async def _cmd_multiplier(self, a: dict):
+        return self.multiplier.view()
+
+    async def _cmd_set_multiplier(self, a: dict):
+        try:
+            view = self.multiplier.configure(a)
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
+        self.core.bus.emit("multiplier", f"Multiplicador: {view['description']}", "info")
+        return view
 
     async def _cmd_clear_history(self, a: dict):
         return {"cleared": self.trades.clear_history()}
@@ -1026,6 +1054,10 @@ COMMANDS: dict[str, dict] = {
     "position_mode": _c(False, "Modo Hedge/One-way de la cuenta", "", "GET /api/position-mode"),
     "set_position_mode": _c(True, "Cambia el modo de posición", "hedge_mode", "POST /api/position-mode"),
     "toggle_trading": _c(True, "Pausa/reactiva aperturas por señal", "enabled?", "POST /api/trading"),
+    "multiplier": _c(False, "Estado del multiplicador de operaciones", "", "GET /api/multiplier"),
+    "set_multiplier": _c(True, "Activa/ajusta el multiplicador (manual o automático por balance)",
+                         "enabled?, mode?=manual|auto|off, factor?, step_usdt?, max_factor?, source?=wallet|margin|available",
+                         "POST /api/multiplier"),
     "clear_history": _c(True, "Borra el historial y reinicia el PnL", "", "POST /api/clear-history"),
     "grid_create": _c(True, "Crea un bot Grid", "symbol, lower, upper, grids, investment, leverage?, mode?, "
                                                 "spacing?, stop_loss?, take_profit?, trigger_price?", "POST /api/grids"),

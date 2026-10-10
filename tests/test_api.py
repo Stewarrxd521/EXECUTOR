@@ -6,41 +6,12 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 import executor_client
-from executor.config import LEGACY_SIGNAL_SECRETS
 from executor.precision import parse_bool
 from executor.service import COMMANDS, ExecutorService
 from executor.web.api import REST_ROUTES
 from executor.web.server import build_app
 from tests.compat import bridge_app25, bridge_standalone
-from tests.conftest import make_settings, wait_for
-
-SECRET = "clave-secreta-aleatoria"
-
-
-def legacy_settings(fake, tmp_path, **over):
-    """Executor desplegado sin SIGNAL_SECRET ni DASHBOARD_TOKEN (como en Render)."""
-    over.setdefault("dashboard_token", "")
-    return make_settings(fake, tmp_path, signal_secret=LEGACY_SIGNAL_SECRETS[0],
-                         signal_secrets=list(LEGACY_SIGNAL_SECRETS), signal_secret_is_default=True, **over)
-
-
-@pytest.fixture
-async def open_service(fake, tmp_path, snapshot_file):
-    svc = ExecutorService(legacy_settings(fake, tmp_path))
-    await svc.start()
-    await wait_for(lambda: svc.core.market.marks and svc.user.conn.connected and svc.trades.ready.is_set())
-    yield svc
-    await svc.stop()
-
-
-@pytest.fixture
-async def live_url(open_service):
-    """Servidor HTTP real (los bridges usan urllib en hilos)."""
-    server = TestServer(build_app(open_service))
-    await server.start_server()
-    yield str(server.make_url("")).rstrip("/")
-    await server.close()
-
+from tests.conftest import SECRET, legacy_settings, wait_for
 
 def trade(svc, symbol="ETHUSDT", direction="SHORT"):
     return svc.trades.get_trade(symbol, direction)
@@ -624,3 +595,42 @@ async def test_cross_site_signal_is_rejected(open_service):
         assert r.status == 403
         r = await client.post("/signal", json={"action": "close_all"}, headers={"X-Signal-Secret": SECRET})
         assert r.status == 200
+
+
+# ── 3 señales en el mismo segundo (app_25 abre varios tramos seguidos) ────────
+@pytest.mark.parametrize("dedupe_ttl", [0, 10])
+async def test_app25_burst_of_tranches_all_execute(fake, tmp_path, snapshot_file, dedupe_ttl):
+    svc = ExecutorService(legacy_settings(fake, tmp_path, signal_dedupe_ttl_s=dedupe_ttl))
+    await svc.start()
+    await wait_for(lambda: svc.trades.ready.is_set() and svc.user.conn.connected)
+    server = TestServer(build_app(svc))
+    await server.start_server()
+    try:
+        url = str(server.make_url("")).rstrip("/")
+        logs = []
+        bridge = bridge_app25.ExecutorBridge(executor_url=url, signal_secret=SECRET, logger=logs.append)
+        # Mismo trade_id, mismo precio y misma cantidad, sin pausa entre envíos (como _ensure_short en bucle).
+        for level in (50, 75, 100):
+            bridge.notify_open(trade_id=57, symbol="ETHUSDT", direction="SHORT", price=3000, quantity=0.01,
+                               notional=30, level=level)
+        await wait_for(lambda: svc.trades.get_trade("ETHUSDT", "SHORT") is not None
+                       and svc.trades.get_trade("ETHUSDT", "SHORT").quantity == pytest.approx(0.03), timeout=10)
+        assert sorted(svc.trades.get_trade("ETHUSDT", "SHORT").to_dict()["levels"]) == [50, 75, 100]
+        assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == pytest.approx(-0.03)
+        # El bridge original (sin level) manda payloads idénticos: tampoco se descartan.
+        standalone = bridge_standalone.ExecutorBridge(executor_url=url, signal_secret=SECRET, logger=logs.append)
+        await asyncio.gather(*[asyncio.to_thread(standalone.notify_open, 58, "BTCUSDT", "LONG", 65000, 0.002)
+                               for _ in range(3)])
+        await wait_for(lambda: svc.trades.get_trade("BTCUSDT", "LONG") is not None
+                       and svc.trades.get_trade("BTCUSDT", "LONG").quantity == pytest.approx(0.006), timeout=10)
+        assert svc.trades.status["signals_duplicate"] == 0
+    finally:
+        await server.close()
+        await svc.stop()
+
+
+async def test_burst_on_three_symbols(open_service, live_url, fake):
+    bridge = bridge_app25.ExecutorBridge(executor_url=live_url, signal_secret=SECRET, logger=lambda m: None)
+    for i, (sym, px, qty) in enumerate([("ETHUSDT", 3000, 0.01), ("BTCUSDT", 65000, 0.001), ("TESTUSDT", 0.5, 20)]):
+        bridge.notify_open(trade_id=60 + i, symbol=sym, direction="SHORT", price=px, quantity=qty, notional=10, level=50)
+    await wait_for(lambda: len(open_service.trades.open_trades) == 3, timeout=10)
