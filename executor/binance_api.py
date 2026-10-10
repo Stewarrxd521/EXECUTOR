@@ -199,7 +199,12 @@ class BinanceWsApi:
         timestamp_retry = True
         send_retry = True
         while True:
-            await self.connect()
+            try:
+                await self.connect()
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                # Nada se envió: es seguro reintentar (OrderExecutor reintenta el código -1).
+                self.errors += 1
+                raise BinanceAPIError(-1, f"{self.name}: sin conexión: {exc!r}", method=method) from exc
             payload_params = self._prepare(params, signed, with_api_key)
             req_id = f"{next(self._ids)}"
             payload: dict = {"id": req_id, "method": method}

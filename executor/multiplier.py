@@ -108,12 +108,23 @@ class Multiplier:
 
     def _from_env(self) -> MultiplierState:
         s = self.settings
+
+        def valid(value: float, default: float, low: float, high: float, name: str) -> float:
+            if isinstance(value, (int, float)) and math.isfinite(value) and low <= value <= high:
+                return float(value)
+            log.warning("%s=%r no es válido (entre %g y %g); se usa %g", name, value, low, high, default)
+            return default
+
+        if s.multiplier_mode not in MODES + ("off", ""):
+            log.warning("MULTIPLIER_MODE=%r no es válido (off, manual o auto); multiplicador desactivado",
+                        s.multiplier_mode)
         mode = s.multiplier_mode if s.multiplier_mode in MODES else "manual"
         source = s.multiplier_source if s.multiplier_source in SOURCES else "wallet"
-        max_factor = min(MAX_LIMIT, max(1.0, s.multiplier_max))
-        return MultiplierState(enabled=s.multiplier_mode in MODES, mode=mode,
-                               factor=min(max_factor, max(0.01, s.multiplier_factor)),
-                               step_usdt=max(1.0, s.multiplier_step_usdt), max_factor=max_factor, source=source)
+        max_factor = valid(s.multiplier_max, 10.0, 1.0, MAX_LIMIT, "MULTIPLIER_MAX")
+        factor = valid(s.multiplier_factor, 1.0, 0.01, max_factor, "MULTIPLIER")
+        step = valid(s.multiplier_step_usdt, 100.0, 1.0, 1e9, "MULTIPLIER_STEP_USDT")
+        return MultiplierState(enabled=s.multiplier_mode in MODES, mode=mode, factor=factor, step_usdt=step,
+                               max_factor=max_factor, source=source)
 
     def _serialize(self) -> dict:
         return {"state": asdict(self.state), "env": self._env_signature()}
@@ -148,8 +159,12 @@ class Multiplier:
         """Recalcula el nivel automático con el balance actual. Devuelve el nivel."""
         st = self.state
         bal = self.balance()
-        if bal <= 0:  # balance aún desconocido: se conserva el nivel guardado
-            return max(1, st.level or 1)
+        if bal <= 0:  # balance aún desconocido: se conserva el nivel guardado, sin superar el máximo
+            capped = auto_level(st.level, 0.0, st.step_usdt, int(st.max_factor))
+            if st.level and capped != st.level:
+                st.level = capped
+                self.save()
+            return capped
         new = auto_level(st.level, bal, st.step_usdt, int(st.max_factor))
         if new != st.level:
             old = st.level
@@ -251,6 +266,7 @@ class Multiplier:
                     new.level = 0
                 new.source = raw
         new.factor = min(new.factor, new.max_factor)
+        new.level = min(new.level, int(new.max_factor))
         if (new.mode == "auto" and new.enabled and not st.enabled) or new.mode != st.mode:
             new.level = 0  # al activar el automático se parte del balance actual
         new.updated_ts = time.time()

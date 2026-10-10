@@ -161,7 +161,10 @@ class Trade:
     @classmethod
     def from_dict(cls, data: dict) -> "Trade":
         names = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in data.items() if k in names})
+        trade = cls(**{k: v for k, v in data.items() if k in names})
+        if "bot_quantity" not in data:  # guardado antes del multiplicador: todo cuenta como x1
+            trade.bot_quantity = trade.quantity / (trade.multiplier or 1.0)
+        return trade
 
 
 @dataclass
@@ -231,6 +234,7 @@ class TradeManager:
         # open espera a los close aceptados antes que él (nunca a los posteriores).
         self._open_tasks: dict[str, list[tuple[str, asyncio.Task]]] = {}
         self._close_tasks: dict[str, list[tuple[str, asyncio.Task]]] = {}
+        self._close_all_tasks: set[asyncio.Task] = set()
         self._last_close_fill: dict[str, OrderUpdate] = {}
         self._pending_external: set[tuple[str, str]] = set()
         self.store = JsonStore(core.settings.data_dir / "trades.json", self._serialize)
@@ -570,6 +574,7 @@ class TradeManager:
             return self._reject(sig, f"{symbol} {direction} está gestionado por un bot Grid", 200)
         self._inflight[(symbol, direction)] += 1
         prior_closes = self._pending_tasks(self._close_tasks, symbol, direction)
+        prior_closes += [t for t in self._close_all_tasks if not t.done()]  # un close_all anterior va primero
         task = self._spawn(self._signal_open(sig, quantity, notional, margin, prior_closes))
         self._track(self._open_tasks, symbol, direction, task)
         return 200, {"ok": True, "action": "open", "symbol": symbol, "direction": direction}, task
@@ -625,6 +630,7 @@ class TradeManager:
         unknown = False
         baseline = 0.0
         factor = 1.0
+        bot_quantity = quantity
         already_closed: Optional[float] = None
         try:
             await self._await_ready()
@@ -633,7 +639,8 @@ class TradeManager:
             if already_closed is None:
                 # Multiplicador (manual o automático por balance): escala el tamaño pedido.
                 factor = self.multiplier.effective() if self.multiplier is not None else 1.0
-                bot_quantity = quantity
+                if quantity <= 0 and notional <= 0 and margin <= 0:
+                    notional = self.settings.default_notional_usdt  # señal sin tamaño (app.py): también se escala
                 if factor != 1.0:
                     quantity, notional, margin = quantity * factor, notional * factor, margin * factor
                 # Tamaño como antes: quantity × price; notional/margin solo si no hay quantity.
@@ -676,7 +683,8 @@ class TradeManager:
                 # Pudo ejecutarse en Binance: no se marca como rechazada (su close debe
                 # funcionar) y se relee la posición real para registrarla si existe.
                 self._reconciling.add((symbol, direction))
-                self._spawn(self._reconcile_unknown_open(symbol, direction, sig.trade_id, baseline))
+                self._spawn(self._reconcile_unknown_open(symbol, direction, sig.trade_id, baseline, factor,
+                                                         bot_quantity))
                 entry = self._log_signal("open", symbol, direction, False,
                                          "estado desconocido: se verifica la posición real en Binance", sig)
             else:
@@ -723,7 +731,8 @@ class TradeManager:
                              sig)
         return {"ok": True, "detail": detail, "trade": trade.to_dict()}
 
-    async def _reconcile_unknown_open(self, symbol: str, direction: str, paper_id: int, baseline: float) -> None:
+    async def _reconcile_unknown_open(self, symbol: str, direction: str, paper_id: int, baseline: float,
+                                      factor: float = 1.0, bot_quantity: float = 0.0) -> None:
         """Tras una apertura de estado desconocido, registra lo que Binance sí abrió.
 
         Solo se atribuye a la señal la cantidad que supera lo que ya había
@@ -745,15 +754,19 @@ class TradeManager:
                         continue
                     if self.grid_owner(symbol, direction):
                         return
+                    added = real - max(baseline, tracked)
                     if trade is None:
                         trade = self.adopt_position(pos, paper_id=paper_id, source="signal")
+                        trade.bot_quantity, trade.multiplier = 0.0, 1.0
+                        trade.note_tranche_scale(factor, bot_quantity, pos.qty)
                         self._announce_open(trade)
                     else:
+                        trade.note_tranche_scale(factor, bot_quantity, added)
                         trade.quantity = pos.qty
                         trade.entry_price = pos.entry_price or trade.entry_price
                         if paper_id:
                             self._map_paper(trade, paper_id)
-                        self.save()
+                    self.save()
                     log.warning("%s %s: la apertura de estado desconocido SÍ se ejecutó (posición %s); registrada",
                                 direction, symbol, pos.qty)
                     self._rejected_ids.pop((paper_id, symbol), None)
@@ -806,6 +819,34 @@ class TradeManager:
 
     async def _signal_close(self, sig: Signal, reason: str, close_price: float, quantity: float,
                             bot_pnl: Optional[float], prior_opens: Optional[list] = None) -> dict:
+        """Cierre por señal. Un error inesperado (p. ej. sin conexión) se reintenta: un
+        cierre perdido deja la posición abierta."""
+        for attempt, delay in enumerate((0.0, 3.0, 10.0)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                result = await self._signal_close_once(sig, reason, close_price, quantity, bot_pnl,
+                                                       prior_opens if attempt == 0 else None)
+            except Exception as exc:
+                log.exception("Cierre %s %s (trade_id %s) falló (intento %d)", sig.symbol, sig.direction,
+                              sig.trade_id, attempt + 1)
+                last = f"{type(exc).__name__}: {exc}"
+                continue
+            return result  # un rechazo de Binance ya se avisa en close_trade (close_failed + Telegram)
+        self.status["signals_rejected"] += 1
+        self._log_signal("close", sig.symbol, sig.direction, False, f"no se pudo cerrar: {last}", sig)
+        self._alert_close_failed(sig, last)
+        return {"ok": False, "detail": last}
+
+    def _alert_close_failed(self, sig: Signal, why: str) -> None:
+        tid = f" trade_id {sig.trade_id}" if sig.trade_id else ""
+        self.core.bus.emit("signal_failed", f"Cierre NO ejecutado: {sig.direction} {sig.symbol}{tid} — {why}. "
+                                            "Revisa la posición", "error", symbol=sig.symbol)
+        self.core.telegram.send(f"🚨 <b>Señal CLOSE no ejecutada</b> {sig.direction} <code>{sig.symbol}</code>{tid}\n"
+                                f"{why}\nRevisa la posición en Binance")
+
+    async def _signal_close_once(self, sig: Signal, reason: str, close_price: float, quantity: float,
+                                 bot_pnl: Optional[float], prior_opens: Optional[list] = None) -> dict:
         symbol, direction = sig.symbol, sig.direction or None
         await self._await_ready()
         await self._wait_tasks(prior_opens or [])  # solo las aperturas aceptadas antes que este close
@@ -881,14 +922,15 @@ class TradeManager:
     # ── close_all / TP / SL ───────────────────────────────────────────────
     def _accept_close_all(self, sig: Signal):
         total = len(self.trades)
-        task = self._spawn(self._signal_close_all(sig))
+        prior_opens = self._pending_tasks(self._open_tasks, "", None)  # todas las aperturas ya aceptadas
+        task = self._spawn(self._signal_close_all(sig, prior_opens))
+        self._close_all_tasks.add(task)
+        task.add_done_callback(self._close_all_tasks.discard)
         return 200, {"ok": True, "action": "close_all", "positions_targeted": total}, task
 
-    async def _signal_close_all(self, sig: Signal) -> dict:
+    async def _signal_close_all(self, sig: Signal, prior_opens: Optional[list] = None) -> dict:
         await self._await_ready()
-        deadline = time.time() + INFLIGHT_WAIT_S
-        while self._inflight and time.time() < deadline:
-            await asyncio.sleep(0.05)
+        await self._wait_tasks(prior_opens or [])  # no espera (ni cierra) aperturas recibidas después
         closed = await self.close_all("CLOSE_ALL")
         self.status["signals_close"] += len(closed)
         detail = f"{len(closed)} posición(es) cerradas"
@@ -1028,7 +1070,8 @@ class TradeManager:
                                                  assumed=True, source=source)
                     if trade is not None:
                         trade.tranches.append({**tranche, "qty": float(qty), "fill_price": ref, "assumed": True})
-                        trade.note_tranche_scale(multiplier, bot_quantity, float(qty))
+                        if source == "signal":
+                            trade.note_tranche_scale(multiplier, bot_quantity, float(qty))
                         self._announce_open(trade)
                     return trade
                 self.core.bus.emit("open_failed", f"{symbol}: {diag.info.title}", "error", symbol=symbol,
@@ -1054,7 +1097,8 @@ class TradeManager:
                 trade.tranches.append({**tranche, "qty": fill.qty, "fill_price": fill.avg_price,
                                        "order_id": fill.order_id, "leverage": applied_lev,
                                        "leverage_target": target_lev})
-                trade.note_tranche_scale(multiplier, bot_quantity, fill.qty)
+                if source == "signal":
+                    trade.note_tranche_scale(multiplier, bot_quantity, fill.qty)
                 self.save()
                 self._announce_open(trade)
             return trade
@@ -1127,7 +1171,8 @@ class TradeManager:
                       quantity=pos.qty, open_time=utc_now_str(),
                       leverage=self.core.account.leverage.get(pos.symbol) or self.settings.leverage,
                       paper_trade_id=paper_id, current_price=self.core.market.price(pos.symbol) or pos.entry_price,
-                      hedge_mode=pos.side != "BOTH", step_size=fmt(rules.step_size), source=source)
+                      hedge_mode=pos.side != "BOTH", step_size=fmt(rules.step_size), source=source,
+                      bot_quantity=pos.qty, multiplier=1.0)
         self.trades[trade.key] = trade
         self._map_paper(trade, paper_id)
         self.save()
@@ -1212,6 +1257,15 @@ class TradeManager:
                 step = float(rules.qty_step(True))
                 qty = min(base, max_qty) if max_qty and max_qty > 0 else base
                 partial = bool(max_qty) and qty < base - step / 2
+                if partial:
+                    # Cantidad parcial al múltiplo exacto del step (p. ej. 0.003 × 3 = 0.009000000000000001).
+                    rounded = float(rules.round_qty(D(fmt(qty)), True, "nearest"))
+                    if rounded <= 0:
+                        log.warning("%s: cierre parcial de %s es menor que el step %s; se ignora", trade.symbol,
+                                    qty, step)
+                        return False
+                    qty = min(rounded, base)
+                    partial = qty < base - step / 2
                 if not partial:
                     await self.orders.cancel_protection(trade.symbol, trade.direction)
                 side = "SELL" if trade.direction == "LONG" else "BUY"
@@ -1239,7 +1293,10 @@ class TradeManager:
                                                 f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
                         return False
                 if partial:
-                    trade.quantity = max(0.0, base - (filled or qty))
+                    done = filled or qty
+                    trade.quantity = max(0.0, base - done)
+                    if trade.bot_quantity > 0:
+                        trade.bot_quantity = max(0.0, trade.bot_quantity - done / (trade.multiplier or 1.0))
                     self.save()
                     self.core.bus.emit("partial_close", f"Cierre parcial {trade.symbol}: {filled or qty:g}", "info")
                     return True

@@ -153,3 +153,116 @@ def test_settings_from_env(monkeypatch):
     monkeypatch.setenv("MULTIPLIER_STEP_USDT", "250")
     s = load_settings()
     assert s.multiplier_mode == "auto" and s.multiplier_step_usdt == 250
+
+
+# ── Regresiones de la revisión adversarial ─────────────────────────────────
+async def test_auto_level_updates_without_dashboard(fake, tmp_path, snapshot_file):
+    svc = ExecutorService(legacy_settings(fake, tmp_path))
+    await svc.start()
+    try:
+        await wait_for(lambda: svc.trades.ready.is_set() and svc.core.account.usdt().wallet > 0)
+        svc.multiplier.configure({"enabled": True, "mode": "auto", "step_usdt": 5000})
+        events = []
+        svc.core.bus.subscribe(lambda e: events.append(e))
+        for wallet in (15_000, 12_000):  # sin consultar el multiplicador entre medias
+            fake.wallet = wallet
+            await svc.refresh_balance(force=True)
+        assert svc.multiplier.state.level == 3
+        assert any(e["kind"] == "multiplier" and "x2 ▲ x3" in e["text"] for e in events)
+    finally:
+        await svc.stop()
+
+
+async def test_partial_close_with_x3_is_rounded_to_step(open_service, fake):
+    svc, t = open_service, open_service.trades
+    svc.multiplier.configure({"enabled": True, "mode": "manual", "factor": 3})
+    t.handle_signal({"action": "open", "trade_id": 81, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    step_before = svc.core.exinfo.get("ETHUSDT").step_size
+    t.handle_signal({"action": "close", "trade_id": 81, "symbol": "ETHUSDT", "direction": "SHORT",
+                     "quantity": 0.003, "reason": "PARTIAL"})
+    await wait_for(lambda: fake.positions[("ETHUSDT", "SHORT")]["amt"] == pytest.approx(-0.021))
+    assert svc.core.exinfo.get("ETHUSDT").step_size == step_before  # no «aprende» un step falso
+    assert not svc.core.journal.entries()
+    trade = t.get_trade("ETHUSDT", "SHORT")
+    assert trade.bot_quantity == pytest.approx(0.007) and trade.multiplier == 3.0
+
+
+async def test_sizeless_open_uses_default_notional_times_factor(fake, tmp_path, snapshot_file):
+    svc = ExecutorService(legacy_settings(fake, tmp_path, default_notional_usdt=30))
+    await svc.start()
+    try:
+        await wait_for(lambda: svc.trades.ready.is_set())
+        svc.multiplier.configure({"enabled": True, "mode": "manual", "factor": 2})
+        svc.trades.handle_signal({"action": "open", "trade_id": 82, "symbol": "ETHUSDT", "direction": "SHORT",
+                                  "price": 3000})
+        await wait_for(lambda: svc.trades.get_trade("ETHUSDT", "SHORT") is not None)
+        assert svc.trades.get_trade("ETHUSDT", "SHORT").quantity == pytest.approx(0.02)
+    finally:
+        await svc.stop()
+
+
+async def test_unknown_open_keeps_multiplier(open_service, fake, monkeypatch):
+    import executor.trading as trading_mod
+    monkeypatch.setattr(trading_mod, "UNKNOWN_OPEN_CHECKS", (0.3, 0.6))
+    t = open_service.trades
+    open_service.multiplier.configure({"enabled": True, "mode": "manual", "factor": 2})
+    fake.inject_after.append(("order.place", -1007, "Timeout waiting for response from backend server."))
+    for _ in range(3):
+        fake.inject.append(("order.status", -1001, "Internal error; unable to process your request."))
+    t.handle_signal({"action": "open", "trade_id": 83, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None, timeout=8)
+    trade = t.get_trade("ETHUSDT", "SHORT")
+    assert trade.quantity == pytest.approx(0.02) and trade.multiplier == 2.0
+    assert trade.bot_quantity == pytest.approx(0.01)
+
+
+def test_old_trades_and_adopted_positions_count_as_x1():
+    from executor.trading import Trade
+    old = Trade.from_dict({"id": 1, "symbol": "ETHUSDT", "direction": "SHORT", "entry_price": 3000,
+                           "quantity": 0.05, "open_time": "", "leverage": 5})
+    assert old.bot_quantity == pytest.approx(0.05) and old.multiplier == 1.0
+    old.note_tranche_scale(2.0, 0.01, 0.02)  # tramo nuevo con x2
+    assert old.multiplier == pytest.approx((0.05 * 1 + 0.01 * 2) / 0.06)
+
+
+async def test_close_all_does_not_close_opens_received_after_it(open_service, fake):
+    t = open_service.trades
+    t.handle_signal({"action": "open", "trade_id": 84, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.01})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    t.handle_signal({"action": "close_all"})
+    t.handle_signal({"action": "open", "trade_id": 85, "symbol": "BTCUSDT", "direction": "LONG", "price": 65000,
+                     "quantity": 0.002})
+    await wait_for(lambda: t.get_trade("BTCUSDT", "LONG") is not None and t.get_trade("ETHUSDT", "SHORT") is None)
+    await asyncio.sleep(0.3)
+    assert t.get_trade("BTCUSDT", "LONG") is not None
+
+
+def test_max_factor_caps_auto_level_without_balance(tmp_path):
+    balance = {"wallet": 1000.0}
+    m = Multiplier(_FakeSettings(tmp_path), lambda: balance)
+    m.configure({"enabled": True, "mode": "auto"})
+    assert m.effective() == 10.0
+    balance["wallet"] = 0.0
+    m.configure({"max_factor": 3})
+    assert m.effective() == 3.0 and m.view()["effective"] == 3.0
+
+
+def test_invalid_env_values_fall_back_to_defaults(tmp_path):
+    m = Multiplier(_FakeSettings(tmp_path, multiplier_mode="auto", multiplier_step_usdt=0.0,
+                                 multiplier_max=float("nan"), multiplier_factor=-2), lambda: {"wallet": 250})
+    assert m.state.step_usdt == 100.0 and m.state.max_factor == 10.0 and m.state.factor == 1.0
+    assert m.effective() == 2.0
+
+
+async def test_ws_api_connect_failure_is_retryable_error():
+    from executor.binance_api import BinanceWsApi, ServerClock
+    from executor.errors import BinanceAPIError
+    ws = BinanceWsApi("ws://127.0.0.1:9/ws-fapi/v1", "k", "s", ServerClock(), 5000)
+    with pytest.raises(BinanceAPIError) as exc:
+        await ws.request("ticker.price", {"symbol": "BTCUSDT"}, timeout=2)
+    assert exc.value.code == -1
+    await ws.close()

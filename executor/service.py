@@ -236,6 +236,7 @@ class ExecutorService:
             self.core.account.apply_balances(await self.core.ws.balances())
         except BinanceAPIError as err:
             self.orders._record(err, "balance", "")
+        self.refresh_multiplier()
 
     async def seed_open_orders(self) -> None:
         """Lectura inicial (REST, una vez) de órdenes y algo orders abiertas."""
@@ -262,6 +263,17 @@ class ExecutorService:
             await asyncio.sleep(2)
             if self._balance_dirty or time.time() - self._last_balance > self.settings.balance_poll_s:
                 await self.refresh_balance(force=True)
+            else:
+                self.refresh_multiplier()  # margen/disponible cambian con el precio
+
+    def refresh_multiplier(self) -> None:
+        """Nivel automático del multiplicador según el balance (sin depender del dashboard)."""
+        st = self.multiplier.state
+        if st.enabled and st.mode == "auto":
+            try:
+                self.multiplier.refresh("balance")
+            except Exception:  # pragma: no cover
+                log.exception("Multiplicador: no se pudo recalcular el nivel")
 
     async def _verify_loop(self) -> None:
         """Verificación de baja frecuencia por si se perdiera algún evento."""
@@ -326,6 +338,7 @@ class ExecutorService:
             keys = acct.apply_account_update(evt)
             self.trades.on_positions_changed(keys)
             self._balance_dirty = True
+            self.refresh_multiplier()
         elif kind == "ORDER_TRADE_UPDATE":
             upd = acct.apply_order_update(evt)
             if not self.grids.on_order_update(upd):
