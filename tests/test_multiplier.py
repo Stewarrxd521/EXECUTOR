@@ -397,3 +397,46 @@ async def test_partial_close_with_unknown_status_is_not_repeated(open_service, f
                      "quantity": 0.01, "reason": "PARTIAL"})
     await asyncio.sleep(4)
     assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == pytest.approx(-0.02)  # nunca -0.01 (cierre doble)
+
+
+async def test_chunked_partial_close_is_never_repeated(open_service, fake):
+    """Parcial dividido por marketMaxQty: la 1.ª parte se llena y la 2.ª falla → nunca se repite entero."""
+    from dataclasses import replace
+    from decimal import Decimal
+    from tests.fake_binance import _Err
+    t = open_service.trades
+    t.handle_signal({"action": "open", "trade_id": 89, "symbol": "ETHUSDT", "direction": "SHORT", "price": 3000,
+                     "quantity": 0.03})
+    await wait_for(lambda: t.get_trade("ETHUSDT", "SHORT") is not None)
+    ex = open_service.core.exinfo
+    ex._rules["ETHUSDT"] = replace(ex._rules["ETHUSDT"], market_max_qty=Decimal("0.006"))
+    orig, state = fake._dispatch, {"placed": 0, "fail": 0}
+
+    def dispatch(method, p):
+        if method == "order.place" and p.get("side") == "BUY":
+            state["placed"] += 1
+            if state["placed"] >= 2 and state["fail"] < 7:
+                state["fail"] += 1
+                raise _Err(-1001, "Internal error; unable to process your request.")
+        return orig(method, p)
+
+    fake._dispatch = dispatch
+    t.handle_signal({"action": "close", "trade_id": 89, "symbol": "ETHUSDT", "direction": "SHORT",
+                     "quantity": 0.01, "reason": "PARTIAL"})
+    await wait_for(lambda: any(e["action"] == "close" for e in t.signals(5)), timeout=20)
+    await asyncio.sleep(0.5)
+    assert abs(fake.positions[("ETHUSDT", "SHORT")]["amt"]) >= 0.02 - 1e-9  # nunca cierra más de lo pedido
+
+
+def test_corrupted_persisted_state_is_validated(tmp_path):
+    import json
+    (tmp_path / "multiplier.json").write_text(json.dumps({
+        "state": {"enabled": True, "mode": "manual", "factor": -3, "step_usdt": 0, "max_factor": 999,
+                  "source": "usdc", "level": -4, "updated_ts": 5},
+        "env": {"mode": "off", "factor": 1.0, "step": 100.0, "max": 10.0, "source": "wallet"}}))
+    m = Multiplier(_FakeSettings(tmp_path), lambda: {"wallet": 300, "balance_sync": 1.0})
+    m.load()
+    assert m.effective() == 1.0 and m.state.source == "wallet" and m.state.step_usdt == 100.0
+    assert m.state.max_factor == 100.0 and m.state.level == 0
+    m.configure({"mode": "auto"})
+    assert m.effective() == 3.0

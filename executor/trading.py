@@ -1308,13 +1308,20 @@ class TradeManager:
                                          diag.info.name)
                                 break
                             if attempt == 0:
-                                qty = min(pos2.qty, qty) if partial else pos2.qty
+                                if partial:
+                                    # Descuenta lo que ya se cerró (p. ej. partes de una orden dividida).
+                                    remaining = qty - max(0.0, base - pos2.qty)
+                                    remaining = float(rules.round_qty(D(fmt(max(0.0, remaining))), True, "nearest"))
+                                    if remaining <= 0:
+                                        break
+                                    qty = min(pos2.qty, remaining)
+                                else:
+                                    qty = pos2.qty
                                 continue
-                        # RETRY = Binance no procesó la orden → reintento seguro. CHECK_STATUS = pudo
-                        # ejecutarse: solo se reintenta un cierre total (relee la posición); un parcial
-                        # repetido cerraría de más.
-                        retryable = diag.action == Action.RETRY or (diag.action == Action.CHECK_STATUS
-                                                                    and not partial)
+                        # Solo se reintenta automáticamente un cierre TOTAL (cada intento relee la posición
+                        # real). Un parcial nunca: si una parte ya se ejecutó (orden dividida o respuesta
+                        # perdida), repetirlo cerraría de más; se avisa para revisarlo.
+                        retryable = not partial and diag.action in (Action.RETRY, Action.CHECK_STATUS)
                         self._close_retryable[key] = retryable
                         if alert or not retryable:
                             self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",

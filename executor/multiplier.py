@@ -164,11 +164,17 @@ class Multiplier:
             env.level = min(max(0, int(restored.level or 0)), int(env.max_factor))
             env.level_balance, env.level_ts, env.history = restored.level_balance, restored.level_ts, restored.history
             return
-        restored.max_factor = min(MAX_LIMIT, max(1.0, safe_float(restored.max_factor, 10.0)))
-        if not 0 < safe_float(restored.factor) <= restored.max_factor:
-            restored.factor = min(max(safe_float(restored.factor, 1.0), 0.01), restored.max_factor)
-        restored.step_usdt = max(1.0, safe_float(restored.step_usdt, 100.0))
-        restored.level = min(int(restored.level or 0), int(restored.max_factor))
+        # Mismas reglas que las variables de entorno (archivo editado a mano o corrupto).
+        max_factor = safe_float(restored.max_factor, 10.0)
+        restored.max_factor = min(MAX_LIMIT, max(1.0, max_factor if math.isfinite(max_factor) else 10.0))
+        factor = safe_float(restored.factor, 1.0)
+        restored.factor = min(factor, restored.max_factor) if math.isfinite(factor) and factor > 0 else 1.0
+        step = safe_float(restored.step_usdt, 100.0)
+        restored.step_usdt = step if math.isfinite(step) and step >= 1 else 100.0
+        restored.mode = restored.mode if restored.mode in MODES else "manual"
+        restored.source = restored.source if restored.source in SOURCES else "wallet"
+        restored.enabled = bool(restored.enabled)
+        restored.level = min(max(0, int(safe_float(restored.level, 0))), int(restored.max_factor))
         self.state = restored
         if self.state.enabled:
             log.info("Multiplicador restaurado: %s", self.describe())
