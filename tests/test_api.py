@@ -756,3 +756,30 @@ async def test_dashboard_zip_stream_is_ordered_deflate(open_service):
             kinds += [_json.loads(line)["type"] for line in lines]
         assert kinds[0] == "auth" and buf == b""
         await ws.close()
+
+
+def test_pick_market_rows_top_plus_kept_symbols():
+    from executor.web.server import pick_market_rows
+    rows = [["AUSDT", 1, 5.0, 10], ["BUSDT", 1, -3.0, 30], ["CUSDT", 1, 1.0, 20], ["DUSDT", 1, 9.0, 1]]
+    assert pick_market_rows(rows, 0, "vol", "", set()) == rows
+    assert [r[0] for r in pick_market_rows(rows, 2, "vol", "", {"DUSDT"})] == ["BUSDT", "CUSDT", "DUSDT"]
+    assert [r[0] for r in pick_market_rows(rows, 2, "chg", "", set())] == ["DUSDT", "AUSDT"]
+    assert [r[0] for r in pick_market_rows(rows, 2, "vol", "CU", set())] == ["CUSDT"]
+    assert [r[0] for r in pick_market_rows(rows, 2, "fav", "", {"AUSDT"})] == ["AUSDT"]
+
+
+async def test_dashboard_markets_top_n(open_service):
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        ws = await client.ws_connect("/ws")
+        await ws.send_json({"op": "auth", "token": ""})
+        everything = await _until_timeout(ws, "markets", 5)
+        assert len(everything["rows"]) > 2
+        await ws.send_json({"op": "markets", "on": True, "delta": True, "top": 2, "sort": "vol"})
+        top = await _until_timeout(ws, "markets", 5)
+        by_vol = sorted(everything["rows"], key=lambda r: -r[3])
+        assert top["full"] is True and {r[0] for r in top["rows"]} == {r[0] for r in by_vol[:2]}
+        await ws.send_json({"op": "select", "symbol": by_vol[-1][0]})
+        await ws.send_json({"op": "markets", "on": True, "delta": True, "top": 2, "sort": "vol"})
+        again = await _until_timeout(ws, "markets", 5)
+        assert {r[0] for r in again["rows"]} == {r[0] for r in by_vol[:2]} | {by_vol[-1][0]}
+        await ws.close()
