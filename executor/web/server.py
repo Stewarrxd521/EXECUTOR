@@ -53,6 +53,28 @@ def ws_market_rows(rows: list) -> list:
     return [[sym, last, chg, _sig(vol)] for sym, last, chg, vol in rows]
 
 
+MARKET_SORTS = {"vol": lambda r: -r[3], "chg": lambda r: -r[2], "name": lambda r: r[0]}
+
+
+def pick_market_rows(rows: list, top: int, sort: str, query: str, keep: set) -> list:
+    """Las ``top`` primeras filas según el orden del panel, más las de ``keep``.
+
+    El executor sigue recibiendo todo el mercado; esto solo recorta lo que sale hacia el
+    dashboard (lo que Render cuenta como ancho de banda). ``top=0`` = todas.
+    """
+    if top <= 0:
+        return rows
+    if query:
+        base = [r for r in rows if query in r[0]]
+    elif sort == "fav":
+        base = [r for r in rows if r[0] in keep]
+    else:
+        base = rows
+    chosen = sorted(base, key=MARKET_SORTS.get(sort, MARKET_SORTS["vol"]))[:top]
+    names = {r[0] for r in chosen}
+    return chosen + [r for r in rows if r[0] in keep and r[0] not in names]
+
+
 class Client:
     def __init__(self, ws: web.WebSocketResponse, ip: str):
         self.ws = ws
@@ -60,6 +82,11 @@ class Client:
         self.authed = False
         self.markets = False
         self.symbol = ""
+        # Lista reducida (dashboard actual): top N del orden elegido + favoritos en la pestaña ★.
+        self.market_top = 0
+        self.market_sort = "vol"
+        self.market_query = ""
+        self.market_pins: set[str] = set()
         self.log_seq = 0
         # Dashboard actual: recibe solo lo que cambió y avisa si la pestaña está oculta.
         self.delta = False
@@ -90,7 +117,8 @@ class Client:
 
     def markets_text(self, rows: list) -> Optional[str]:
         """Mercados completos la primera vez; después solo las filas que cambiaron."""
-        full = not self.delta or not self.market_sent
+        # Si cambia qué símbolos van en la lista, se reenvía entera.
+        full = not self.delta or not self.market_sent or {r[0] for r in rows} != self.market_sent.keys()
         changed = rows if full else [r for r in rows if self.market_sent.get(r[0]) != r]
         if full:
             self.market_sent = {}
@@ -152,6 +180,24 @@ class DashboardHub:
             self._sends.add(task)
             task.add_done_callback(self._sends.discard)
 
+    def _held_symbols(self) -> set[str]:
+        """Símbolos con posición real o trade abierto: siempre van en la lista del panel."""
+        held = {pos.symbol for pos in self.service.core.account.positions.values()}
+        held.update(t.symbol for t in self.service.trades.open_trades)
+        return held
+
+    def _client_rows(self, client: Client, rows: list, held: set) -> list:
+        keep = held | {client.symbol} if client.symbol else set(held)
+        if client.market_sort == "fav":
+            keep |= client.market_pins
+        return pick_market_rows(rows, client.market_top, client.market_sort, client.market_query, keep)
+
+    async def _send_markets(self, client: Client) -> None:
+        rows = ws_market_rows(self.service.core.market.market_rows())
+        markets = client.markets_text(self._client_rows(client, rows, self._held_symbols()))
+        if markets:
+            await client.send(markets)
+
     def _on_event(self, event: dict) -> None:
         self._push_all({"type": "event", "event": event})
 
@@ -174,13 +220,14 @@ class DashboardHub:
             try:
                 parts = self._state_parts(health=tick % HEALTH_EVERY_S == 0)
                 rows = ws_market_rows(self.service.core.market.market_rows()) if tick % MARKETS_EVERY_S == 0 else None
+                held = self._held_symbols() if rows is not None else set()
                 logs = list(self.service.logs.lines)
                 for c in clients:
                     state = c.state_text(parts)
                     if state:
                         await c.send(state)
                     if rows is not None and c.markets:
-                        markets = c.markets_text(rows)
+                        markets = c.markets_text(self._client_rows(c, rows, held))
                         if markets:
                             await c.send(markets)
                     if c.symbol:
@@ -239,7 +286,7 @@ class DashboardHub:
                 client.sent.clear()
                 client.market_sent = {}
                 await client.send(client.state_text(self._state_parts()))
-                await client.send(client.markets_text(ws_market_rows(self.service.core.market.market_rows())))
+                await self._send_markets(client)
                 await client.send(dumps({"type": "errors", "entries": self.service.core.journal.entries(150)}))
                 client.log_seq = 0
             else:
@@ -253,6 +300,14 @@ class DashboardHub:
             client.markets = bool(data.get("on", True))
             if data.get("delta"):
                 client.delta = True
+            if "top" in data:
+                client.market_top = max(0, min(500, int(safe_float(data.get("top"), 0))))
+                client.market_sort = str(data.get("sort", "vol"))[:8]
+                client.market_query = str(data.get("q", "")).upper().strip()[:30]
+                pins = data.get("pins")
+                client.market_pins = {str(p).upper()[:30] for p in pins[:100]} if isinstance(pins, list) else set()
+                if client.markets:
+                    await self._send_markets(client)
         elif op == "visible":
             client.visible = bool(data.get("on", True))
         elif op == "select":

@@ -141,7 +141,7 @@
           $('#login-error').textContent = '';
           $('#logout-btn').hidden = !m.required;
           // delta: el servidor envía solo lo que cambió (historial y mercados).
-          WS.send({ op: 'markets', on: true, delta: true });
+          sendMarketPrefs();
           WS.send({ op: 'visible', on: !document.hidden });
           selectSymbol(S.symbol, true);
         } else {
@@ -342,6 +342,13 @@
   }
 
   // ── Mercados ───────────────────────────────────────────────────────────
+  // El servidor solo envía las primeras MKT_TOP filas del orden elegido (o de la búsqueda),
+  // más los símbolos con operaciones y el seleccionado: ahorra ancho de banda en Render.
+  const MKT_TOP = 10;
+  function sendMarketPrefs() {
+    WS.send({ op: 'markets', on: true, delta: true, top: MKT_TOP, sort: S.sort, q: S.search.trim().toUpperCase(), pins: [...S.favs] });
+  }
+
   function positionSymbols() { return new Set((S.snap ? S.snap.positions : []).map((p) => p.symbol)); }
 
   function renderMarkets() {
@@ -367,6 +374,7 @@
   function toggleFav(sym) {
     if (S.favs.has(sym)) S.favs.delete(sym); else S.favs.add(sym);
     store.set('favs', [...S.favs]);
+    if (S.sort === 'fav') sendMarketPrefs();
     renderMarkets();
     $('#sym-fav').classList.toggle('on', S.favs.has(S.symbol));
     $('#sym-fav').textContent = S.favs.has(S.symbol) ? '★' : '☆';
@@ -1140,10 +1148,10 @@
     $('#lev-btn').onclick = () => leverageModal('señales (por defecto)', S.snap ? S.snap.leverage : 4, (lev) => run('set_default_leverage', { leverage: lev }, `Leverage por defecto: ${lev}x`));
 
     // Mercados
-    $('#mkt-search').addEventListener('input', debounce((e) => { S.search = e.target.value; renderMarkets(); }, 120));
+    $('#mkt-search').addEventListener('input', debounce((e) => { S.search = e.target.value; sendMarketPrefs(); renderMarkets(); }, 250));
     $$('#mkt-sort button').forEach((b) => {
       b.classList.toggle('active', b.dataset.sort === S.sort);
-      b.onclick = () => { S.sort = b.dataset.sort; store.set('sort', S.sort); $$('#mkt-sort button').forEach((x) => x.classList.toggle('active', x === b)); renderMarkets(); };
+      b.onclick = () => { S.sort = b.dataset.sort; store.set('sort', S.sort); $$('#mkt-sort button').forEach((x) => x.classList.toggle('active', x === b)); sendMarketPrefs(); renderMarkets(); };
     });
     $('#mkt-list').addEventListener('click', (e) => {
       const star = e.target.closest('[data-star]');
