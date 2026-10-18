@@ -30,12 +30,26 @@ from aiohttp import WSMsgType, web
 from .. import __version__
 from ..precision import parse_bool, safe_float
 from ..service import ExecutorService
-from .api import add_route, cors_middleware, json_errors_middleware, register_legacy, register_rest
+from .api import (add_route, compress_middleware, cors_middleware, json_errors_middleware, register_legacy,
+                  register_rest)
 from .common import (Auth, any_valid, client_ip, dumps, json_response, origin_allowed, read_body,
                      request_secrets, run_command)
 
 log = logging.getLogger("executor.web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# Del estado solo se reenvía lo que cambió; estos campos van siempre que se envía algo.
+STATE_ALWAYS = ("ts", "uptime_s")
+HEALTH_EVERY_S = 5    # latencias y contadores: cambian cada segundo
+MARKETS_EVERY_S = 10  # el símbolo seleccionado sigue llegando cada segundo
+
+
+def _sig(value: float, digits: int = 2) -> float:
+    """Redondea a ``digits`` cifras significativas (el volumen solo sirve para ordenar)."""
+    return float(f"{value:.{digits}g}") if value else 0.0
+
+
+def ws_market_rows(rows: list) -> list:
+    return [[sym, last, chg, _sig(vol)] for sym, last, chg, vol in rows]
 
 
 class Client:
@@ -46,6 +60,34 @@ class Client:
         self.markets = False
         self.symbol = ""
         self.log_seq = 0
+        # Dashboard actual: recibe solo lo que cambió y avisa si la pestaña está oculta.
+        self.delta = False
+        self.visible = True
+        self.sent: dict[str, str] = {}
+        self.market_sent: dict[str, list] = {}
+
+    def state_text(self, parts: dict[str, str]) -> Optional[str]:
+        """Mensaje ``state`` con los campos que cambiaron (todos si el cliente es antiguo)."""
+        changed = [k for k, text in parts.items()
+                   if k not in STATE_ALWAYS and (not self.delta or self.sent.get(k) != text)]
+        if not changed:
+            return None
+        for k in changed:
+            self.sent[k] = parts[k]
+        keys = [k for k in STATE_ALWAYS if k in parts] + changed
+        return '{"type":"state","data":{' + ",".join(f'"{k}":{parts[k]}' for k in keys) + "}}"
+
+    def markets_text(self, rows: list) -> Optional[str]:
+        """Mercados completos la primera vez; después solo las filas que cambiaron."""
+        full = not self.delta or not self.market_sent
+        changed = rows if full else [r for r in rows if self.market_sent.get(r[0]) != r]
+        if full:
+            self.market_sent = {}
+        for r in changed:
+            self.market_sent[r[0]] = r
+        if not changed and not full:
+            return None
+        return dumps({"type": "markets", "rows": changed, "full": full})
 
     async def send(self, text: str) -> None:
         if not self.ws.closed:
@@ -77,6 +119,12 @@ class DashboardHub:
     def _authed(self) -> list[Client]:
         return [c for c in self.clients if c.authed and not c.ws.closed]
 
+    def _state_parts(self, health: bool = True) -> dict[str, str]:
+        snap = self.service.snapshot()
+        if not health:
+            snap.pop("health", None)
+        return {k: dumps(v) for k, v in snap.items()}
+
     def _push_all(self, payload: dict) -> None:
         targets = self._authed()
         if not targets:
@@ -99,19 +147,30 @@ class DashboardHub:
             await asyncio.sleep(1)
             tick += 1
             clients = self._authed()
+            for c in clients:
+                if c.symbol:
+                    self.service.note_watch(c.symbol)
+            # Una pestaña oculta no recibe el estado periódico (sí eventos y errores).
+            clients = [c for c in clients if c.visible]
             if not clients:
                 continue
             try:
-                state = dumps({"type": "state", "data": self.service.snapshot()})
-                markets = dumps({"type": "markets", "rows": self.service.core.market.market_rows()}) if tick % 2 == 0 else None
+                parts = self._state_parts(health=tick % HEALTH_EVERY_S == 0)
+                rows = ws_market_rows(self.service.core.market.market_rows()) if tick % MARKETS_EVERY_S == 0 else None
                 logs = list(self.service.logs.lines)
                 for c in clients:
-                    await c.send(state)
-                    if markets and c.markets:
-                        await c.send(markets)
+                    state = c.state_text(parts)
+                    if state:
+                        await c.send(state)
+                    if rows is not None and c.markets:
+                        markets = c.markets_text(rows)
+                        if markets:
+                            await c.send(markets)
                     if c.symbol:
-                        await c.send(dumps({"type": "ticker", "data": self.service.symbol_view(c.symbol)}))
-                        self.service.note_watch(c.symbol)
+                        ticker = dumps({"type": "ticker", "data": self.service.symbol_view(c.symbol)})
+                        if not c.delta or c.sent.get("ticker") != ticker:
+                            c.sent["ticker"] = ticker
+                            await c.send(ticker)
                     fresh = [ln for ln in logs if ln["id"] > c.log_seq]
                     if fresh:
                         c.log_seq = fresh[-1]["id"]
@@ -158,8 +217,10 @@ class DashboardHub:
             if not required or settings.check_write_token(str(data.get("token", ""))):
                 client.authed = True
                 await client.send(dumps({"type": "auth", "ok": True, "env": settings.env_label, "required": required}))
-                await client.send(dumps({"type": "state", "data": self.service.snapshot()}))
-                await client.send(dumps({"type": "markets", "rows": self.service.core.market.market_rows()}))
+                client.sent.clear()
+                client.market_sent = {}
+                await client.send(client.state_text(self._state_parts()))
+                await client.send(client.markets_text(ws_market_rows(self.service.core.market.market_rows())))
                 await client.send(dumps({"type": "errors", "entries": self.service.core.journal.entries(150)}))
                 client.log_seq = 0
             else:
@@ -171,6 +232,10 @@ class DashboardHub:
             return
         if op == "markets":
             client.markets = bool(data.get("on", True))
+            if data.get("delta"):
+                client.delta = True
+        elif op == "visible":
+            client.visible = bool(data.get("on", True))
         elif op == "select":
             client.symbol = str(data.get("symbol", "")).upper()[:30]
             if client.symbol:
@@ -196,8 +261,19 @@ def build_app(service: ExecutorService) -> web.Application:
     hub = DashboardHub(service)
     auth = Auth(service)
 
-    async def index(_: web.Request) -> web.StreamResponse:
-        return web.FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+    # Dashboard en memoria: compress_middleware lo sirve con gzip y ETag (304 si no cambió).
+    static_files = {name: (STATIC_DIR / name).read_bytes() for name in ("index.html", "app.js", "app.css")}
+    static_types = {"html": "text/html", "js": "application/javascript", "css": "text/css"}
+
+    def static_response(name: str) -> web.Response:
+        return web.Response(body=static_files[name], content_type=static_types[name.rsplit(".", 1)[1]],
+                            charset="utf-8", headers={"Cache-Control": "no-cache"})
+
+    async def index(_: web.Request) -> web.Response:
+        return static_response("index.html")
+
+    async def static_asset(request: web.Request) -> web.Response:
+        return static_response(request.match_info["name"])
 
     # ── POST /signal (ExecutorBridge de app.py / app_25.py) ─────────────────
     def cross_site(request: web.Request) -> bool:
@@ -276,7 +352,7 @@ def build_app(service: ExecutorService) -> web.Application:
         if settings.state_requires_auth and not any_valid(request_secrets(request), settings.check_write_token):
             auth.warn_denied(request, "/api/state")
             return json_response({"ok": False, "error": "unauthorized"}, 401)
-        limit = int(safe_float(request.query.get("limit"), 200))
+        limit = int(safe_float(request.query.get("limit"), settings.state_closed_limit))
         return json_response(service.api_state(max(0, limit)))
 
     async def health(_: web.Request) -> web.Response:
@@ -298,7 +374,7 @@ def build_app(service: ExecutorService) -> web.Application:
         await hub.stop()
 
     app = web.Application(client_max_size=1 << 20,
-                          middlewares=[cors_middleware(service), json_errors_middleware])
+                          middlewares=[compress_middleware, cors_middleware(service), json_errors_middleware])
     app.router.add_get("/", index)
     app.router.add_get("/ws", hub.handle)
     app.router.add_get("/ws/signal", signal_ws)
@@ -308,6 +384,7 @@ def build_app(service: ExecutorService) -> web.Application:
     add_route(app, "GET", "/ready", ready)
     register_rest(app, service, auth)
     register_legacy(app, service, auth)
+    app.router.add_get("/static/{name:app\\.(?:js|css)}", static_asset)
     app.router.add_static("/static", STATIC_DIR, append_version=True)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)

@@ -103,6 +103,8 @@ class Settings:
     exchange_info_bootstrap: bool = True
     seed_open_orders_rest: bool = True
     state_requires_auth: bool = False
+    # Cerrados que se envían al dashboard y a /api/state sin ?limit= (el historial completo se guarda igual).
+    state_closed_limit: int = 15
     api_write_open: bool = False
     cors_origins: str = "*"
     trust_proxy: bool = False
@@ -254,6 +256,7 @@ def load_settings() -> Settings:
         exchange_info_bootstrap=_env_bool("EXCHANGE_INFO_BOOTSTRAP", True),
         seed_open_orders_rest=_env_bool("SEED_OPEN_ORDERS_REST", True),
         state_requires_auth=_env_bool("STATE_REQUIRES_AUTH", False),
+        state_closed_limit=max(0, _env_int("STATE_CLOSED_LIMIT", 15)),
         api_write_open=_env_bool("API_WRITE_OPEN", False),
         cors_origins=_env("CORS_ORIGINS", "*"),
         trust_proxy=_env_bool("TRUST_PROXY", on_render),

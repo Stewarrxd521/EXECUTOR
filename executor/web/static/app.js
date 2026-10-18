@@ -110,7 +110,9 @@
           $('#app').hidden = false;
           $('#login-error').textContent = '';
           $('#logout-btn').hidden = !m.required;
-          WS.send({ op: 'markets', on: true });
+          // delta: el servidor envía solo lo que cambió (historial y mercados).
+          WS.send({ op: 'markets', on: true, delta: true });
+          WS.send({ op: 'visible', on: !document.hidden });
           selectSymbol(S.symbol, true);
         } else {
           // Solo ocurre si el servidor tiene DASHBOARD_TOKEN configurado.
@@ -126,10 +128,20 @@
           $('#login-token').focus();
         }
         break;
-      case 'state': S.snap = m.data; renderAll(); break;
+      case 'state': {
+        // Solo llegan los campos que cambiaron: se conservan los anteriores.
+        S.snap = { ...(S.snap || {}), ...m.data };
+        renderAll();
+        break;
+      }
       case 'markets':
-        S.markets = m.rows;
-        S.marketMap = new Map(m.rows.map((r) => [r[0], r]));
+        if (m.full === false && S.marketMap) {
+          for (const r of m.rows) S.marketMap.set(r[0], r);
+          S.markets = [...S.marketMap.values()];
+        } else {
+          S.markets = m.rows;
+          S.marketMap = new Map(m.rows.map((r) => [r[0], r]));
+        }
         renderMarkets();
         break;
       case 'ticker':
@@ -1211,6 +1223,8 @@
     $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') closeModal(); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
     setInterval(() => { if (S.ticker) renderSymbol(); }, 1000);
+    // Pestaña oculta: el servidor deja de enviar el estado cada segundo (ahorra ancho de banda).
+    document.addEventListener('visibilitychange', () => { if (WS.authed) WS.send({ op: 'visible', on: !document.hidden }); });
   }
 
   // ── Arranque ───────────────────────────────────────────────────────────

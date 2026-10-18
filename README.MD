@@ -249,13 +249,14 @@ ambos y las pruebas los ejecutan contra el executor.
 | `SIGNAL_SECRETS` | — | Secretos adicionales aceptados, separados por comas (p. ej. al rotar el secreto) |
 | `CORS_ORIGINS` | `*` | Orígenes permitidos para la API (CORS). El WebSocket del dashboard solo acepta el mismo sitio o los orígenes listados explícitamente |
 | `TRUST_PROXY` | `true` en Render | Tomar la IP del cliente de `X-Forwarded-For` |
-| `KEEPALIVE_URL` / `KEEPALIVE_S` | `RENDER_EXTERNAL_URL` / `600` | Auto-ping para que Render no duerma el servicio |
+| `KEEPALIVE_URL` / `KEEPALIVE_S` | `RENDER_EXTERNAL_URL` / `600` | Auto-ping para que Render no duerma el servicio (con UptimeRobot u otro monitor externo puedes poner `KEEPALIVE_S=0`) |
 | `MAX_PRICE_AGE_S` | `5` | Antigüedad máxima del precio de referencia |
 | `DATA_DIR` | `data` | Estado persistente (trades, grids, exchangeInfo descargado) |
 | `EXCHANGE_INFO_FILE` | `exchangeInfo.txt` | Base predefinida de reglas (respuesta cruda de Binance) |
 | `EXCHANGE_INFO_BOOTSTRAP` | `true` | Generar el exchangeInfo si no hay snapshot |
 | `EXCHANGE_INFO_REFRESH_H` | `0` | Refresco periódico del exchangeInfo (horas, 0 = nunca) |
 | `SEED_OPEN_ORDERS_REST` | `true` | Leer órdenes abiertas al arrancar |
+| `STATE_CLOSED_LIMIT` | `15` | Operaciones cerradas que se envían al dashboard y a `/api/state` sin `?limit=` (`0` = todas). El historial completo se sigue guardando para las estadísticas y el CSV |
 | `STATE_REQUIRES_AUTH` | `false` | Exigir el secreto en `/api/state` (los bots desplegados no lo envían: déjalo en `false`) |
 | `GRID_MAX_LEVELS` / `GRID_ORDER_CONCURRENCY` | `150` / `4` | Límites de los bots Grid |
 | `BALANCE_POLL_S` | `60` | Refresco de seguridad del balance (WS API) |

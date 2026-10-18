@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import logging
 import time
@@ -412,6 +413,35 @@ async def json_errors_middleware(request: web.Request, handler):
         return json_response({"ok": False, "error": "error interno del executor", "status": 500}, 500)
 
 
+_COMPRESSIBLE = ("application/json", "text/csv", "text/plain", "text/html", "text/css",
+                 "application/javascript", "text/javascript")
+
+
+@web.middleware
+async def compress_middleware(request: web.Request, handler):
+    """ETag/304 y gzip para las respuestas grandes: Render cobra el tráfico de salida.
+
+    * ``GET`` con ``If-None-Match`` igual al ETag → 304 sin cuerpo (lo usan los
+      bots que consultan ``/api/state`` cada pocos segundos y el dashboard).
+    * Cuerpos de 1 KB o más se comprimen si el cliente envía ``Accept-Encoding``.
+    """
+    resp = await handler(request)
+    if not isinstance(resp, web.Response) or resp.prepared or resp.body is None:
+        return resp
+    body = resp.body if isinstance(resp.body, bytes) else None
+    if body is None or resp.content_type not in _COMPRESSIBLE or "Content-Encoding" in resp.headers:
+        return resp
+    if request.method in ("GET", "HEAD") and resp.status == 200:
+        etag = '"' + hashlib.blake2b(body, digest_size=10).hexdigest() + '"'
+        if etag in request.headers.get("If-None-Match", ""):
+            return web.Response(status=304, headers={"ETag": etag, **{k: v for k, v in resp.headers.items()
+                                                                      if k in ("Cache-Control", "Vary")}})
+        resp.headers["ETag"] = etag
+    if len(body) >= 1024:
+        resp.enable_compression()  # negocia según Accept-Encoding; sin él se envía tal cual
+    return resp
+
+
 _REDACT = {"secret", "token", "signal_secret"}
 
 
@@ -444,4 +474,5 @@ def build_access_logger(trust_proxy: bool) -> type:
 
 
 __all__ = ["REST_ROUTES", "register_rest", "register_legacy", "cors_middleware", "json_errors_middleware",
+           "compress_middleware",
            "build_access_logger", "add_route", "dumps", "time"]

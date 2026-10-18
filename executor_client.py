@@ -211,6 +211,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import gzip
 import http.client
 import itertools
 import json
@@ -261,14 +262,30 @@ def _decode(raw: bytes) -> Any:
         return text
 
 
-def _http(req: urllib.request.Request, timeout: float) -> tuple[int, Any]:
-    """Ejecuta la petición y devuelve (código, cuerpo). Los 4xx/5xx no lanzan excepción."""
+def _read(resp) -> bytes:
+    raw = resp.read()
+    if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+        raw = gzip.decompress(raw)
+    return raw
+
+
+def _http(req: urllib.request.Request, timeout: float, headers_out: Optional[dict] = None) -> tuple[int, Any]:
+    """Ejecuta la petición y devuelve (código, cuerpo). Los 4xx/5xx no lanzan excepción.
+
+    Pide la respuesta comprimida: el executor en Render paga cada byte que envía.
+    """
+    if not req.has_header("Accept-encoding"):
+        req.add_header("Accept-Encoding", "gzip")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, _decode(resp.read())
+            if headers_out is not None:
+                headers_out.update(resp.headers.items())
+            return resp.status, _decode(_read(resp))
     except urllib.error.HTTPError as err:
+        if err.code == 304:
+            return 304, None
         try:
-            body = _decode(err.read())
+            body = _decode(_read(err))
         except Exception:  # pragma: no cover
             body = ""
         return err.code, body
@@ -348,6 +365,7 @@ class ExecutorBridge:
         self.last_error = ""
         self.last_response: Optional[dict] = None
         self.last_state: Optional[dict] = None
+        self._state_etag = ""
         self._queue: list[dict] = []
         self._cond = threading.Condition()
         self._busy = 0
@@ -548,14 +566,20 @@ class ExecutorBridge:
         if self.config.state_limit:
             url += f"?limit={int(self.config.state_limit)}"
         headers = {"User-Agent": USER_AGENT, "X-Signal-Secret": self.config.signal_secret}
+        if self.last_state is not None and self._state_etag:
+            headers["If-None-Match"] = self._state_etag  # sin cambios → 304 sin cuerpo
+        got: dict = {}
         try:
             status, body = _http(urllib.request.Request(url, headers=headers, method="GET"),
-                                 self.config.timeout_state)
+                                 self.config.timeout_state, got)
         except Exception:
             return None
+        if status == 304 and self.last_state is not None:
+            return self.last_state
         if status != 200 or not isinstance(body, dict):
             return None
         self.last_state = body
+        self._state_etag = got.get("ETag", "")
         return body
 
     async def poll_state_loop(
