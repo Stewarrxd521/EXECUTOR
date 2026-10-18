@@ -512,7 +512,7 @@ class ExecutorService:
             "positions": self.positions_view(),
             "orders": self.orders_view(),
             "grids": self.grids.list(),
-            "closed": [t.to_dict() for t in trades.closed[-150:]][::-1],
+            "closed": [t.to_dict() for t in trades.closed[-self.settings.state_closed_limit:]][::-1],
             "signals": list(trades.signal_log)[-80:][::-1],
             "health": self.health(),
             "errors_total": len(c.journal),

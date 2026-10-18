@@ -648,7 +648,7 @@ async def test_api_state_is_capped_and_gzipped(open_service):
     async with TestClient(TestServer(build_app(open_service))) as client:
         r = await client.get("/api/state", headers={"Accept-Encoding": "gzip"})
         assert r.headers.get("Content-Encoding") == "gzip"
-        assert len((await r.json())["closed_trades"]) == open_service.settings.state_closed_limit == 20
+        assert len((await r.json())["closed_trades"]) == open_service.settings.state_closed_limit == 15
         r = await client.get("/api/state?limit=50", headers={"Accept-Encoding": "identity"})
         assert "Content-Encoding" not in r.headers and len((await r.json())["closed_trades"]) == 50
     # executor_client pide gzip y lo descomprime solo.
@@ -656,7 +656,7 @@ async def test_api_state_is_capped_and_gzipped(open_service):
     await server.start_server()
     try:
         c = executor_client.ExecutorClient(str(server.make_url("")).rstrip("/"), SECRET)
-        assert len((await asyncio.to_thread(c.state))["closed_trades"]) == 20
+        assert len((await asyncio.to_thread(c.state))["closed_trades"]) == 15
     finally:
         await server.close()
 

@@ -256,7 +256,7 @@ ambos y las pruebas los ejecutan contra el executor.
 | `EXCHANGE_INFO_BOOTSTRAP` | `true` | Generar el exchangeInfo si no hay snapshot |
 | `EXCHANGE_INFO_REFRESH_H` | `0` | Refresco periódico del exchangeInfo (horas, 0 = nunca) |
 | `SEED_OPEN_ORDERS_REST` | `true` | Leer órdenes abiertas al arrancar |
-| `STATE_CLOSED_LIMIT` | `20` | Operaciones cerradas que devuelve `/api/state` sin `?limit=` (los bots lo consultan cada 5 s; `0` = todas) |
+| `STATE_CLOSED_LIMIT` | `15` | Operaciones cerradas que se envían al dashboard y a `/api/state` sin `?limit=` (`0` = todas). El historial completo se sigue guardando para las estadísticas y el CSV |
 | `STATE_REQUIRES_AUTH` | `false` | Exigir el secreto en `/api/state` (los bots desplegados no lo envían: déjalo en `false`) |
 | `GRID_MAX_LEVELS` / `GRID_ORDER_CONCURRENCY` | `150` / `4` | Límites de los bots Grid |
 | `BALANCE_POLL_S` | `60` | Refresco de seguridad del balance (WS API) |
