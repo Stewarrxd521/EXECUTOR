@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import time
+import zlib
 from pathlib import Path
 from typing import Optional
 
@@ -40,7 +41,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Del estado solo se reenvía lo que cambió; estos campos van siempre que se envía algo.
 STATE_ALWAYS = ("ts", "uptime_s")
 HEALTH_EVERY_S = 5    # latencias y contadores: cambian cada segundo
-MARKETS_EVERY_S = 10  # el símbolo seleccionado sigue llegando cada segundo
+MARKETS_EVERY_S = 30  # el símbolo seleccionado sigue llegando cada segundo
 
 
 def _sig(value: float, digits: int = 2) -> float:
@@ -65,6 +66,16 @@ class Client:
         self.visible = True
         self.sent: dict[str, str] = {}
         self.market_sent: dict[str, list] = {}
+        # Render no negocia permessage-deflate: si el dashboard lo pide, los mensajes van
+        # comprimidos en un único flujo deflate (cada uno termina en "\n" y Z_SYNC_FLUSH).
+        self.zip: Optional["zlib._Compress"] = None
+        self._lock = asyncio.Lock()
+
+    def enable_zip(self) -> None:
+        self.zip = zlib.compressobj(6, zlib.DEFLATED, -15)
+
+    def pack(self, text: str) -> bytes:
+        return self.zip.compress(text.encode() + b"\n") + self.zip.flush(zlib.Z_SYNC_FLUSH)
 
     def state_text(self, parts: dict[str, str]) -> Optional[str]:
         """Mensaje ``state`` con los campos que cambiaron (todos si el cliente es antiguo)."""
@@ -90,11 +101,17 @@ class Client:
         return dumps({"type": "markets", "rows": changed, "full": full})
 
     async def send(self, text: str) -> None:
-        if not self.ws.closed:
-            try:
+        if self.ws.closed:
+            return
+        try:
+            if self.zip is None:
                 await self.ws.send_str(text)
-            except (ConnectionResetError, RuntimeError):
-                pass
+                return
+            # El flujo comprimido exige que los mensajes salgan en el orden en que se comprimen.
+            async with self._lock:
+                await self.ws.send_bytes(self.pack(text))
+        except (ConnectionResetError, RuntimeError):
+            pass
 
 
 class DashboardHub:
@@ -216,6 +233,8 @@ class DashboardHub:
                 await asyncio.sleep(2)
             if not required or settings.check_write_token(str(data.get("token", ""))):
                 client.authed = True
+                if data.get("zip") and client.zip is None:
+                    client.enable_zip()
                 await client.send(dumps({"type": "auth", "ok": True, "env": settings.env_label, "required": required}))
                 client.sent.clear()
                 client.market_sent = {}
