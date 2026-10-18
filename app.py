@@ -59,6 +59,7 @@ ROBUSTEZ:
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import hmac
 import json
@@ -404,9 +405,14 @@ def _executor_fetch_state_sync() -> Optional[dict]:
     if not EXECUTOR_URL:
         return None
     try:
-        req = urllib.request.Request(f"{EXECUTOR_URL}/api/state", method="GET")
+        # Solo se usan los totales: limit=1 y gzip para no gastar el ancho de banda del executor.
+        req = urllib.request.Request(f"{EXECUTOR_URL}/api/state?limit=1", method="GET",
+                                     headers={"Accept-Encoding": "gzip"})
         with urllib.request.urlopen(req, timeout=8) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read()
+            if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8"))
     except Exception:
         return None
 

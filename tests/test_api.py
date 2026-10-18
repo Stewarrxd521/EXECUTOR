@@ -634,3 +634,80 @@ async def test_burst_on_three_symbols(open_service, live_url, fake):
     for i, (sym, px, qty) in enumerate([("ETHUSDT", 3000, 0.01), ("BTCUSDT", 65000, 0.001), ("TESTUSDT", 0.5, 20)]):
         bridge.notify_open(trade_id=60 + i, symbol=sym, direction="SHORT", price=px, quantity=qty, notional=10, level=50)
     await wait_for(lambda: len(open_service.trades.open_trades) == 3, timeout=10)
+
+
+# ── Ancho de banda (Render cobra el tráfico de salida) ──────────────────────
+def _closed_trade(i: int):
+    from executor.trading import Trade
+    return Trade(id=i, symbol="ETHUSDT", direction="SHORT", entry_price=3000, quantity=0.01,
+                 open_time="2026-01-01 00:00:00", leverage=5, status="TP", close_price=2990)
+
+
+async def test_api_state_is_capped_and_gzipped(open_service):
+    open_service.trades.closed.extend(_closed_trade(i) for i in range(60))
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        r = await client.get("/api/state", headers={"Accept-Encoding": "gzip"})
+        assert r.headers.get("Content-Encoding") == "gzip"
+        assert len((await r.json())["closed_trades"]) == open_service.settings.state_closed_limit == 20
+        r = await client.get("/api/state?limit=50", headers={"Accept-Encoding": "identity"})
+        assert "Content-Encoding" not in r.headers and len((await r.json())["closed_trades"]) == 50
+    # executor_client pide gzip y lo descomprime solo.
+    server = TestServer(build_app(open_service))
+    await server.start_server()
+    try:
+        c = executor_client.ExecutorClient(str(server.make_url("")).rstrip("/"), SECRET)
+        assert len((await asyncio.to_thread(c.state))["closed_trades"]) == 20
+    finally:
+        await server.close()
+
+
+async def _until(ws, kind: str) -> dict:
+    while True:
+        msg = await ws.receive_json(timeout=8)
+        if msg.get("type") == kind:
+            return msg
+
+
+async def test_dashboard_sends_only_changes(open_service):
+    open_service.trades.closed.extend(_closed_trade(i) for i in range(5))
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        ws = await client.ws_connect("/ws")
+        await ws.send_json({"op": "auth", "token": ""})
+        first = await _until(ws, "state")
+        assert len(first["data"]["closed"]) == 5 and "signals" in first["data"]
+        assert (await _until(ws, "markets"))["full"] is True
+        await ws.send_json({"op": "markets", "on": True, "delta": True})
+        nxt = await _until(ws, "state")
+        assert "closed" not in nxt["data"] and "positions" in nxt["data"]
+        open_service.trades.closed.append(_closed_trade(99))
+        changed = await _until(ws, "state")
+        assert len(changed["data"]["closed"]) == 6
+        # Pestaña oculta: no llega el estado periódico.
+        await ws.send_json({"op": "visible", "on": False})
+        await asyncio.sleep(0.2)
+        while True:
+            try:
+                await ws.receive_json(timeout=0.05)
+            except asyncio.TimeoutError:
+                break
+        with pytest.raises(asyncio.TimeoutError):
+            await _until_timeout(ws, "state", 2.5)
+        await ws.send_json({"op": "visible", "on": True})
+        assert (await _until(ws, "state"))["data"]
+        await ws.close()
+
+
+async def _until_timeout(ws, kind: str, seconds: float) -> dict:
+    return await asyncio.wait_for(_until(ws, kind), seconds)
+
+
+def test_markets_delta_sends_changed_rows_only():
+    from executor.web.server import Client
+    import json as _json
+    c = Client(ws=None, ip="")
+    rows = [["AUSDT", 1.0, 0.1, 10], ["BUSDT", 2.0, 0.2, 20]]
+    assert _json.loads(c.markets_text(rows))["full"] is True
+    c.delta = True
+    assert c.markets_text([list(r) for r in rows]) is None
+    msg = _json.loads(c.markets_text([rows[0], ["BUSDT", 2.5, 0.3, 21]]))
+    assert msg == {"type": "markets", "rows": [["BUSDT", 2.5, 0.3, 21]], "full": False}

@@ -412,6 +412,24 @@ async def json_errors_middleware(request: web.Request, handler):
         return json_response({"ok": False, "error": "error interno del executor", "status": 500}, 500)
 
 
+_COMPRESSIBLE = ("application/json", "text/csv", "text/plain")
+
+
+@web.middleware
+async def compress_middleware(request: web.Request, handler):
+    """gzip/deflate para las respuestas JSON/CSV grandes si el cliente lo acepta.
+
+    Render cobra el tráfico de salida: ``/api/state`` (que los bots consultan cada
+    pocos segundos) ocupa de 5 a 10 veces menos comprimido.
+    """
+    resp = await handler(request)
+    if (isinstance(resp, web.Response) and not resp.prepared and resp.body is not None
+            and len(resp.body) >= 1024 and resp.content_type in _COMPRESSIBLE
+            and "Content-Encoding" not in resp.headers):
+        resp.enable_compression()  # negocia según Accept-Encoding; sin él se envía tal cual
+    return resp
+
+
 _REDACT = {"secret", "token", "signal_secret"}
 
 
@@ -444,4 +462,5 @@ def build_access_logger(trust_proxy: bool) -> type:
 
 
 __all__ = ["REST_ROUTES", "register_rest", "register_legacy", "cors_middleware", "json_errors_middleware",
+           "compress_middleware",
            "build_access_logger", "add_route", "dumps", "time"]

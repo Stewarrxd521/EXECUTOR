@@ -211,6 +211,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import gzip
 import http.client
 import itertools
 import json
@@ -261,14 +262,26 @@ def _decode(raw: bytes) -> Any:
         return text
 
 
+def _read(resp) -> bytes:
+    raw = resp.read()
+    if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+        raw = gzip.decompress(raw)
+    return raw
+
+
 def _http(req: urllib.request.Request, timeout: float) -> tuple[int, Any]:
-    """Ejecuta la petición y devuelve (código, cuerpo). Los 4xx/5xx no lanzan excepción."""
+    """Ejecuta la petición y devuelve (código, cuerpo). Los 4xx/5xx no lanzan excepción.
+
+    Pide la respuesta comprimida: el executor en Render paga cada byte que envía.
+    """
+    if not req.has_header("Accept-encoding"):
+        req.add_header("Accept-Encoding", "gzip")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, _decode(resp.read())
+            return resp.status, _decode(_read(resp))
     except urllib.error.HTTPError as err:
         try:
-            body = _decode(err.read())
+            body = _decode(_read(err))
         except Exception:  # pragma: no cover
             body = ""
         return err.code, body

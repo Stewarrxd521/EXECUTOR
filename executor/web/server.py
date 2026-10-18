@@ -30,12 +30,16 @@ from aiohttp import WSMsgType, web
 from .. import __version__
 from ..precision import parse_bool, safe_float
 from ..service import ExecutorService
-from .api import add_route, cors_middleware, json_errors_middleware, register_legacy, register_rest
+from .api import (add_route, compress_middleware, cors_middleware, json_errors_middleware, register_legacy,
+                  register_rest)
 from .common import (Auth, any_valid, client_ip, dumps, json_response, origin_allowed, read_body,
                      request_secrets, run_command)
 
 log = logging.getLogger("executor.web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# Partes del estado que pesan mucho y casi nunca cambian: solo se reenvían si cambian.
+HEAVY_STATE_KEYS = ("closed", "signals")
+MARKETS_EVERY_S = 5
 
 
 class Client:
@@ -46,6 +50,32 @@ class Client:
         self.markets = False
         self.symbol = ""
         self.log_seq = 0
+        # Dashboard actual: recibe solo lo que cambió y avisa si la pestaña está oculta.
+        self.delta = False
+        self.visible = True
+        self.sent: dict[str, str] = {}
+        self.market_sent: dict[str, list] = {}
+
+    def state_text(self, light: str, heavy: dict[str, str]) -> str:
+        """Mensaje ``state``: lo ligero siempre; ``closed``/``signals`` solo si cambiaron."""
+        extra = []
+        for key, text in heavy.items():
+            if not self.delta or self.sent.get(key) != text:
+                self.sent[key] = text
+                extra.append(f',"{key}":{text}')
+        return '{"type":"state","data":' + light[:-1] + "".join(extra) + "}}"
+
+    def markets_text(self, rows: list) -> Optional[str]:
+        """Mercados completos la primera vez; después solo las filas que cambiaron."""
+        full = not self.delta or not self.market_sent
+        changed = rows if full else [r for r in rows if self.market_sent.get(r[0]) != r]
+        if full:
+            self.market_sent = {}
+        for r in changed:
+            self.market_sent[r[0]] = r
+        if not changed and not full:
+            return None
+        return dumps({"type": "markets", "rows": changed, "full": full})
 
     async def send(self, text: str) -> None:
         if not self.ws.closed:
@@ -77,6 +107,11 @@ class DashboardHub:
     def _authed(self) -> list[Client]:
         return [c for c in self.clients if c.authed and not c.ws.closed]
 
+    def _split_state(self) -> tuple[str, dict[str, str]]:
+        snap = self.service.snapshot()
+        heavy = {key: dumps(snap.pop(key)) for key in HEAVY_STATE_KEYS}
+        return dumps(snap), heavy
+
     def _push_all(self, payload: dict) -> None:
         targets = self._authed()
         if not targets:
@@ -99,19 +134,28 @@ class DashboardHub:
             await asyncio.sleep(1)
             tick += 1
             clients = self._authed()
+            for c in clients:
+                if c.symbol:
+                    self.service.note_watch(c.symbol)
+            # Una pestaña oculta no recibe el estado periódico (sí eventos y errores).
+            clients = [c for c in clients if c.visible]
             if not clients:
                 continue
             try:
-                state = dumps({"type": "state", "data": self.service.snapshot()})
-                markets = dumps({"type": "markets", "rows": self.service.core.market.market_rows()}) if tick % 2 == 0 else None
+                light, heavy = self._split_state()
+                rows = self.service.core.market.market_rows() if tick % MARKETS_EVERY_S == 0 else None
                 logs = list(self.service.logs.lines)
                 for c in clients:
-                    await c.send(state)
-                    if markets and c.markets:
-                        await c.send(markets)
+                    await c.send(c.state_text(light, heavy))
+                    if rows is not None and c.markets:
+                        markets = c.markets_text(rows)
+                        if markets:
+                            await c.send(markets)
                     if c.symbol:
-                        await c.send(dumps({"type": "ticker", "data": self.service.symbol_view(c.symbol)}))
-                        self.service.note_watch(c.symbol)
+                        ticker = dumps({"type": "ticker", "data": self.service.symbol_view(c.symbol)})
+                        if not c.delta or c.sent.get("ticker") != ticker:
+                            c.sent["ticker"] = ticker
+                            await c.send(ticker)
                     fresh = [ln for ln in logs if ln["id"] > c.log_seq]
                     if fresh:
                         c.log_seq = fresh[-1]["id"]
@@ -158,8 +202,10 @@ class DashboardHub:
             if not required or settings.check_write_token(str(data.get("token", ""))):
                 client.authed = True
                 await client.send(dumps({"type": "auth", "ok": True, "env": settings.env_label, "required": required}))
-                await client.send(dumps({"type": "state", "data": self.service.snapshot()}))
-                await client.send(dumps({"type": "markets", "rows": self.service.core.market.market_rows()}))
+                client.sent.clear()
+                client.market_sent = {}
+                await client.send(client.state_text(*self._split_state()))
+                await client.send(client.markets_text(self.service.core.market.market_rows()))
                 await client.send(dumps({"type": "errors", "entries": self.service.core.journal.entries(150)}))
                 client.log_seq = 0
             else:
@@ -171,6 +217,10 @@ class DashboardHub:
             return
         if op == "markets":
             client.markets = bool(data.get("on", True))
+            if data.get("delta"):
+                client.delta = True
+        elif op == "visible":
+            client.visible = bool(data.get("on", True))
         elif op == "select":
             client.symbol = str(data.get("symbol", "")).upper()[:30]
             if client.symbol:
@@ -276,7 +326,7 @@ def build_app(service: ExecutorService) -> web.Application:
         if settings.state_requires_auth and not any_valid(request_secrets(request), settings.check_write_token):
             auth.warn_denied(request, "/api/state")
             return json_response({"ok": False, "error": "unauthorized"}, 401)
-        limit = int(safe_float(request.query.get("limit"), 200))
+        limit = int(safe_float(request.query.get("limit"), settings.state_closed_limit))
         return json_response(service.api_state(max(0, limit)))
 
     async def health(_: web.Request) -> web.Response:
@@ -298,7 +348,7 @@ def build_app(service: ExecutorService) -> web.Application:
         await hub.stop()
 
     app = web.Application(client_max_size=1 << 20,
-                          middlewares=[cors_middleware(service), json_errors_middleware])
+                          middlewares=[compress_middleware, cors_middleware(service), json_errors_middleware])
     app.router.add_get("/", index)
     app.router.add_get("/ws", hub.handle)
     app.router.add_get("/ws/signal", signal_ws)
