@@ -674,15 +674,16 @@ async def test_dashboard_sends_only_changes(open_service):
         ws = await client.ws_connect("/ws")
         await ws.send_json({"op": "auth", "token": ""})
         first = await _until(ws, "state")
-        assert len(first["data"]["closed"]) == 5 and "signals" in first["data"]
+        assert len(first["data"]["closed"]) == 5 and {"signals", "positions", "health"} <= set(first["data"])
         assert (await _until(ws, "markets"))["full"] is True
         await ws.send_json({"op": "markets", "on": True, "delta": True})
-        nxt = await _until(ws, "state")
-        assert "closed" not in nxt["data"] and "positions" in nxt["data"]
         open_service.trades.closed.append(_closed_trade(99))
         changed = await _until(ws, "state")
+        while "closed" not in changed["data"]:
+            changed = await _until(ws, "state")
         assert len(changed["data"]["closed"]) == 6
-        # Pestaña oculta: no llega el estado periódico.
+        assert "positions" not in changed["data"] and "settings" not in changed["data"]
+        # Pestaña oculta: no llega el estado periódico aunque cambie.
         await ws.send_json({"op": "visible", "on": False})
         await asyncio.sleep(0.2)
         while True:
@@ -690,11 +691,26 @@ async def test_dashboard_sends_only_changes(open_service):
                 await ws.receive_json(timeout=0.05)
             except asyncio.TimeoutError:
                 break
+        open_service.trades.closed.append(_closed_trade(100))
         with pytest.raises(asyncio.TimeoutError):
             await _until_timeout(ws, "state", 2.5)
         await ws.send_json({"op": "visible", "on": True})
-        assert (await _until(ws, "state"))["data"]
+        back = await _until(ws, "state")
+        while "closed" not in back["data"]:
+            back = await _until(ws, "state")
+        assert len(back["data"]["closed"]) == 7
         await ws.close()
+
+
+async def test_dashboard_files_use_etag_and_gzip(open_service):
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        for path in ("/", "/static/app.js", "/static/app.css"):
+            r = await client.get(path, headers={"Accept-Encoding": "gzip"})
+            assert r.status == 200 and r.headers.get("Content-Encoding") == "gzip"
+            r2 = await client.get(path, headers={"If-None-Match": r.headers["ETag"]})
+            assert r2.status == 304 and not await r2.read()
+        r = await client.get("/api/state")
+        assert (await client.get("/api/state", headers={"If-None-Match": r.headers["ETag"]})).status in (200, 304)
 
 
 async def _until_timeout(ws, kind: str, seconds: float) -> dict:
@@ -711,3 +727,11 @@ def test_markets_delta_sends_changed_rows_only():
     assert c.markets_text([list(r) for r in rows]) is None
     msg = _json.loads(c.markets_text([rows[0], ["BUSDT", 2.5, 0.3, 21]]))
     assert msg == {"type": "markets", "rows": [["BUSDT", 2.5, 0.3, 21]], "full": False}
+
+
+async def test_bridge_poll_uses_etag(open_service, live_url):
+    bridge = executor_client.ExecutorBridge(executor_url=live_url, signal_secret=SECRET)
+    first = await asyncio.to_thread(bridge.fetch_state_sync)
+    assert first and bridge._state_etag
+    second = await asyncio.to_thread(bridge.fetch_state_sync)
+    assert second is first  # 304: se reutiliza el estado anterior sin descargarlo

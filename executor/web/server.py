@@ -37,9 +37,19 @@ from .common import (Auth, any_valid, client_ip, dumps, json_response, origin_al
 
 log = logging.getLogger("executor.web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-# Partes del estado que pesan mucho y casi nunca cambian: solo se reenvían si cambian.
-HEAVY_STATE_KEYS = ("closed", "signals")
-MARKETS_EVERY_S = 5
+# Del estado solo se reenvía lo que cambió; estos campos van siempre que se envía algo.
+STATE_ALWAYS = ("ts", "uptime_s")
+HEALTH_EVERY_S = 5    # latencias y contadores: cambian cada segundo
+MARKETS_EVERY_S = 10  # el símbolo seleccionado sigue llegando cada segundo
+
+
+def _sig(value: float, digits: int = 2) -> float:
+    """Redondea a ``digits`` cifras significativas (el volumen solo sirve para ordenar)."""
+    return float(f"{value:.{digits}g}") if value else 0.0
+
+
+def ws_market_rows(rows: list) -> list:
+    return [[sym, last, chg, _sig(vol)] for sym, last, chg, vol in rows]
 
 
 class Client:
@@ -56,14 +66,16 @@ class Client:
         self.sent: dict[str, str] = {}
         self.market_sent: dict[str, list] = {}
 
-    def state_text(self, light: str, heavy: dict[str, str]) -> str:
-        """Mensaje ``state``: lo ligero siempre; ``closed``/``signals`` solo si cambiaron."""
-        extra = []
-        for key, text in heavy.items():
-            if not self.delta or self.sent.get(key) != text:
-                self.sent[key] = text
-                extra.append(f',"{key}":{text}')
-        return '{"type":"state","data":' + light[:-1] + "".join(extra) + "}}"
+    def state_text(self, parts: dict[str, str]) -> Optional[str]:
+        """Mensaje ``state`` con los campos que cambiaron (todos si el cliente es antiguo)."""
+        changed = [k for k, text in parts.items()
+                   if k not in STATE_ALWAYS and (not self.delta or self.sent.get(k) != text)]
+        if not changed:
+            return None
+        for k in changed:
+            self.sent[k] = parts[k]
+        keys = [k for k in STATE_ALWAYS if k in parts] + changed
+        return '{"type":"state","data":{' + ",".join(f'"{k}":{parts[k]}' for k in keys) + "}}"
 
     def markets_text(self, rows: list) -> Optional[str]:
         """Mercados completos la primera vez; después solo las filas que cambiaron."""
@@ -107,10 +119,11 @@ class DashboardHub:
     def _authed(self) -> list[Client]:
         return [c for c in self.clients if c.authed and not c.ws.closed]
 
-    def _split_state(self) -> tuple[str, dict[str, str]]:
+    def _state_parts(self, health: bool = True) -> dict[str, str]:
         snap = self.service.snapshot()
-        heavy = {key: dumps(snap.pop(key)) for key in HEAVY_STATE_KEYS}
-        return dumps(snap), heavy
+        if not health:
+            snap.pop("health", None)
+        return {k: dumps(v) for k, v in snap.items()}
 
     def _push_all(self, payload: dict) -> None:
         targets = self._authed()
@@ -142,11 +155,13 @@ class DashboardHub:
             if not clients:
                 continue
             try:
-                light, heavy = self._split_state()
-                rows = self.service.core.market.market_rows() if tick % MARKETS_EVERY_S == 0 else None
+                parts = self._state_parts(health=tick % HEALTH_EVERY_S == 0)
+                rows = ws_market_rows(self.service.core.market.market_rows()) if tick % MARKETS_EVERY_S == 0 else None
                 logs = list(self.service.logs.lines)
                 for c in clients:
-                    await c.send(c.state_text(light, heavy))
+                    state = c.state_text(parts)
+                    if state:
+                        await c.send(state)
                     if rows is not None and c.markets:
                         markets = c.markets_text(rows)
                         if markets:
@@ -204,8 +219,8 @@ class DashboardHub:
                 await client.send(dumps({"type": "auth", "ok": True, "env": settings.env_label, "required": required}))
                 client.sent.clear()
                 client.market_sent = {}
-                await client.send(client.state_text(*self._split_state()))
-                await client.send(client.markets_text(self.service.core.market.market_rows()))
+                await client.send(client.state_text(self._state_parts()))
+                await client.send(client.markets_text(ws_market_rows(self.service.core.market.market_rows())))
                 await client.send(dumps({"type": "errors", "entries": self.service.core.journal.entries(150)}))
                 client.log_seq = 0
             else:
@@ -246,8 +261,19 @@ def build_app(service: ExecutorService) -> web.Application:
     hub = DashboardHub(service)
     auth = Auth(service)
 
-    async def index(_: web.Request) -> web.StreamResponse:
-        return web.FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+    # Dashboard en memoria: compress_middleware lo sirve con gzip y ETag (304 si no cambió).
+    static_files = {name: (STATIC_DIR / name).read_bytes() for name in ("index.html", "app.js", "app.css")}
+    static_types = {"html": "text/html", "js": "application/javascript", "css": "text/css"}
+
+    def static_response(name: str) -> web.Response:
+        return web.Response(body=static_files[name], content_type=static_types[name.rsplit(".", 1)[1]],
+                            charset="utf-8", headers={"Cache-Control": "no-cache"})
+
+    async def index(_: web.Request) -> web.Response:
+        return static_response("index.html")
+
+    async def static_asset(request: web.Request) -> web.Response:
+        return static_response(request.match_info["name"])
 
     # ── POST /signal (ExecutorBridge de app.py / app_25.py) ─────────────────
     def cross_site(request: web.Request) -> bool:
@@ -358,6 +384,7 @@ def build_app(service: ExecutorService) -> web.Application:
     add_route(app, "GET", "/ready", ready)
     register_rest(app, service, auth)
     register_legacy(app, service, auth)
+    app.router.add_get("/static/{name:app\\.(?:js|css)}", static_asset)
     app.router.add_static("/static", STATIC_DIR, append_version=True)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)

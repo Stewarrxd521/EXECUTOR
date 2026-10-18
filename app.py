@@ -400,19 +400,30 @@ def _executor_send_signal_sync(payload: dict) -> None:
         )
 
 
+_executor_state_cache: Dict[str, Any] = {"etag": "", "data": None}
+
+
 def _executor_fetch_state_sync() -> Optional[dict]:
     """Lee /api/state del Executor (balance, PnL realizado real, etc.)."""
     if not EXECUTOR_URL:
         return None
+    # Solo se usan los totales: limit=1, gzip y ETag (304 sin cuerpo si nada cambió)
+    # para no gastar el ancho de banda del executor.
+    headers = {"Accept-Encoding": "gzip"}
+    cache = _executor_state_cache
+    if cache["data"] is not None and cache["etag"]:
+        headers["If-None-Match"] = cache["etag"]
     try:
-        # Solo se usan los totales: limit=1 y gzip para no gastar el ancho de banda del executor.
-        req = urllib.request.Request(f"{EXECUTOR_URL}/api/state?limit=1", method="GET",
-                                     headers={"Accept-Encoding": "gzip"})
+        req = urllib.request.Request(f"{EXECUTOR_URL}/api/state?limit=1", method="GET", headers=headers)
         with urllib.request.urlopen(req, timeout=8) as resp:
             raw = resp.read()
             if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
                 raw = gzip.decompress(raw)
-            return json.loads(raw.decode("utf-8"))
+            cache["data"] = json.loads(raw.decode("utf-8"))
+            cache["etag"] = resp.headers.get("ETag") or ""
+            return cache["data"]
+    except urllib.error.HTTPError as exc:
+        return cache["data"] if exc.code == 304 else None
     except Exception:
         return None
 

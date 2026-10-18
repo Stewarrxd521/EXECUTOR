@@ -129,9 +129,8 @@
         }
         break;
       case 'state': {
-        // closed/signals solo llegan cuando cambian: se conservan los anteriores.
-        const prev = S.snap || {};
-        S.snap = { closed: prev.closed || [], signals: prev.signals || [], ...m.data };
+        // Solo llegan los campos que cambiaron: se conservan los anteriores.
+        S.snap = { ...(S.snap || {}), ...m.data };
         renderAll();
         break;
       }
