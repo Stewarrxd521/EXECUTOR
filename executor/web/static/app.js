@@ -55,6 +55,29 @@
   };
 
   // ── WebSocket ──────────────────────────────────────────────────────────
+  // Un único flujo deflate-raw por conexión; cada mensaje JSON termina en "\n".
+  function inflater(onText) {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = '';
+    (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += value;
+          let i;
+          while ((i = buf.indexOf('\n')) >= 0) { onText(buf.slice(0, i)); buf = buf.slice(i + 1); }
+        }
+      } catch (err) { /* conexión cerrada */ }
+    })();
+    return {
+      push(data) { writer.write(new Uint8Array(data)).catch(() => {}); },
+      close() { writer.abort().catch(() => {}); },
+    };
+  }
+
   const WS = {
     sock: null, seq: 0, pending: new Map(), retry: 0, token: '', authed: false, denied: false,
     connect() {
@@ -62,9 +85,16 @@
       const sock = new WebSocket(`${proto}://${location.host}/ws`);
       this.sock = sock;
       setDot('c-dash', 'warn');
-      sock.onopen = () => { this.retry = 0; this.send({ op: 'auth', token: this.token }); };
-      sock.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+      const handle = (text) => { try { onMessage(JSON.parse(text)); } catch (err) { console.error(err); } };
+      // Render no comprime el WebSocket: el servidor envía un flujo deflate propio si lo pedimos.
+      let inflate = null;
+      try { inflate = inflater(handle); } catch (err) { /* navegador sin deflate-raw: mensajes de texto */ }
+      sock.binaryType = 'arraybuffer';
+      this.zip = !!inflate;
+      sock.onopen = () => { this.retry = 0; this.send({ op: 'auth', token: this.token, zip: this.zip }); };
+      sock.onmessage = (e) => { if (typeof e.data === 'string') handle(e.data); else if (inflate) inflate.push(e.data); };
       sock.onclose = () => {
+        if (inflate) inflate.close();
         this.authed = false;
         setDot('c-dash', 'off');
         for (const p of this.pending.values()) { clearTimeout(p.t); p.rej(new Error('Conexión con el panel perdida')); }
@@ -1092,7 +1122,7 @@
       if ($('#login-remember').checked) store.set('token', token);
       $('#login-error').textContent = '';
       WS.denied = false;
-      if (WS.sock && WS.sock.readyState === 1) WS.send({ op: 'auth', token }); else WS.connect();
+      if (WS.sock && WS.sock.readyState === 1) WS.send({ op: 'auth', token, zip: WS.zip }); else WS.connect();
     });
     $('#logout-btn').onclick = () => { store.del('token'); WS.token = ''; location.reload(); };
     $('#theme-btn').onclick = () => {

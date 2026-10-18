@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from aiohttp import WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
 import executor_client
@@ -735,3 +736,23 @@ async def test_bridge_poll_uses_etag(open_service, live_url):
     assert first and bridge._state_etag
     second = await asyncio.to_thread(bridge.fetch_state_sync)
     assert second is first  # 304: se reutiliza el estado anterior sin descargarlo
+
+
+async def test_dashboard_zip_stream_is_ordered_deflate(open_service):
+    import json as _json
+    import zlib
+    async with TestClient(TestServer(build_app(open_service))) as client:
+        ws = await client.ws_connect("/ws")
+        await ws.send_json({"op": "auth", "token": "", "zip": True})
+        await ws.send_json({"op": "markets", "on": True, "delta": True})
+        await ws.send_json({"op": "select", "symbol": "BTCUSDT"})
+        inflate, buf, kinds, raw = zlib.decompressobj(-15), b"", [], 0
+        while not {"auth", "state", "markets", "errors", "ticker"} <= set(kinds):
+            msg = await ws.receive(timeout=8)
+            assert msg.type == WSMsgType.BINARY
+            raw += len(msg.data)
+            buf += inflate.decompress(msg.data)
+            *lines, buf = buf.split(b"\n")
+            kinds += [_json.loads(line)["type"] for line in lines]
+        assert kinds[0] == "auth" and buf == b""
+        await ws.close()
