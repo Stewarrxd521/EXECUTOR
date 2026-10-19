@@ -117,6 +117,8 @@ class BinanceWsApi:
         self.method_counts: Counter = Counter()
         self.bytes_in = 0
         self.bytes_out = 0
+        self.frames_in = 0
+        self.frames_out = 0
         self.bytes_by_method: Counter = Counter()   # bytes recibidos por método (qué consume más)
         self.started_ts = time.time()
 
@@ -158,6 +160,7 @@ class BinanceWsApi:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     self.bytes_in += len(msg.data)
+                    self.frames_in += 1
                     try:
                         data = json.loads(msg.data)
                     except ValueError:
@@ -230,6 +233,7 @@ class BinanceWsApi:
                 self._methods[req_id] = method
                 await self._ws.send_str(text)
                 self.bytes_out += len(text)
+                self.frames_out += 1
             except Exception as exc:
                 self._pending.pop(req_id, None)
                 self._methods.pop(req_id, None)

@@ -415,36 +415,55 @@ class ExecutorService:
                     del self.history[sym]
 
     def note_watch(self, symbol: str) -> None:
-        """Marca un símbolo como observado (gráfico y suscripción de precio). Solo símbolos reales."""
-        if len(symbol) <= 30 and (self.core.exinfo.known(symbol) or self.core.market.mark(symbol)):
+        """Marca un símbolo como observado (gráfico y suscripción de precio). Solo símbolos reales:
+        los del exchangeInfo local o los que Binance ya reportó (precio o ticker)."""
+        market = self.core.market
+        if len(symbol) <= 30 and market.valid_symbol(symbol) and (
+                self.core.exinfo.known(symbol) or market.mark(symbol) or symbol in market.tickers):
             self.watch[symbol] = time.time()
 
-    async def ensure_price(self, symbol: str, wait_s: float = 2.5) -> float:
-        """Precio de un símbolo aunque aún no esté suscrito (modo lite): se suscribe y,
-        si el stream no llega a tiempo, se pide por la WS API."""
+    async def ensure_prices(self, symbols, wait_s: float = 2.5) -> dict[str, float]:
+        """Precio de varios símbolos aunque aún no estén suscritos (modo lite).
+
+        Se registran todos (un único SUBSCRIBE), se espera al stream y, si no llega a
+        tiempo, se pide por la WS API. Un símbolo desconocido solo se suscribe si
+        Binance devuelve precio (nada de suscribir textos arbitrarios).
+        """
         market = self.core.market
-        price = market.mark(symbol, max_age_s=self.settings.max_price_age_s)
-        if price:
-            return price
-        self.note_watch(symbol)
-        market.want([symbol], ticker_symbols=[symbol])
-        try:
-            await market.sync_subscriptions()
-        except Exception:  # pragma: no cover
-            log.exception("Mercado: no se pudo suscribir %s", symbol)
-        deadline = time.time() + wait_s
-        while time.time() < deadline:
-            price = market.mark(symbol, max_age_s=self.settings.max_price_age_s)
-            if price:
-                return price
-            await asyncio.sleep(0.1)
-        try:
-            price = await self.core.ws.ticker_price(symbol)
-        except Exception as exc:
-            log.warning("%s: sin precio de mercado (%s)", symbol, exc)
-            price = 0.0
-        market.seed(symbol, price)
-        return market.price(symbol)
+        max_age = self.settings.max_price_age_s
+        symbols = [s for s in dict.fromkeys(symbols) if market.valid_symbol(s)]
+        unknown = [s for s in symbols if not (self.core.exinfo.known(s) or s in market.tickers or market.mark(s))]
+        for sym in unknown:  # se valida con Binance antes de suscribir
+            try:
+                market.seed(sym, await self.core.ws.ticker_price(sym))
+            except Exception as exc:
+                log.warning("%s: símbolo sin precio en Binance (%s)", sym, exc)
+        for sym in symbols:
+            self.note_watch(sym)
+        market.want([s for s in symbols if s in self.watch], ticker_symbols=[s for s in symbols if s in self.watch])
+        missing = [s for s in symbols if not market.mark(s, max_age_s=max_age)]
+        if missing:
+            try:
+                await market.sync_subscriptions()
+            except Exception:  # pragma: no cover
+                log.exception("Mercado: no se pudieron suscribir %s", missing)
+            deadline = time.time() + wait_s
+            while time.time() < deadline and any(not market.mark(s, max_age_s=max_age) for s in missing):
+                await asyncio.sleep(0.1)
+
+        async def fallback(sym: str) -> None:
+            try:
+                market.seed(sym, await self.core.ws.ticker_price(sym))
+            except Exception as exc:
+                log.warning("%s: sin precio de mercado (%s)", sym, exc)
+
+        late = [s for s in missing if not market.mark(s, max_age_s=max_age)]
+        if late:
+            await asyncio.gather(*(fallback(s) for s in late))
+        return {s: market.price(s) for s in symbols}
+
+    async def ensure_price(self, symbol: str, wait_s: float = 2.5) -> float:
+        return (await self.ensure_prices([symbol], wait_s)).get(symbol, 0.0)
 
     # ── Vistas ────────────────────────────────────────────────────────────
     def positions_view(self, symbol: Optional[str] = None) -> list[dict]:
@@ -526,19 +545,29 @@ class ExecutorService:
             "network": self.network_view(),
         }
 
-    # Por cada byte recibido en una conexión que abre el executor, la pila TCP/TLS envía
-    # de vuelta ≈4-5 % (ACK). Render factura esa salida como «Service-Initiated».
-    ACK_RATIO = 0.045
+    # Estimación de lo que Render factura como «Service-Initiated» en las conexiones que abre
+    # el executor: lo enviado + ~80 B de cabeceras TCP/TLS por mensaje enviado + un ACK (~66 B)
+    # por mensaje recibido (y uno más por cada ~2 segmentos de 1448 B en mensajes grandes).
+    FRAME_OVERHEAD_OUT = 80
+    ACK_BYTES = 66
 
     def _traffic_totals(self) -> dict:
+        """(bytes_in, bytes_out, frames_in, frames_out) por conexión."""
         c = self.core
+        rest_calls = sum(c.rest.calls.values())
         return {
-            "market": (c.market.conn.bytes_in, c.market.conn.bytes_out),
-            "user": (self.user.conn.bytes_in, self.user.conn.bytes_out),
-            "ws_api": (c.ws.bytes_in, c.ws.bytes_out),
-            "rest": (c.rest.bytes_in, c.rest.bytes_out),
-            "web": (0, sum(self.web_traffic.values())),
+            "market": (c.market.conn.bytes_in, c.market.conn.bytes_out, c.market.conn.messages,
+                       c.market.conn.frames_out),
+            "user": (self.user.conn.bytes_in, self.user.conn.bytes_out, self.user.conn.messages,
+                     self.user.conn.frames_out),
+            "ws_api": (c.ws.bytes_in, c.ws.bytes_out, c.ws.frames_in, c.ws.frames_out),
+            "rest": (c.rest.bytes_in, c.rest.bytes_out, rest_calls * 2, rest_calls * 2),
+            "web": (0, sum(self.web_traffic.values()), 0, 0),
         }
+
+    def _billable(self, bytes_in: int, bytes_out: int, frames_in: int, frames_out: int) -> float:
+        acks = frames_in + bytes_in // 2896
+        return bytes_out + frames_out * self.FRAME_OVERHEAD_OUT + acks * self.ACK_BYTES
 
     def network_view(self) -> dict:
         """Tráfico por fuente (MB/h) y estimación de lo que factura Render.
@@ -551,18 +580,17 @@ class ExecutorService:
         totals = self._traffic_totals()
         base, since = None, self.started_ts
         for ts, sample in self._traffic_samples:
-            if now - ts <= 15 * 60 and now - ts >= 9 * 60:
+            if 9 * 60 <= now - ts <= 15 * 60:
                 base, since = sample, ts
                 break
         hours = max((now - since) / 3600, 1 / 3600)
-        raw = {k: (i - (base[k][0] if base else 0), o - (base[k][1] if base else 0))
-               for k, (i, o) in totals.items() if k != "web"}
-        web_out = totals["web"][1] - (base["web"][1] if base else 0)
-        sources = {k: {"in_mb_h": round(i / 1e6 / hours, 3), "out_mb_h": round(o / 1e6 / hours, 3)}
-                   for k, (i, o) in raw.items()}
-        received = sum(i for i, _ in raw.values())
-        sent = sum(o for _, o in raw.values())
-        billable = (sent + received * self.ACK_RATIO) / 1e6 / hours
+        delta = {k: tuple(v - (base[k][i] if base else 0) for i, v in enumerate(vals)) for k, vals in totals.items()}
+        mbh = lambda b: round(b / 1e6 / hours, 3)  # noqa: E731
+        sources = {k: {"in_mb_h": mbh(d[0]), "out_mb_h": mbh(d[1]), "billable_mb_h": mbh(self._billable(*d))}
+                   for k, d in delta.items() if k != "web"}
+        received = sum(d[0] for k, d in delta.items() if k != "web")
+        sent = sum(d[1] for k, d in delta.items() if k != "web")
+        billable = sum(self._billable(*d) for k, d in delta.items() if k != "web") / 1e6 / hours
         return {
             "hours": round(hours, 2),
             "window": "últimos 10 min" if base else "desde el arranque (incluye la sincronización inicial)",
@@ -570,14 +598,14 @@ class ExecutorService:
             "market_streams": c.market.stats().get("streams"),
             "compressed": {"market": c.market.conn.compressed, "user": self.user.conn.compressed},
             "service_initiated": {
-                "received_mb_h": round(received / 1e6 / hours, 3),
-                "sent_mb_h": round(sent / 1e6 / hours, 3),
+                "received_mb_h": mbh(received),
+                "sent_mb_h": mbh(sent),
                 "estimated_billable_mb_h": round(billable, 3),
                 "estimated_billable_gb_month": round(billable * 24 * 30 / 1000, 2),
                 "sources": sources,
                 "top_ws_api_methods_in": c.ws.traffic().get("top_methods_in", {}),
             },
-            "web_out_mb_h": round(web_out / 1e6 / hours, 3),
+            "web_out_mb_h": mbh(delta["web"][1]),
         }
 
     def account_view(self) -> dict:
@@ -646,8 +674,9 @@ class ExecutorService:
         prices = {}
         for sym in wanted:
             v = market.symbol_view(sym)
-            prices[sym] = {"mark": v["mark"], "last": v["last"], "change_pct": v["change_pct"],
-                           "funding_rate": v["funding_rate"]}
+            last = market.last(sym)  # solo si es reciente (modo lite)
+            prices[sym] = {"mark": market.mark(sym), "last": last or market.mark(sym),
+                           "change_pct": v["change_pct"] if last else None, "funding_rate": v["funding_rate"]}
         return {"ts": time.time(), "prices": prices,
                 "positions": [{k: p[k] for k in ("symbol", "direction", "qty", "entry", "mark", "pnl", "roe")}
                               for p in self.positions_view()]}
@@ -794,8 +823,8 @@ class ExecutorService:
 
     async def _cmd_live(self, a: dict):
         syms = [x.strip().upper() for x in str(a.get("symbols", "")).split(",") if x.strip()][:20]
-        if syms:  # símbolos pedidos explícitamente: se suscriben (modo lite) o se piden por WS API
-            await asyncio.gather(*(self.ensure_price(s, wait_s=1.5) for s in syms))
+        if syms:  # símbolos pedidos explícitamente: un único SUBSCRIBE (modo lite) o WS API
+            await self.ensure_prices(syms, wait_s=1.5)
         return self.live_view(syms or None)
 
     async def _cmd_symbol_info(self, a: dict):

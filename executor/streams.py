@@ -28,7 +28,9 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -90,6 +92,7 @@ class StreamConnection:
         self.last_error = ""
         self.bytes_in = 0          # carga útil recibida (texto de los mensajes)
         self.bytes_out = 0         # carga útil enviada (SUBSCRIBE, etc.)
+        self.frames_out = 0
         self.compressed = False    # Binance aceptó permessage-deflate
         self.started_ts = time.time()
 
@@ -123,6 +126,7 @@ class StreamConnection:
             log.warning("Stream %s: no se pudo enviar %s (%r)", self.name, data.get("method"), exc)
             return False
         self.bytes_out += len(text)
+        self.frames_out += 1
         return True
 
     async def _run(self) -> None:
@@ -207,7 +211,12 @@ class MarketData:
     BASE_STREAMS = ("!contractInfo",)
     ALL_TICKERS = "!miniTicker@arr"
     ALL_MARKS_3S = "!markPrice@arr"   # todo el mercado cada 3 s: más barato que muchos streams sueltos
-    MANY_SYMBOLS = 15           # con más posiciones que esto se usa ALL_MARKS_3S
+    # Con más símbolos que esto se usa ALL_MARKS_3S (≈150 B × ~700 símbolos cada 3 s): por debajo,
+    # los streams sueltos (≈190 B por símbolo) son más baratos. También evita el límite de 1024 streams.
+    MANY_SYMBOLS = 300
+    MAX_FRAMES_PER_S = 4        # Binance admite 10 mensajes/s por conexión: margen de sobra
+    SNAPSHOT_ARRAYS = 3         # !miniTicker@arr solo trae lo que cambió en el último segundo
+    WATCHDOG_S = 20.0           # sin datos de precio en 20 s con streams activos → reconexión
     SNAPSHOT_EVERY_S = 25.0     # foto de todos los mercados como mucho cada 25 s (solo con dashboard)
     UNSUBSCRIBE_GRACE_S = 60.0  # un símbolo que deja de hacer falta se mantiene 60 s (evita altas/bajas)
     STALE_S = 60.0              # (lite) un precio sin actualizar en 60 s no se usa para operar
@@ -230,6 +239,10 @@ class MarketData:
         self._pending: dict[int, tuple[str, list]] = {}
         self._snapshot_pending = False
         self._snapshot_asked = 0.0
+        self._snapshot_arrays = 0
+        self._snapshot_task: Optional[asyncio.Task] = None
+        self._sent_ts: deque = deque(maxlen=32)
+        self._last_price_ts = 0.0
         self.all_tickers_ts = 0.0
         self._lock = asyncio.Lock()
         self.conn = StreamConnection("market", self._url, self._handle, on_connect=self._on_connect,
@@ -250,6 +263,12 @@ class MarketData:
             keep = (keep - set(slow)) | {self.ALL_MARKS_3S}
         return keep | set(self.BASE_STREAMS)
 
+    _SYMBOL_RE = re.compile(r"\w{2,30}")  # letras/dígitos (también no ASCII): nada que rompa la URL
+
+    @classmethod
+    def valid_symbol(cls, symbol: str) -> bool:
+        return bool(symbol) and bool(cls._SYMBOL_RE.fullmatch(symbol))
+
     def want(self, symbols, fast_symbols=(), ticker_symbols=()) -> None:
         """Marca los símbolos que necesitan precio (lo llama el servicio cada segundo).
 
@@ -259,13 +278,13 @@ class MarketData:
         """
         now = time.time()
         for sym in symbols:
-            if sym:
+            if self.valid_symbol(sym):
                 self._wanted[f"{sym.lower()}@markPrice"] = now
         for sym in fast_symbols:
-            if sym:
+            if self.valid_symbol(sym):
                 self._wanted[f"{sym.lower()}@markPrice@1s"] = now
         for sym in ticker_symbols:
-            if sym:
+            if self.valid_symbol(sym):
                 self._wanted[f"{sym.lower()}@markPrice@1s"] = now
                 self._wanted[f"{sym.lower()}@miniTicker"] = now
 
@@ -279,15 +298,42 @@ class MarketData:
         self._active = set(self._url_streams) if self.mode == "lite" else set(self.FULL_STREAMS)
         self._pending.clear()
         self._snapshot_pending = False
+        self._last_price_ts = time.time()
+
+    def _frame_budget(self) -> int:
+        now = time.time()
+        return self.MAX_FRAMES_PER_S - sum(1 for t in self._sent_ts if now - t < 1.0)
+
+    async def _watchdog(self) -> None:
+        """Con streams de precio activos, si no llega nada en WATCHDOG_S se reconecta."""
+        if not any("@markPrice" in st or st.startswith("!markPrice") for st in self._active):
+            return
+        quiet = time.time() - max(self._last_price_ts, self.conn.connected_since)
+        if quiet > self.WATCHDOG_S:
+            log.warning("Mercado: %.0f s sin precios con %d stream(s) activos; reconectando", quiet,
+                        len(self._active))
+            self._last_price_ts = time.time()
+            await self.conn.reconnect()
 
     async def sync_subscriptions(self) -> None:
-        """Alinea los streams activos con los deseados (SUBSCRIBE/UNSUBSCRIBE en caliente)."""
+        """Alinea los streams activos con los deseados (SUBSCRIBE/UNSUBSCRIBE en caliente).
+
+        Envía como mucho MAX_FRAMES_PER_S mensajes por segundo; lo pendiente se
+        completa en la siguiente llamada (el servicio la hace cada segundo).
+        """
         if self.mode != "lite" or not self.conn.connected:
             return
         async with self._lock:
+            await self._watchdog()
+            if not self.conn.connected:
+                return
             desired = self._desired()
             if self._snapshot_pending:
-                desired.add(self.ALL_TICKERS)
+                if self._dynamic:
+                    desired.add(self.ALL_TICKERS)
+                elif self._snapshot_task is None or self._snapshot_task.done():
+                    # Sin SUBSCRIBE: la foto va por una conexión aparte, de un solo uso.
+                    self._snapshot_task = asyncio.create_task(self._snapshot_once())
             add = sorted(desired - self._active)
             remove = sorted(self._active - desired)
             if not add and not remove:
@@ -299,8 +345,11 @@ class MarketData:
                 return
             for method, streams in (("SUBSCRIBE", add), ("UNSUBSCRIBE", remove)):
                 for i in range(0, len(streams), 100):
+                    if self._frame_budget() <= 0:
+                        return  # resto en el próximo segundo
                     chunk = streams[i:i + 100]
                     self._req_id += 1
+                    self._sent_ts.append(time.time())
                     if await self.conn.send_json({"method": method, "params": chunk, "id": self._req_id}):
                         self._pending[self._req_id] = (method, chunk)
                         if method == "SUBSCRIBE":
@@ -322,6 +371,30 @@ class MarketData:
                 if self.ALL_MARKS_3S not in self._active:
                     self.marks.pop(sym.upper(), None)
 
+    async def _snapshot_once(self) -> None:
+        """Foto de todos los mercados por una conexión de un solo uso (si SUBSCRIBE no funciona)."""
+        url = f"{self.base}/market/stream?streams={self.ALL_TICKERS}"
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.ws_connect(url, compress=15, max_msg_size=0) as ws:
+                    arrays, deadline = 0, time.time() + 6
+                    while arrays < self.SNAPSHOT_ARRAYS and time.time() < deadline:
+                        msg = await ws.receive(timeout=max(0.1, deadline - time.time()))
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            break
+                        self.conn.bytes_in += len(msg.data)
+                        data = json.loads(msg.data)
+                        payload = data.get("data", data) if isinstance(data, dict) else data
+                        if isinstance(payload, list):
+                            arrays += 1
+                            for item in payload:
+                                self._set_ticker(item, time.time())
+        except Exception as exc:
+            log.warning("Mercado: foto de mercados no disponible (%r)", exc)
+        finally:
+            self.all_tickers_ts = time.time()
+            self._snapshot_pending = False
+
     def request_all_tickers(self) -> None:
         """Pide una foto de todos los mercados (lista del dashboard). En ``full`` ya llegan solos."""
         if self.mode != "lite":
@@ -333,6 +406,7 @@ class MarketData:
             return
         self._snapshot_pending = True
         self._snapshot_asked = now
+        self._snapshot_arrays = 0
 
     def on_tick(self, callback: Callable[[], None]) -> None:
         """Callback tras cada actualización de mark price."""
@@ -342,6 +416,8 @@ class MarketData:
         self.conn.start()
 
     async def stop(self) -> None:
+        if self._snapshot_task is not None:
+            self._snapshot_task.cancel()
         await self.conn.stop()
 
     def seed(self, symbol: str, price: float) -> None:
@@ -362,6 +438,7 @@ class MarketData:
     def _set_mark(self, item: dict, now: float) -> None:
         sym = item.get("s")
         price = safe_float(item.get("p"))
+        self._last_price_ts = now
         if sym and price > 0:
             self.marks[sym] = MarkInfo(price, safe_float(item.get("i")), safe_float(item.get("r")),
                                        int(item.get("T") or 0), now)
@@ -388,10 +465,16 @@ class MarketData:
             elif kind == "24hrMiniTicker":
                 for item in payload:
                     self._set_ticker(item, now)
-                self.all_tickers_ts = now
-                if self._snapshot_pending:  # foto recibida: se deja de recibir el mercado entero
-                    self._snapshot_pending = False
-                    return self.sync_subscriptions()
+                if self.mode == "full":
+                    self.all_tickers_ts = now
+                elif self._snapshot_pending:
+                    # !miniTicker@arr solo trae lo que cambió en el último segundo: se toman
+                    # SNAPSHOT_ARRAYS envíos y se deja de recibir el mercado entero.
+                    self._snapshot_arrays += 1
+                    if self._snapshot_arrays >= self.SNAPSHOT_ARRAYS:
+                        self._snapshot_pending = False
+                        self.all_tickers_ts = now
+                        return self.sync_subscriptions()
             return None
         if not isinstance(payload, dict):
             return None
@@ -401,6 +484,7 @@ class MarketData:
             self._set_mark(payload, now)
             self._notify_tick()
         elif kind == "24hrMiniTicker":
+            self._last_price_ts = now
             self._set_ticker(payload, now)
         elif kind == "contractInfo":
             if self._on_contract_info is not None:

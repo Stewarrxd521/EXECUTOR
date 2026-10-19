@@ -165,3 +165,114 @@ def test_desired_streams_rules(count):
         assert "!markPrice@arr" in desired and not any(d.endswith("@markPrice") for d in desired)
     else:
         assert {f"s{i}usdt@markPrice" for i in range(1, count)} <= desired
+
+
+# ── Regresiones de la revisión adversarial ─────────────────────────────────
+async def test_live_with_many_symbols_sends_few_subscribe_frames(fake, tmp_path, snapshot_file):
+    for i in range(20):
+        fake.marks[f"Q{i:02d}USDT"] = 1.0 + i
+    svc = await _started(fake, tmp_path)
+    try:
+        before = len(fake.market_requests)
+        res = await svc.execute("live", {"symbols": ",".join(f"Q{i:02d}USDT" for i in range(20))})
+        frames = fake.market_requests[before:]
+        assert len(frames) <= 2, frames                     # un único SUBSCRIBE coalescido
+        assert all(v["mark"] > 0 for v in res["prices"].values())
+    finally:
+        await svc.stop()
+
+
+async def test_junk_symbols_are_never_subscribed(fake, tmp_path, snapshot_file):
+    svc = await _started(fake, tmp_path)
+    try:
+        await svc.execute("live", {"symbols": "ETH#X,A&B,NOPEUSDT"})
+        svc.trades.handle_signal({"action": "open", "trade_id": 1, "symbol": "ETHUSDT", "direction": "SHORT",
+                                  "price": 3000, "quantity": 0.01})
+        await wait_for(lambda: "ethusdt@markPrice" in fake.market_subs)
+        assert not any("#" in s or "&" in s or "nopeusdt" in s for s in fake.market_subs)
+        await svc.core.market.conn.reconnect()  # la URL de reconexión sigue siendo válida
+        await wait_for(lambda: fake.market_connections >= 2 and "ethusdt@markPrice" in fake.market_subs)
+    finally:
+        await svc.stop()
+
+
+async def test_sixteen_positions_stay_on_per_symbol_streams(fake, tmp_path, snapshot_file):
+    m = MarketData("ws://x", clock=None)
+    m.want([f"S{i}USDT" for i in range(16)])
+    assert "!markPrice@arr" not in m._desired()
+
+
+async def test_fallback_mode_snapshot_does_not_reconnect(fake, tmp_path, snapshot_file):
+    fake.reject_subscribe = True
+    svc = await _started(fake, tmp_path)
+    try:
+        svc.note_watch("ETHUSDT")
+        await wait_for(lambda: svc.core.market.stats()["dynamic_subscribe"] is False
+                       and "ethusdt@markPrice@1s" in fake.market_subs, timeout=10)
+        conns = fake.market_connections
+        rows = await svc.execute("markets", {})
+        assert len(rows) == len(fake.marks)
+        await asyncio.sleep(1.5)
+        assert fake.market_connections == conns + 1  # solo la conexión de un uso para la foto
+    finally:
+        await svc.stop()
+
+
+async def test_snapshot_takes_several_arrays_then_unsubscribes(fake, tmp_path, snapshot_file):
+    svc = await _started(fake, tmp_path)
+    try:
+        rows = await svc.execute("markets", {})
+        assert len(rows) == len(fake.marks)
+        await wait_for(lambda: "!miniTicker@arr" not in fake.market_subs)
+    finally:
+        await svc.stop()
+
+
+async def test_order_retries_ignore_stale_snapshot_prices(fake, tmp_path, snapshot_file):
+    svc = await _started(fake, tmp_path)
+    try:
+        await svc.execute("markets", {})               # foto: last de todos los símbolos
+        assert svc.core.market.last("TESTUSDT") > 0
+        assert svc.orders.mark("TESTUSDT") == 0.0      # sin mark reciente: nunca la foto
+        assert await svc.orders.fresh_price("TESTUSDT") == 0.5
+    finally:
+        await svc.stop()
+
+
+async def test_watchdog_reconnects_a_silent_stream(fake, tmp_path, snapshot_file, monkeypatch):
+    svc = await _started(fake, tmp_path)
+    try:
+        svc.note_watch("ETHUSDT")
+        await wait_for(lambda: "ethusdt@markPrice@1s" in fake.market_subs)
+        market = svc.core.market
+        monkeypatch.setattr(MarketData, "WATCHDOG_S", 0.0)
+        market._last_price_ts = market.conn.connected_since = 0.0
+        conns = fake.market_connections
+        await market.sync_subscriptions()
+        await wait_for(lambda: fake.market_connections > conns)
+    finally:
+        await svc.stop()
+
+
+async def test_ensure_price_keeps_polled_symbols_watched(fake, tmp_path, snapshot_file):
+    svc = await _started(fake, tmp_path)
+    try:
+        await svc.ensure_price("ETHUSDT")
+        await wait_for(lambda: svc.core.market.mark("ETHUSDT", max_age_s=5) > 0)
+        svc.watch["ETHUSDT"] = 0.0                     # a punto de expirar
+        await svc.ensure_price("ETHUSDT")              # precio fresco: igual renueva el interés
+        assert svc.watch["ETHUSDT"] > 0
+    finally:
+        await svc.stop()
+
+
+def test_note_watch_accepts_symbols_reported_by_binance(tmp_path):
+    from executor.streams import MiniTicker
+    from tests.conftest import make_settings
+    from tests.fake_binance import FakeBinance
+    svc = ExecutorService(make_settings(FakeBinance(), tmp_path))
+    svc.note_watch("NEWLISTUSDT")
+    assert "NEWLISTUSDT" not in svc.watch               # ni en exinfo ni reportado: no
+    svc.core.market.tickers["NEWLISTUSDT"] = MiniTicker(1, 1, 1, 1, 1, 1, 0)
+    svc.note_watch("NEWLISTUSDT")
+    assert "NEWLISTUSDT" in svc.watch
