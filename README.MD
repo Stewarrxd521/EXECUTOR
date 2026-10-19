@@ -54,16 +54,18 @@ Con `MARKET_STREAMS=lite` (por defecto) la conexión de mercado recibe solo:
 | Qué | Stream | Frecuencia |
 | --- | --- | --- |
 | Símbolos con posición o trade abierto | `<símbolo>@markPrice` | 3 s (con más de 300 se usa `!markPrice@arr`, uno solo) |
-| Símbolos con bot Grid activo | `<símbolo>@markPrice@1s` | 1 s |
-| Símbolo que se mira en el dashboard / API | `<símbolo>@markPrice@1s` + `<símbolo>@miniTicker` | 1 s, mientras se mira |
+| Símbolos con bot Grid activo | `<símbolo>@markPrice@1s` | 1 s (con más de 300 se usa `!markPrice@arr@1s`) |
+| Símbolo que se mira en el dashboard / API | `<símbolo>@markPrice@1s` + `<símbolo>@miniTicker` | 1 s, hasta 2 min después de la última consulta; como mucho los 40 más recientes |
 | Listados y estados de contratos | `!contractInfo` | solo cuando cambian |
 | Lista de mercados del dashboard | `!miniTicker@arr` | una foto (3 envíos) cada 30 s, solo con el dashboard visible |
 
 Las suscripciones cambian en caliente (`SUBSCRIBE`/`UNSUBSCRIBE`, sin reconectar y como mucho 4 mensajes por
 segundo; Binance admite 10). Un símbolo que deja de hacer falta se mantiene 60 s y luego se descarta su precio.
 Para un símbolo nuevo (señal, grid, consulta) se pide el precio por la WebSocket API mientras llega su stream; un
-símbolo que no está en el exchangeInfo solo se suscribe si Binance devuelve precio. Si los precios dejan de llegar
-20 s con streams activos, la conexión se reinicia. Si Binance rechazara `SUBSCRIBE`, se reconecta con la lista
+símbolo que no está en el exchangeInfo solo se suscribe si Binance devuelve precio. Las consultas (`/api/live`,
+dashboard) nunca suben la conexión de ~650 streams (Binance admite 1024); las posiciones y grids no tienen tope.
+`/api/live` solo da `last`/`change_pct` si el ticker del símbolo llega en vivo (no de la foto de la lista de
+mercados). Si los precios dejan de llegar 20 s con streams activos, la conexión se reinicia. Si Binance rechazara `SUBSCRIBE`, se reconecta con la lista
 nueva y la foto de mercados va por una conexión aparte de un solo uso. Con 1 posición abierta el executor recibe ≈ 0.25 MB/h
 (unas 1 000 veces menos) y la salida facturable baja a ≈ 0.1-0.2 MB/h.
 

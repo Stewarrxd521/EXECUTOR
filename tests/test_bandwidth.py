@@ -276,3 +276,100 @@ def test_note_watch_accepts_symbols_reported_by_binance(tmp_path):
     svc.core.market.tickers["NEWLISTUSDT"] = MiniTicker(1, 1, 1, 1, 1, 1, 0)
     svc.note_watch("NEWLISTUSDT")
     assert "NEWLISTUSDT" in svc.watch
+
+
+# ── Regresiones de la verificación final ───────────────────────────────────
+async def test_first_price_stream_after_idle_does_not_trip_watchdog(fake, tmp_path, snapshot_file):
+    svc = await _started(fake, tmp_path)
+    try:
+        market = svc.core.market
+        assert market._active == {"!contractInfo"}
+        market._last_price_ts = market.conn.connected_since = 0.0   # mucho rato solo con !contractInfo
+        reconnects = []
+
+        async def reconnect():
+            reconnects.append(1)
+
+        market.conn.reconnect = reconnect
+        market.want(["QUIETUSDT"])                                   # su primer precio aún no llega (cada 3 s)
+        await market.sync_subscriptions()                            # SUBSCRIBE quietusdt@markPrice
+        await market.sync_subscriptions()
+        assert "quietusdt@markPrice" in market._active
+        assert not reconnects                                        # sin reconexión espuria
+    finally:
+        await svc.stop()
+
+
+def test_watched_symbols_are_capped_but_positions_never():
+    m = MarketData("ws://x", clock=None)
+    now = __import__("time").time()
+    m.want([f"P{i}USDT" for i in range(50)], fast_symbols=["GRIDUSDT"],
+           ticker_symbols={f"W{i}USDT": now - i for i in range(100)})
+    desired = m._desired()
+    tickers = {d for d in desired if d.endswith("@miniTicker")}
+    assert tickers == {f"w{i}usdt@miniTicker" for i in range(MarketData.MAX_WATCH)}   # los más recientes
+    assert {f"p{i}usdt@markPrice" for i in range(50)} <= desired and "gridusdt@markPrice@1s" in desired
+    assert len(desired) < 1024
+
+
+def test_hundreds_of_grids_use_the_all_market_one_second_stream():
+    m = MarketData("ws://x", clock=None)
+    m.want(["POSUSDT"], fast_symbols=[f"G{i}USDT" for i in range(MarketData.MANY_SYMBOLS + 1)])
+    desired = m._desired()
+    assert "!markPrice@arr@1s" in desired and not any("@markPrice" in d for d in desired)
+
+
+async def test_public_live_flood_cannot_grow_the_market_connection(fake, tmp_path, snapshot_file):
+    for i in range(200):
+        fake.marks[f"F{i:03d}USDT"] = 1.0 + i
+    svc = await _started(fake, tmp_path)
+    try:
+        for n in range(20):
+            await svc.execute("live", {"symbols": ",".join(f"F{i:03d}USDT" for i in range(n * 10, n * 10 + 10))})
+        cap = 2 * MarketData.MAX_WATCH + 2
+        assert len(svc.core.market._desired()) <= cap
+        await wait_for(lambda: "f199usdt@miniTicker" in fake.market_subs)  # lo último consultado sí
+        await asyncio.sleep(1.5)
+        assert len(fake.market_subs) <= cap and "f000usdt@miniTicker" not in fake.market_subs
+    finally:
+        await svc.stop()
+
+
+async def test_live_view_ignores_an_old_markets_snapshot(fake, tmp_path, snapshot_file):
+    svc = await _started(fake, tmp_path)
+    try:
+        market = svc.core.market
+        await svc.execute("markets", {})
+        await wait_for(lambda: "!miniTicker@arr" not in market._active)
+        market.seed("ETHUSDT", 2500.0)
+        market.tickers["ETHUSDT"].ts -= 10                           # foto de hace 10 s, sin stream propio
+        row = svc.live_view(["ETHUSDT"])["prices"]["ETHUSDT"]
+        assert row["last"] == 2500.0 and row["change_pct"] is None
+        svc.note_watch("ETHUSDT")                                    # mirado: miniTicker en vivo
+        await wait_for(lambda: "ethusdt@miniTicker" in market._active)
+        await wait_for(lambda: svc.live_view(["ETHUSDT"])["prices"]["ETHUSDT"]["change_pct"] is not None)
+    finally:
+        await svc.stop()
+
+
+async def test_unknown_symbols_are_validated_once_and_in_parallel(fake, tmp_path, snapshot_file, monkeypatch):
+    svc = await _started(fake, tmp_path)
+    try:
+        calls = []
+        real = svc.core.ws.ticker_price
+
+        async def slow_ticker(sym):
+            calls.append(sym)
+            await asyncio.sleep(0.1)
+            return await real(sym)
+
+        monkeypatch.setattr(svc.core.ws, "ticker_price", slow_ticker)
+        t0 = asyncio.get_running_loop().time()
+        res = await svc.ensure_prices([f"NOPE{i}USDT" for i in range(30)], wait_s=1.5)
+        took = asyncio.get_running_loop().time() - t0
+        assert len(calls) == ExecutorService.MAX_UNKNOWN              # una vez cada uno, con tope
+        assert took < 1.0, took                                      # sin esperar streams que no existen
+        assert set(res) == {f"NOPE{i}USDT" for i in range(30)} and not any(res.values())
+        assert not any("nope" in s for s in fake.market_subs)
+    finally:
+        await svc.stop()

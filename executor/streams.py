@@ -211,9 +211,15 @@ class MarketData:
     BASE_STREAMS = ("!contractInfo",)
     ALL_TICKERS = "!miniTicker@arr"
     ALL_MARKS_3S = "!markPrice@arr"   # todo el mercado cada 3 s: más barato que muchos streams sueltos
+    ALL_MARKS_1S = "!markPrice@arr@1s"
     # Con más símbolos que esto se usa ALL_MARKS_3S (≈150 B × ~700 símbolos cada 3 s): por debajo,
     # los streams sueltos (≈190 B por símbolo) son más baratos. También evita el límite de 1024 streams.
     MANY_SYMBOLS = 300
+    # Símbolos mirados (dashboard, /api/live, consultas) suscritos a la vez: los más recientes.
+    # Con el tope, la conexión nunca pasa de ~650 streams (Binance admite 1024) ni crece por
+    # peticiones sin token.
+    MAX_WATCH = 40
+    WATCH_GRACE_S = 120.0       # un símbolo mirado sigue suscrito 2 min desde la última consulta
     MAX_FRAMES_PER_S = 4        # Binance admite 10 mensajes/s por conexión: margen de sobra
     SNAPSHOT_ARRAYS = 3         # !miniTicker@arr solo trae lo que cambió en el último segundo
     WATCHDOG_S = 20.0           # sin datos de precio en 20 s con streams activos → reconexión
@@ -232,6 +238,7 @@ class MarketData:
         self._tick_listeners: list[Callable[[], None]] = []
         # Suscripciones dinámicas (modo lite)
         self._wanted: dict[str, float] = {}       # stream -> última vez que hizo falta
+        self._watched: dict[str, float] = {}      # símbolo mirado -> última vez que se miró
         self._active: set[str] = set()            # streams activos en la conexión actual
         self._dynamic = True                      # False si Binance rechaza SUBSCRIBE: se reconecta con la URL nueva
         self._req_id = 0
@@ -255,12 +262,17 @@ class MarketData:
         now = time.time()
         keep = {st for st, ts in self._wanted.items() if now - ts < self.UNSUBSCRIBE_GRACE_S}
         self._wanted = {st: ts for st, ts in self._wanted.items() if st in keep}
+        self._watched = {s: ts for s, ts in self._watched.items() if now - ts < self.WATCH_GRACE_S}
+        for sym in sorted(self._watched, key=self._watched.__getitem__, reverse=True)[:self.MAX_WATCH]:
+            keep |= {f"{sym.lower()}@markPrice@1s", f"{sym.lower()}@miniTicker"}
         fast = {st.split("@")[0] for st in keep if st.endswith("@markPrice@1s")}
         # Un símbolo con stream de 1 s no necesita además el de 3 s.
         keep = {st for st in keep if not (st.endswith("@markPrice") and st.split("@")[0] in fast)}
         slow = [st for st in keep if st.endswith("@markPrice")]
         if len(slow) > self.MANY_SYMBOLS:
             keep = (keep - set(slow)) | {self.ALL_MARKS_3S}
+        if len(fast) > self.MANY_SYMBOLS:  # cientos de grids: el mercado entero cada 1 s
+            keep = {st for st in keep if "@markPrice" not in st and st != self.ALL_MARKS_3S} | {self.ALL_MARKS_1S}
         return keep | set(self.BASE_STREAMS)
 
     _SYMBOL_RE = re.compile(r"\w{2,30}")  # letras/dígitos (también no ASCII): nada que rompa la URL
@@ -274,7 +286,8 @@ class MarketData:
 
         * ``symbols`` (posiciones, trades): mark price cada 3 s (``<s>@markPrice``).
         * ``fast_symbols`` (grids): cada 1 s (``<s>@markPrice@1s``).
-        * ``ticker_symbols`` (lo que se mira en el dashboard): 1 s + estadísticas 24 h.
+        * ``ticker_symbols`` (lo que se mira en el dashboard): 1 s + estadísticas 24 h. Puede ser
+          un dict ``{símbolo: última vez que se miró}``; solo se suscriben los MAX_WATCH más recientes.
         """
         now = time.time()
         for sym in symbols:
@@ -283,10 +296,11 @@ class MarketData:
         for sym in fast_symbols:
             if self.valid_symbol(sym):
                 self._wanted[f"{sym.lower()}@markPrice@1s"] = now
-        for sym in ticker_symbols:
+        seen = ticker_symbols.items() if isinstance(ticker_symbols, dict) else ((s, now) for s in ticker_symbols)
+        for sym, ts in seen:
             if self.valid_symbol(sym):
-                self._wanted[f"{sym.lower()}@markPrice@1s"] = now
-                self._wanted[f"{sym.lower()}@miniTicker"] = now
+                sym = sym.upper()
+                self._watched[sym] = max(ts, self._watched.get(sym, 0.0))
 
     async def _url(self) -> str:
         streams = sorted(self._desired()) if self.mode == "lite" else list(self.FULL_STREAMS)
@@ -304,9 +318,13 @@ class MarketData:
         now = time.time()
         return self.MAX_FRAMES_PER_S - sum(1 for t in self._sent_ts if now - t < 1.0)
 
+    @staticmethod
+    def _is_price_stream(stream: str) -> bool:
+        return "@markPrice" in stream or stream.startswith("!markPrice")
+
     async def _watchdog(self) -> None:
         """Con streams de precio activos, si no llega nada en WATCHDOG_S se reconecta."""
-        if not any("@markPrice" in st or st.startswith("!markPrice") for st in self._active):
+        if not any(self._is_price_stream(st) for st in self._active):
             return
         quiet = time.time() - max(self._last_price_ts, self.conn.connected_since)
         if quiet > self.WATCHDOG_S:
@@ -350,17 +368,24 @@ class MarketData:
                     chunk = streams[i:i + 100]
                     self._req_id += 1
                     self._sent_ts.append(time.time())
+                    had_prices = any(self._is_price_stream(st) for st in self._active)
                     if await self.conn.send_json({"method": method, "params": chunk, "id": self._req_id}):
                         self._pending[self._req_id] = (method, chunk)
                         if method == "SUBSCRIBE":
                             self._active.update(chunk)
+                            if not had_prices and any(self._is_price_stream(st) for st in chunk):
+                                # El watchdog cuenta desde que hay streams de precio, no desde la conexión.
+                                self._last_price_ts = time.time()
                         else:
                             self._active.difference_update(chunk)
                             self._forget(chunk)
 
     def _forget(self, removed: list[str]) -> None:
         """Al dejar de recibir el mark price de un símbolo se descarta (no se opera con un precio viejo)."""
-        if self.ALL_MARKS_3S in removed:
+        all_marks = {self.ALL_MARKS_3S, self.ALL_MARKS_1S}
+        if all_marks & self._active:
+            return  # el mercado entero sigue llegando
+        if all_marks & set(removed):
             covered = {st.split("@")[0].upper() for st in self._active if "@markPrice" in st}
             for sym in [s for s in self.marks if s not in covered]:
                 del self.marks[sym]
@@ -368,8 +393,7 @@ class MarketData:
         for st in removed:
             sym, _, kind = st.partition("@")
             if kind.startswith("markPrice") and not any(a.startswith(sym + "@markPrice") for a in self._active):
-                if self.ALL_MARKS_3S not in self._active:
-                    self.marks.pop(sym.upper(), None)
+                self.marks.pop(sym.upper(), None)
 
     async def _snapshot_once(self) -> None:
         """Foto de todos los mercados por una conexión de un solo uso (si SUBSCRIBE no funciona)."""
@@ -513,6 +537,16 @@ class MarketData:
             return 0.0
         return t.last
 
+    def live_last(self, symbol: str) -> float:
+        """Último precio solo si llega en vivo (stream del símbolo o del mercado), no de una foto vieja."""
+        if self.mode == "full":
+            return self.last(symbol)
+        t = self.tickers.get(symbol.upper())
+        if t is None:
+            return 0.0
+        live = f"{symbol.lower()}@miniTicker" in self._active or self.ALL_TICKERS in self._active
+        return t.last if time.time() - t.ts < (self.STALE_S if live else 5.0) else 0.0
+
     def price(self, symbol: str, max_age_s: Optional[float] = None) -> float:
         """Mark price fresco; si no hay, último precio negociado."""
         return self.mark(symbol, max_age_s) or (self.last(symbol) if max_age_s is None else 0.0)
@@ -545,7 +579,8 @@ class MarketData:
     def stats(self) -> dict:
         data = self.conn.stats()
         data.update({"symbols": len(self.marks), "tickers": len(self.tickers), "mode": self.mode,
-                     "streams": len(self._active), "dynamic_subscribe": self._dynamic,
+                     "streams": len(self._active), "watched": len(self._watched),
+                     "dynamic_subscribe": self._dynamic,
                      "all_tickers_age_s": round(time.time() - self.all_tickers_ts) if self.all_tickers_ts else None})
         return data
 

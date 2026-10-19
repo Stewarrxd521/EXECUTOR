@@ -414,6 +414,8 @@ class ExecutorService:
                 if sym not in wanted and now - (self.history[sym][-1][0] if self.history[sym] else 0) > 600:
                     del self.history[sym]
 
+    MAX_UNKNOWN = 20  # símbolos fuera del exchangeInfo validados por la WS API en una consulta (/api/live: 20)
+
     def note_watch(self, symbol: str) -> None:
         """Marca un símbolo como observado (gráfico y suscripción de precio). Solo símbolos reales:
         los del exchangeInfo local o los que Binance ya reportó (precio o ticker)."""
@@ -427,20 +429,25 @@ class ExecutorService:
 
         Se registran todos (un único SUBSCRIBE), se espera al stream y, si no llega a
         tiempo, se pide por la WS API. Un símbolo desconocido solo se suscribe si
-        Binance devuelve precio (nada de suscribir textos arbitrarios).
+        Binance devuelve precio (nada de suscribir textos arbitrarios); como mucho se
+        validan MAX_UNKNOWN por llamada, a la vez.
         """
         market = self.core.market
         max_age = self.settings.max_price_age_s
-        symbols = [s for s in dict.fromkeys(symbols) if market.valid_symbol(s)]
-        unknown = [s for s in symbols if not (self.core.exinfo.known(s) or s in market.tickers or market.mark(s))]
-        for sym in unknown:  # se valida con Binance antes de suscribir
+        requested = [s for s in dict.fromkeys(symbols) if market.valid_symbol(s)]
+        unknown = [s for s in requested if not (self.core.exinfo.known(s) or s in market.tickers or market.mark(s))]
+
+        async def validate(sym: str) -> None:  # se valida con Binance antes de suscribir
             try:
                 market.seed(sym, await self.core.ws.ticker_price(sym))
             except Exception as exc:
                 log.warning("%s: símbolo sin precio en Binance (%s)", sym, exc)
-        for sym in symbols:
+
+        await asyncio.gather(*(validate(s) for s in unknown[:self.MAX_UNKNOWN]))
+        for sym in requested:
             self.note_watch(sym)
-        market.want([s for s in symbols if s in self.watch], ticker_symbols=[s for s in symbols if s in self.watch])
+        symbols = [s for s in requested if s in self.watch]  # los rechazados ni se esperan ni se repiten
+        market.want((), ticker_symbols={s: self.watch[s] for s in symbols})
         missing = [s for s in symbols if not market.mark(s, max_age_s=max_age)]
         if missing:
             try:
@@ -460,7 +467,7 @@ class ExecutorService:
         late = [s for s in missing if not market.mark(s, max_age_s=max_age)]
         if late:
             await asyncio.gather(*(fallback(s) for s in late))
-        return {s: market.price(s) for s in symbols}
+        return {s: market.price(s) for s in requested}
 
     async def ensure_price(self, symbol: str, wait_s: float = 2.5) -> float:
         return (await self.ensure_prices([symbol], wait_s)).get(symbol, 0.0)
@@ -674,7 +681,7 @@ class ExecutorService:
         prices = {}
         for sym in wanted:
             v = market.symbol_view(sym)
-            last = market.last(sym)  # solo si es reciente (modo lite)
+            last = market.live_last(sym)  # nunca una foto de la lista de mercados de hace un minuto
             prices[sym] = {"mark": market.mark(sym), "last": last or market.mark(sym),
                            "change_pct": v["change_pct"] if last else None, "funding_rate": v["funding_rate"]}
         return {"ts": time.time(), "prices": prices,
