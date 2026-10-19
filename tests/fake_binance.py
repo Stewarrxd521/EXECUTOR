@@ -62,6 +62,12 @@ class FakeBinance:
         self.user_ws: set[web.WebSocketResponse] = set()
         self.inject: list[tuple[str, int, str]] = []
         self.inject_after: list = []
+        # Streams de mercado
+        self.market_subs: set = set()
+        self.market_requests: list = []
+        self.market_connections = 0
+        self.market_bytes = 0
+        self.reject_subscribe = False
         self.requests: list[tuple[str, dict]] = []
         self.rest_calls: list[str] = []
         self._tasks: list[asyncio.Task] = []
@@ -326,20 +332,65 @@ class FakeBinance:
 
     # ── Streams ───────────────────────────────────────────────────────────
     async def _market(self, request: web.Request) -> web.WebSocketResponse:
+        """Streams de mercado: respeta ?streams= y SUBSCRIBE/UNSUBSCRIBE (como Binance)."""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        subs = {x for x in request.query.get("streams", "").split("/") if x}
+        self.market_subs = subs
+        self.market_connections += 1
+
+        async def reader():
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                req = json.loads(msg.data)
+                self.market_requests.append(req)
+                if self.reject_subscribe:
+                    await ws.send_str(json.dumps({"error": {"code": 2, "msg": "Invalid request"}, "id": req.get("id")}))
+                    continue
+                params = req.get("params") or []
+                if req.get("method") == "SUBSCRIBE":
+                    subs.update(params)
+                elif req.get("method") == "UNSUBSCRIBE":
+                    subs.difference_update(params)
+                await ws.send_str(json.dumps({"result": None, "id": req.get("id")}))
+
+        async def send(stream: str, data) -> None:
+            text = json.dumps({"stream": stream, "data": data})
+            self.market_bytes += len(text)
+            await ws.send_str(text)
+
+        def mark_item(s: str, p: float, now: int) -> dict:
+            return {"e": "markPriceUpdate", "E": now, "s": s, "p": str(p), "i": str(p), "r": "0.0001",
+                    "T": now + 3600_000}
+
+        def tick_item(s: str, p: float, now: int) -> dict:
+            return {"e": "24hrMiniTicker", "E": now, "s": s, "c": str(p), "o": str(p * 0.97), "h": str(p * 1.05),
+                    "l": str(p * 0.95), "v": "1000", "q": str(p * 1000)}
+
+        task = asyncio.create_task(reader())
         try:
             while not ws.closed:
                 now = int(time.time() * 1000)
-                marks = [{"e": "markPriceUpdate", "E": now, "s": s, "p": str(p), "i": str(p), "r": "0.0001",
-                          "T": now + 3600_000} for s, p in self.marks.items()]
-                tick = [{"e": "24hrMiniTicker", "E": now, "s": s, "c": str(p), "o": str(p * 0.97), "h": str(p * 1.05),
-                         "l": str(p * 0.95), "v": "1000", "q": str(p * 1000)} for s, p in self.marks.items()]
-                await ws.send_str(json.dumps({"stream": "!markPrice@arr@1s", "data": marks}))
-                await ws.send_str(json.dumps({"stream": "!miniTicker@arr", "data": tick}))
+                for arr in ("!markPrice@arr@1s", "!markPrice@arr"):
+                    if arr in subs:
+                        await send(arr, [mark_item(s, p, now) for s, p in self.marks.items()])
+                if "!miniTicker@arr" in subs:
+                    await send("!miniTicker@arr", [tick_item(s, p, now) for s, p in self.marks.items()])
+                for st in sorted(subs):
+                    sym, _, kind = st.partition("@")
+                    sym = sym.upper()
+                    if sym not in self.marks:
+                        continue
+                    if kind in ("markPrice@1s", "markPrice"):
+                        await send(st, mark_item(sym, self.marks[sym], now))
+                    elif kind == "miniTicker":
+                        await send(st, tick_item(sym, self.marks[sym], now))
                 await asyncio.sleep(0.2)
         except (ConnectionError, RuntimeError):
             pass
+        finally:
+            task.cancel()
         return ws
 
     async def _private(self, request: web.Request) -> web.WebSocketResponse:

@@ -92,6 +92,7 @@ class Client:
         self.delta = False
         self.visible = True
         self.sent: dict[str, str] = {}
+        self.traffic = None  # Counter del servicio (bytes enviados al dashboard)
         self.market_sent: dict[str, list] = {}
         # Render no negocia permessage-deflate: si el dashboard lo pide, los mensajes van
         # comprimidos en un único flujo deflate (cada uno termina en "\n" y Z_SYNC_FLUSH).
@@ -134,10 +135,15 @@ class Client:
         try:
             if self.zip is None:
                 await self.ws.send_str(text)
+                if self.traffic is not None:
+                    self.traffic["dashboard_ws"] += len(text)
                 return
             # El flujo comprimido exige que los mensajes salgan en el orden en que se comprimen.
             async with self._lock:
-                await self.ws.send_bytes(self.pack(text))
+                packed = self.pack(text)
+                await self.ws.send_bytes(packed)
+                if self.traffic is not None:
+                    self.traffic["dashboard_ws"] += len(packed)
         except (ConnectionResetError, RuntimeError):
             pass
 
@@ -192,6 +198,31 @@ class DashboardHub:
             keep |= client.market_pins
         return pick_market_rows(rows, client.market_top, client.market_sort, client.market_query, keep)
 
+    def _want_all_markets(self, client: Client, force: bool = False) -> bool:
+        """Modo lite: pide una foto de todos los mercados y se la envía al cliente al llegar.
+
+        Devuelve True si el envío quedó programado (la foto actual es vieja)."""
+        market = self.service.core.market
+        if market.mode != "lite":
+            return False
+        stale = time.time() - market.all_tickers_ts > market.SNAPSHOT_EVERY_S
+        market.request_all_tickers()
+        if stale:
+            task = asyncio.create_task(self._send_markets_when_fresh(client, force=force))
+            self._sends.add(task)
+            task.add_done_callback(self._sends.discard)
+        return stale
+
+    async def _send_markets_when_fresh(self, client: Client, timeout: float = 8.0, force: bool = False) -> None:
+        market = self.service.core.market
+        asked = time.time()
+        while time.time() - asked < timeout and not client.ws.closed:
+            await asyncio.sleep(0.25)
+            if market.all_tickers_ts >= asked:
+                break
+        if not client.ws.closed and (client.markets or force):
+            await self._send_markets(client)
+
     async def _send_markets(self, client: Client) -> None:
         rows = ws_market_rows(self.service.core.market.market_rows())
         markets = client.markets_text(self._client_rows(client, rows, self._held_symbols()))
@@ -209,14 +240,17 @@ class DashboardHub:
         while True:
             await asyncio.sleep(1)
             tick += 1
-            clients = self._authed()
+            # Una pestaña oculta no recibe el estado periódico (sí eventos y errores) ni
+            # mantiene suscrito el precio de su símbolo.
+            clients = [c for c in self._authed() if c.visible]
             for c in clients:
                 if c.symbol:
                     self.service.note_watch(c.symbol)
-            # Una pestaña oculta no recibe el estado periódico (sí eventos y errores).
-            clients = [c for c in clients if c.visible]
             if not clients:
                 continue
+            if tick % MARKETS_EVERY_S == MARKETS_EVERY_S - 5 and any(c.markets for c in clients):
+                # Modo lite: foto de todos los mercados 5 s antes del envío periódico de la lista.
+                self.service.core.market.request_all_tickers()
             try:
                 parts = self._state_parts(health=tick % HEALTH_EVERY_S == 0)
                 rows = ws_market_rows(self.service.core.market.market_rows()) if tick % MARKETS_EVERY_S == 0 else None
@@ -253,6 +287,7 @@ class DashboardHub:
         ws = web.WebSocketResponse(heartbeat=25, max_msg_size=1 << 20)
         await ws.prepare(request)
         client = Client(ws, client_ip(request, settings.trust_proxy))
+        client.traffic = self.service.web_traffic
         self.clients.add(client)
         try:
             async for msg in ws:
@@ -286,7 +321,8 @@ class DashboardHub:
                 client.sent.clear()
                 client.market_sent = {}
                 await client.send(client.state_text(self._state_parts()))
-                await self._send_markets(client)
+                if not self._want_all_markets(client, force=True):
+                    await self._send_markets(client)
                 await client.send(dumps({"type": "errors", "entries": self.service.core.journal.entries(150)}))
                 client.log_seq = 0
             else:
@@ -298,6 +334,8 @@ class DashboardHub:
             return
         if op == "markets":
             client.markets = bool(data.get("on", True))
+            if client.markets:
+                self._want_all_markets(client)
             if data.get("delta"):
                 client.delta = True
             if "top" in data:
@@ -447,8 +485,19 @@ def build_app(service: ExecutorService) -> web.Application:
     async def on_shutdown(_: web.Application) -> None:
         await hub.stop()
 
+    @web.middleware
+    async def traffic_middleware(request: web.Request, handler):
+        """Cuenta los bytes de las respuestas HTTP (aprox., antes de gzip)."""
+        resp = await handler(request)
+        body = getattr(resp, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            key = "api_state" if request.path.startswith("/api/state") else "http"
+            service.web_traffic[key] += len(body)
+        return resp
+
     app = web.Application(client_max_size=1 << 20,
-                          middlewares=[compress_middleware, cors_middleware(service), json_errors_middleware])
+                          middlewares=[traffic_middleware, compress_middleware, cors_middleware(service),
+                                       json_errors_middleware])
     app.router.add_get("/", index)
     app.router.add_get("/ws", hub.handle)
     app.router.add_get("/ws/signal", signal_ws)

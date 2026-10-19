@@ -978,10 +978,26 @@
       sysCard('User Data Stream', h.user.disabled ? null : h.user.connected, h.user.disabled ? [['Estado', 'sin credenciales']] : [['Eventos', h.user.events], ['Reconexiones', h.user.reconnects], ['Activo', dur(h.user.uptime_s)], ['Último error', h.user.last_error || '–']]),
       sysCard('REST (solo lo imprescindible)', null, [['Llamadas totales', h.rest.total], ...restRows, ['Proxies', (h.rest.proxies || []).join(', ') || 'ninguno'], ['Última ruta', h.rest.last_route || '–']]),
       sysCard('exchangeInfo local', ex.count > 0, [['Símbolos', ex.count], ['Generado', ex.generated_at || '—'], ['Antigüedad', ex.age_h == null ? '—' : `${ex.age_h} h`], ['Reglas aprendidas', ex.learned], ['Eventos contractInfo', ex.contract_updates], ['Origen', ex.source || '—']]),
+      netCard(h.network),
       sysCard('Reloj y notificaciones', null, [['Desfase con Binance', `${sg(h.clock_offset_ms, 0)} ms`], ['Telegram', h.telegram.enabled ? `activo (${h.telegram.sent} enviados)` : 'desactivado']]),
       sysCard('Configuración', null, [['Entorno', cfg.env], ['Leverage señales', `${cfg.leverage}x (>${cfg.high_price_threshold} USDT → ${cfg.high_price_leverage}x)`], ['Notional mín.', `${cfg.min_notional_usdt} USDT +${cfg.notional_buffer_pct}%`], ['Tamaño por defecto', cfg.default_notional_usdt ? `${cfg.default_notional_usdt} USDT` : 'desactivado'], ['Bloqueados', (cfg.blocked_symbols || []).join(', ') || 'ninguno'], ['Margen insuf. → asumida', cfg.assume_on_margin_error ? 'sí' : 'no']]),
     ].join('');
     renderLogs();
+  }
+  function netCard(n) {
+    if (!n) return '';
+    const si = n.service_initiated || {}, src = si.sources || {};
+    const mb = (v) => `${fn(v, v < 1 ? 3 : 2)} MB/h`;
+    const names = { market: 'Mercado (stream)', user: 'Cuenta (stream)', ws_api: 'WS API', rest: 'REST' };
+    const rows = [
+      ['Modo de mercado', n.market_mode === 'lite' ? `lite · ${n.market_streams ?? 0} streams` : 'full (todo el mercado)'],
+      ['Estimado facturable', `${mb(si.estimated_billable_mb_h || 0)} ≈ ${fn(si.estimated_billable_gb_month || 0, 2)} GB/mes`],
+      ['Recibido / enviado', `${mb(si.received_mb_h || 0)} / ${mb(si.sent_mb_h || 0)}`],
+      ...Object.entries(src).map(([k, v]) => [names[k] || k, `↓ ${mb(v.in_mb_h)} · ↑ ${mb(v.out_mb_h)}`]),
+      ['Dashboard y HTTP (otra categoría)', mb(n.web_out_mb_h || 0)],
+      ['Medición', n.window || `${fn(n.hours, 2)} h`],
+    ];
+    return sysCard('Ancho de banda (Render)', null, rows);
   }
   function renderLogs() {
     const box = $('#logbox');

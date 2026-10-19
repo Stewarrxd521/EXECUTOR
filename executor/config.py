@@ -96,6 +96,7 @@ class Settings:
     # ── Infra ─────────────────────────────────────────────────────────────
     recv_window_ms: int = 5000
     balance_poll_s: int = 60
+    market_streams: str = "lite"   # lite: solo los símbolos necesarios · full: todo el mercado cada segundo
     position_poll_s: int = 30
     data_dir: Path = Path("data")
     exchange_info_file: Path = BUNDLED_EXCHANGE_INFO
@@ -249,6 +250,7 @@ def load_settings() -> Settings:
         signal_wait_timeout_s=_env_float("SIGNAL_WAIT_TIMEOUT_S", 7.0),
         recv_window_ms=_env_int("RECV_WINDOW_MS", 5000),
         balance_poll_s=max(10, _env_int("BALANCE_POLL_S", 60)),
+        market_streams="full" if _env("MARKET_STREAMS", "lite").lower() == "full" else "lite",
         position_poll_s=max(10, _env_int("POSITION_POLL_S", 30)),
         data_dir=Path(_env("DATA_DIR", "data")),
         exchange_info_file=Path(_env("EXCHANGE_INFO_FILE") or BUNDLED_EXCHANGE_INFO),

@@ -64,7 +64,7 @@ def snapshot_file(tmp_path):
 async def service(fake, tmp_path, snapshot_file):
     svc = ExecutorService(make_settings(fake, tmp_path))
     await svc.start()
-    await wait_for(lambda: svc.core.market.marks and svc.user.conn.connected)
+    await wait_for(lambda: svc.core.market.conn.connected and svc.user.conn.connected)
     yield svc
     await svc.stop()
 
@@ -83,7 +83,7 @@ def legacy_settings(fake, tmp_path, **over):
 async def open_service(fake, tmp_path, snapshot_file):
     svc = ExecutorService(legacy_settings(fake, tmp_path))
     await svc.start()
-    await wait_for(lambda: svc.core.market.marks and svc.user.conn.connected and svc.trades.ready.is_set())
+    await wait_for(lambda: svc.core.market.conn.connected and svc.user.conn.connected and svc.trades.ready.is_set())
     yield svc
     await svc.stop()
 

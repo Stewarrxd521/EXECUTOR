@@ -661,7 +661,7 @@ class TradeManager:
                         note = f"notional {notional:g} ≠ quantity×price {q_notional:.4g}: se usa quantity"
                     notional = 0.0
                 if margin > 0 and notional <= 0 and quantity <= 0:
-                    ref = price or self.core.market.price(symbol) or 1.0
+                    ref = price or await self.reference_price(symbol) or 1.0
                     notional = margin * (lev or self.leverage_for_price(ref))
                 self._unknown_open.pop((symbol, direction), None)
                 before = self.core.account.position(symbol, direction)

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import time
-from collections import deque
+from collections import Counter, deque
 from typing import Any, Awaitable, Callable, Optional
 
 from . import __version__
@@ -73,7 +73,8 @@ class ExecutorService:
         rest = RestClient(settings.rest_url, settings.api_key, settings.api_secret, clock, settings.proxy_urls,
                           settings.recv_window_ms, settings.rest_proxy_all)
         exinfo = ExchangeInfo(settings.data_dir, settings.exchange_info_file, settings.min_notional_usdt)
-        market = MarketData(settings.stream_base_url, clock, on_contract_info=exinfo.apply_contract_info)
+        market = MarketData(settings.stream_base_url, clock, on_contract_info=exinfo.apply_contract_info,
+                            mode=settings.market_streams)
         self.core = Core(
             settings=settings, clock=clock, ws=ws, rest=rest, account=AccountState(settings.hedge_mode_hint),
             market=market, exinfo=exinfo, journal=ErrorJournal(), bus=EventBus(),
@@ -97,6 +98,8 @@ class ExecutorService:
         self._balance_dirty = False
         self._last_balance = 0.0
         self.exinfo_refreshing = False
+        self.web_traffic: Counter = Counter()  # bytes enviados por el servidor web (dashboard, HTTP)
+        self._traffic_samples: deque = deque(maxlen=20)  # (ts, contadores) cada minuto: tasa reciente
         self.keepalive = {"enabled": bool(settings.keepalive_url and settings.keepalive_s), "ok": 0, "errors": 0,
                           "last_status": None}
 
@@ -184,12 +187,13 @@ class ExecutorService:
         """Mantiene despierto el servicio en planes de Render que se duermen."""
         import aiohttp
 
-        url = f"{self.settings.keepalive_url}/health"
+        # HEAD /ready: respuesta sin cuerpo (el auto-ping cuenta como tráfico de salida en Render).
+        url = f"{self.settings.keepalive_url}/ready"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
             while True:
                 await asyncio.sleep(self.settings.keepalive_s)
                 try:
-                    async with session.get(url) as resp:
+                    async with session.head(url) as resp:
                         self.keepalive["last_status"] = resp.status
                         self.keepalive["ok"] += 1
                 except Exception as exc:
@@ -373,15 +377,35 @@ class ExecutorService:
         self.trades.refresh_marks()
         self.grids.on_tick()
 
+    def needed_symbols(self) -> set[str]:
+        """Símbolos que necesitan precio en vivo: posiciones, trades abiertos y grids activos."""
+        needed = {p.symbol for p in self.core.account.positions.values()}
+        needed |= {t.symbol for t in self.trades.open_trades}
+        needed |= {b.symbol for b in self.grids.active_bots()}
+        return needed
+
+    def _want_market(self) -> set[str]:
+        """Registra en el stream de mercado qué símbolos hacen falta y con qué frecuencia."""
+        grids = {b.symbol for b in self.grids.active_bots()}
+        needed = self.needed_symbols()
+        self.core.market.want(needed - grids, fast_symbols=grids, ticker_symbols=self.watch)
+        return needed
+
     async def _history_loop(self) -> None:
-        """Historial de mark price (1/s) de los símbolos observados (gráfico)."""
+        """Cada segundo: suscripciones de mercado (modo lite) e historial de mark price del gráfico."""
         while True:
             await asyncio.sleep(1)
             now = time.time()
             self.watch = {s: ts for s, ts in self.watch.items() if now - ts < 120}
-            wanted = set(self.watch)
-            wanted |= {p.symbol for p in self.core.account.positions.values()}
-            wanted |= {b.symbol for b in self.grids.active_bots()}
+            needed = self._want_market()
+            if not self._traffic_samples or now - self._traffic_samples[-1][0] >= 60:
+                self._traffic_samples.append((now, self._traffic_totals()))
+            market = self.core.market
+            try:
+                await market.sync_subscriptions()
+            except Exception:  # pragma: no cover
+                log.exception("Mercado: no se pudieron actualizar las suscripciones")
+            wanted = set(self.watch) | needed
             for sym in wanted:
                 price = self.core.market.mark(sym)
                 if price:
@@ -391,9 +415,36 @@ class ExecutorService:
                     del self.history[sym]
 
     def note_watch(self, symbol: str) -> None:
-        """Marca un símbolo como observado (historial del gráfico). Solo símbolos reales."""
+        """Marca un símbolo como observado (gráfico y suscripción de precio). Solo símbolos reales."""
         if len(symbol) <= 30 and (self.core.exinfo.known(symbol) or self.core.market.mark(symbol)):
             self.watch[symbol] = time.time()
+
+    async def ensure_price(self, symbol: str, wait_s: float = 2.5) -> float:
+        """Precio de un símbolo aunque aún no esté suscrito (modo lite): se suscribe y,
+        si el stream no llega a tiempo, se pide por la WS API."""
+        market = self.core.market
+        price = market.mark(symbol, max_age_s=self.settings.max_price_age_s)
+        if price:
+            return price
+        self.note_watch(symbol)
+        market.want([symbol], ticker_symbols=[symbol])
+        try:
+            await market.sync_subscriptions()
+        except Exception:  # pragma: no cover
+            log.exception("Mercado: no se pudo suscribir %s", symbol)
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            price = market.mark(symbol, max_age_s=self.settings.max_price_age_s)
+            if price:
+                return price
+            await asyncio.sleep(0.1)
+        try:
+            price = await self.core.ws.ticker_price(symbol)
+        except Exception as exc:
+            log.warning("%s: sin precio de mercado (%s)", symbol, exc)
+            price = 0.0
+        market.seed(symbol, price)
+        return market.price(symbol)
 
     # ── Vistas ────────────────────────────────────────────────────────────
     def positions_view(self, symbol: Optional[str] = None) -> list[dict]:
@@ -472,6 +523,61 @@ class ExecutorService:
             "proxy_configured": bool(self.settings.proxy_urls),
             "signals_inflight": self.trades.inflight(),
             "keepalive": self.keepalive,
+            "network": self.network_view(),
+        }
+
+    # Por cada byte recibido en una conexión que abre el executor, la pila TCP/TLS envía
+    # de vuelta ≈4-5 % (ACK). Render factura esa salida como «Service-Initiated».
+    ACK_RATIO = 0.045
+
+    def _traffic_totals(self) -> dict:
+        c = self.core
+        return {
+            "market": (c.market.conn.bytes_in, c.market.conn.bytes_out),
+            "user": (self.user.conn.bytes_in, self.user.conn.bytes_out),
+            "ws_api": (c.ws.bytes_in, c.ws.bytes_out),
+            "rest": (c.rest.bytes_in, c.rest.bytes_out),
+            "web": (0, sum(self.web_traffic.values())),
+        }
+
+    def network_view(self) -> dict:
+        """Tráfico por fuente (MB/h) y estimación de lo que factura Render.
+
+        Con 10 min o más de datos se usa la tasa de los últimos ~10 min (sin la
+        sincronización inicial); antes, la media desde el arranque.
+        """
+        c = self.core
+        now = time.time()
+        totals = self._traffic_totals()
+        base, since = None, self.started_ts
+        for ts, sample in self._traffic_samples:
+            if now - ts <= 15 * 60 and now - ts >= 9 * 60:
+                base, since = sample, ts
+                break
+        hours = max((now - since) / 3600, 1 / 3600)
+        raw = {k: (i - (base[k][0] if base else 0), o - (base[k][1] if base else 0))
+               for k, (i, o) in totals.items() if k != "web"}
+        web_out = totals["web"][1] - (base["web"][1] if base else 0)
+        sources = {k: {"in_mb_h": round(i / 1e6 / hours, 3), "out_mb_h": round(o / 1e6 / hours, 3)}
+                   for k, (i, o) in raw.items()}
+        received = sum(i for i, _ in raw.values())
+        sent = sum(o for _, o in raw.values())
+        billable = (sent + received * self.ACK_RATIO) / 1e6 / hours
+        return {
+            "hours": round(hours, 2),
+            "window": "últimos 10 min" if base else "desde el arranque (incluye la sincronización inicial)",
+            "market_mode": c.market.mode,
+            "market_streams": c.market.stats().get("streams"),
+            "compressed": {"market": c.market.conn.compressed, "user": self.user.conn.compressed},
+            "service_initiated": {
+                "received_mb_h": round(received / 1e6 / hours, 3),
+                "sent_mb_h": round(sent / 1e6 / hours, 3),
+                "estimated_billable_mb_h": round(billable, 3),
+                "estimated_billable_gb_month": round(billable * 24 * 30 / 1000, 2),
+                "sources": sources,
+                "top_ws_api_methods_in": c.ws.traffic().get("top_methods_in", {}),
+            },
+            "web_out_mb_h": round(web_out / 1e6 / hours, 3),
         }
 
     def account_view(self) -> dict:
@@ -673,19 +779,28 @@ class ExecutorService:
         return self.settings.public_view()
 
     async def _cmd_markets(self, a: dict):
-        rows = self.core.market.market_rows()
+        market = self.core.market
+        if market.mode == "lite" and time.time() - market.all_tickers_ts > market.SNAPSHOT_EVERY_S:
+            asked = time.time()
+            market.request_all_tickers()
+            await market.sync_subscriptions()
+            while time.time() - asked < 6 and market.all_tickers_ts < asked:
+                await asyncio.sleep(0.2)
+        rows = market.market_rows()
         q = str(a.get("q", "")).upper()
         if q:
             rows = [r for r in rows if q in r[0]]
         return [{"symbol": r[0], "last": r[1], "change_pct": r[2], "quote_volume": r[3]} for r in rows]
 
     async def _cmd_live(self, a: dict):
-        syms = [x.strip().upper() for x in str(a.get("symbols", "")).split(",") if x.strip()]
+        syms = [x.strip().upper() for x in str(a.get("symbols", "")).split(",") if x.strip()][:20]
+        if syms:  # símbolos pedidos explícitamente: se suscriben (modo lite) o se piden por WS API
+            await asyncio.gather(*(self.ensure_price(s, wait_s=1.5) for s in syms))
         return self.live_view(syms or None)
 
     async def _cmd_symbol_info(self, a: dict):
         symbol = self._symbol(a)
-        self.note_watch(symbol)
+        await self.ensure_price(symbol)
         return self.symbol_view(symbol)
 
     async def _cmd_price_history(self, a: dict):
@@ -788,7 +903,7 @@ class ExecutorService:
             raise CommandError("leverage entre 1 y 125")
         if amount <= 0:
             raise CommandError("indica un tamaño mayor que 0 (amount)")
-        price = self.core.market.price(symbol) or await self.trades.reference_price(symbol)
+        price = await self.ensure_price(symbol)
         if not price:
             raise CommandError(f"sin precio de mercado para {symbol}", 503)
         lev_eff = lev or self.trades.leverage_for_price(price)
@@ -958,10 +1073,14 @@ class ExecutorService:
         return self.grids.list()
 
     async def _cmd_grid_preview(self, a: dict):
+        if a.get("symbol"):
+            await self.ensure_price(str(a["symbol"]).upper())
         return self.grids.preview(a)
 
     async def _cmd_grid_create(self, a: dict):
         self._require_credentials()
+        if a.get("symbol"):
+            await self.ensure_price(str(a["symbol"]).upper())
         bot = await self.grids.create(a)
         return bot.summary(self.core.market.price(bot.symbol))
 
