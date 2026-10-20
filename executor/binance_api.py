@@ -101,6 +101,7 @@ class BinanceWsApi:
         self._reader_task: Optional[asyncio.Task] = None
         self._connect_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future] = {}
+        self._methods: dict[str, str] = {}  # id de petición → método (para contar bytes por método)
         self._ids = itertools.count(1)
         self._closed = False
         self._banned_until = 0.0
@@ -114,6 +115,12 @@ class BinanceWsApi:
         self.latency_ms = 0.0
         self.rate_limits: dict[str, dict] = {}
         self.method_counts: Counter = Counter()
+        self.bytes_in = 0
+        self.bytes_out = 0
+        self.frames_in = 0
+        self.frames_out = 0
+        self.bytes_by_method: Counter = Counter()   # bytes recibidos por método (qué consume más)
+        self.started_ts = time.time()
 
     # ── Conexión ──────────────────────────────────────────────────────────
     def _alive(self) -> bool:
@@ -130,7 +137,8 @@ class BinanceWsApi:
             if self._ws is not None and not self._ws.closed:
                 await self._ws.close()
             log.info("Conectando %s → %s", self.name, self.url)
-            self._ws = await self._session.ws_connect(self.url, heartbeat=25, autoping=True, max_msg_size=0)
+            self._ws = await self._session.ws_connect(self.url, heartbeat=25, autoping=True, max_msg_size=0,
+                                                      compress=15)
             if self.connected_since:
                 self.reconnects += 1
             self.connected = True
@@ -151,11 +159,16 @@ class BinanceWsApi:
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    self.bytes_in += len(msg.data)
+                    self.frames_in += 1
                     try:
                         data = json.loads(msg.data)
                     except ValueError:
                         log.warning("%s: mensaje no JSON: %r", self.name, msg.data[:200])
                         continue
+                    method = self._methods.pop(str(data.get("id")), "")
+                    if method:
+                        self.bytes_by_method[method] += len(msg.data)
                     fut = self._pending.pop(str(data.get("id")), None)
                     if fut is not None and not fut.done():
                         fut.set_result(data)
@@ -170,6 +183,7 @@ class BinanceWsApi:
                 if not fut.done():
                     fut.set_exception(err)
             self._pending.clear()
+            self._methods.clear()
             if not self._closed:
                 log.warning("%s: conexión cerrada; se reconectará en la próxima petición", self.name)
 
@@ -215,9 +229,14 @@ class BinanceWsApi:
             started = time.perf_counter()
             try:
                 assert self._ws is not None
-                await self._ws.send_str(json.dumps(payload, separators=(",", ":")))
+                text = json.dumps(payload, separators=(",", ":"))
+                self._methods[req_id] = method
+                await self._ws.send_str(text)
+                self.bytes_out += len(text)
+                self.frames_out += 1
             except Exception as exc:
                 self._pending.pop(req_id, None)
+                self._methods.pop(req_id, None)
                 if send_retry:
                     send_retry = False
                     log.warning("%s: fallo enviando %s (%r); reconectando", self.name, method, exc)
@@ -230,6 +249,7 @@ class BinanceWsApi:
                 response = await asyncio.wait_for(fut, timeout)
             except (asyncio.TimeoutError, ConnectionError) as exc:
                 self._pending.pop(req_id, None)
+                self._methods.pop(req_id, None)
                 self.errors += 1
                 if method in ORDER_METHODS:
                     # Enviada pero sin confirmación: el llamador debe consultar el estado.
@@ -280,7 +300,15 @@ class BinanceWsApi:
             "last_error": self.last_error,
             "rate_limits": self.rate_limits,
             "uptime_s": int(time.time() - self.connected_since) if self._alive() else 0,
+            "traffic": self.traffic(),
         }
+
+    def traffic(self) -> dict:
+        hours = max((time.time() - self.started_ts) / 3600, 1 / 3600)
+        top = self.bytes_by_method.most_common(5)
+        return {"bytes_in": self.bytes_in, "bytes_out": self.bytes_out,
+                "in_mb_h": round(self.bytes_in / 1e6 / hours, 3), "out_mb_h": round(self.bytes_out / 1e6 / hours, 3),
+                "top_methods_in": {m: b for m, b in top}}
 
     # ── Métodos ───────────────────────────────────────────────────────────
     async def place_order(self, **params) -> dict:
@@ -355,6 +383,8 @@ class RestClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._ban_until: dict[str, float] = {}
         self.calls: Counter = Counter()
+        self.bytes_in = 0
+        self.bytes_out = 0
         self.last_error = ""
         self.last_route = ""
 
@@ -406,11 +436,13 @@ class RestClient:
             url = URL(f"{self.base_url}{path}" + (f"?{query}" if query else ""), encoded=True)
             headers = {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
             self.calls[path] += 1
+            self.bytes_out += len(str(url)) + 120  # línea de petición + cabeceras aproximadas
             self.last_route = self.proxy_label(proxy)
             try:
                 async with session.request(http_method, url, headers=headers, proxy=proxy,
                                            timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                     text = await resp.text()
+                    self.bytes_in += len(text)
                     if resp.status == 200:
                         try:
                             return json.loads(text) if text else {}
@@ -455,6 +487,7 @@ class RestClient:
             "last_error": self.last_error,
             "last_route": self.last_route,
             "proxies": [self.proxy_label(p) for p in self.proxies],
+            "traffic": {"bytes_in": self.bytes_in, "bytes_out": self.bytes_out},
             "banned": {self.proxy_label(k or None): round(v - time.time()) for k, v in self._ban_until.items() if v > time.time()},
         }
 

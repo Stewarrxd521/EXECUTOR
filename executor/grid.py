@@ -416,6 +416,13 @@ class GridManager:
 
     # ── Ciclo de vida ─────────────────────────────────────────────────────
     async def create(self, data: dict) -> GridBot:
+        symbol = str(data.get("symbol", "")).upper().strip()
+        if symbol and not self.core.market.price(symbol):
+            # Modo lite: el símbolo aún no está suscrito → precio por la WS API.
+            try:
+                self.core.market.seed(symbol, await self.core.ws.ticker_price(symbol))
+            except Exception as exc:
+                log.warning("Grid %s: sin precio de mercado (%s)", symbol, exc)
         preview = self.preview(data)
         if preview["errors"]:
             raise GridError("; ".join(preview["errors"]))

@@ -70,7 +70,20 @@ class OrderExecutor:
         return self.core.account.position_side_for(direction)
 
     def mark(self, symbol: str) -> float:
-        return self.core.market.price(symbol)
+        """Mark price reciente (nunca un precio viejo de la foto del dashboard)."""
+        return self.core.market.mark(symbol, max_age_s=self.core.settings.max_price_age_s)
+
+    async def fresh_price(self, symbol: str, fallback: float = 0.0) -> float:
+        price = self.mark(symbol)
+        if price:
+            return price
+        try:
+            price = await self.core.ws.ticker_price(symbol)
+        except Exception:
+            price = 0.0
+        if price:
+            self.core.market.seed(symbol, price)
+        return price or fallback
 
     def _record(self, err: Exception, where: str, symbol: str, **ctx):
         diag = ErrorDoctor.diagnose(err, **ctx)
@@ -228,7 +241,7 @@ class OrderExecutor:
                     raise
                 if action == Action.CLAMP_PRICE and not band_fixed:
                     band_fixed = True
-                    mark = self.mark(ctx.symbol) or ctx.ref_price
+                    mark = await self.fresh_price(ctx.symbol, ctx.ref_price)
                     if not mark:
                         raise
                     if ctx.market:
@@ -290,7 +303,7 @@ class OrderExecutor:
                 continue
             executed = safe_float(result.get("executedQty")) or (
                 safe_float(result.get("origQty")) if result.get("status") in ("FILLED", "NEW") else 0.0)
-            avg = safe_float(result.get("avgPrice")) or safe_float(result.get("price")) or self.mark(ctx.symbol)
+            avg = safe_float(result.get("avgPrice")) or safe_float(result.get("price")) or self.mark(ctx.symbol) or ctx.ref_price
             fill.status = result.get("status", "")
             if executed > 0:
                 fill.qty += executed

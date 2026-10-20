@@ -18,7 +18,10 @@ async def test_startup_syncs_account_over_websocket(service, fake):
     assert acct.leverage["BTCUSDT"] == 20               # caché de leverage sin REST
     assert acct.usdt().available == pytest.approx(9000)
     assert len(service.core.exinfo) == 4
-    assert service.core.market.mark("GRIDUSDT") == 100.0
+    # Modo lite: sin posiciones no llega el mercado entero, solo !contractInfo.
+    assert fake.market_subs == {"!contractInfo"} and not service.core.market.marks
+    assert await service.ensure_price("GRIDUSDT") == 100.0      # bajo demanda
+    await wait_for(lambda: "gridusdt@markPrice@1s" in fake.market_subs)
     # REST solo para la lectura inicial de órdenes abiertas.
     await wait_for(lambda: "openAlgoOrders" in fake.rest_calls)
     assert set(fake.rest_calls) <= {"openOrders", "openAlgoOrders"}
@@ -131,7 +134,7 @@ async def test_long_grid_buys_initial_inventory_and_blocks_signals(service, fake
 async def test_grid_reconciles_after_restart(fake, tmp_path, snapshot_file):
     svc = ExecutorService(make_settings(fake, tmp_path))
     await svc.start()
-    await wait_for(lambda: svc.core.market.marks and svc.user.conn.connected)
+    await wait_for(lambda: svc.core.market.conn.connected and svc.user.conn.connected)
     bot = await svc.grids.create({"symbol": "GRIDUSDT", "lower": 90, "upper": 110, "grids": 4, "investment": 100,
                                   "leverage": 5, "mode": "NEUTRAL"})
     await wait_for(lambda: bot.status == "RUNNING" and len(fake.orders) == 4)
@@ -219,7 +222,7 @@ async def test_manual_limit_entry_creates_trade_on_fill(service, fake):
 async def test_trades_persist_and_reconcile_after_restart(fake, tmp_path, snapshot_file):
     svc = ExecutorService(make_settings(fake, tmp_path))
     await svc.start()
-    await wait_for(lambda: svc.core.market.marks and svc.user.conn.connected)
+    await wait_for(lambda: svc.core.market.conn.connected and svc.user.conn.connected)
     await svc.trades.open_trade("ETHUSDT", "LONG", notional=40, paper_trade_id=11)
     await svc.trades.open_trade("BTCUSDT", "SHORT", notional=150, paper_trade_id=12)
     await svc.stop()

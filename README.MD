@@ -17,7 +17,7 @@ python futures_executor.py          # dashboard en http://localhost:10000
 | Posiciones, balance, fills, TP/SL disparados | **User Data Stream** (push) | `ORDER_TRADE_UPDATE`, `ACCOUNT_UPDATE`, `ALGO_UPDATE`… sin polling |
 | listenKey | **WebSocket API** (`userDataStream.start/ping`) | Sin REST |
 | Leverage actual de cada símbolo y modo Hedge/One-way | **WebSocket API** (`account.position`) | Al arrancar; luego `ACCOUNT_CONFIG_UPDATE` |
-| Precios de **todos** los símbolos | **1 stream** `!markPrice@arr@1s` + `!miniTicker@arr` + `!contractInfo` | Precio siempre fresco: ya no hay que suscribir/reconectar por símbolo |
+| Precios | **1 stream** con suscripción en caliente (`SUBSCRIBE`/`UNSUBSCRIBE`) | Modo `lite` (por defecto): solo los símbolos que hacen falta. Ver «Ancho de banda» |
 | Reglas de cada símbolo (tick, step, mínimos) | **exchangeInfo local** | Cero consultas al operar |
 | Cambiar leverage, tipo de margen, modo de posición, margen aislado | REST | Binance no ofrece estos métodos por WebSocket |
 | Lectura inicial de órdenes abiertas | REST (1 vez al arrancar) | Desactivable con `SEED_OPEN_ORDERS_REST=false` |
@@ -31,7 +31,7 @@ Código en el paquete `executor/`:
 | Módulo | Responsabilidad |
 | --- | --- |
 | `binance_api.py` | Cliente WebSocket API (firma, reconexión, latencia, rate limits) y REST mínimo con rotación de proxies |
-| `streams.py` | Stream de mercado global y User Data Stream |
+| `streams.py` | Stream de mercado (lite/full) y User Data Stream |
 | `account.py` | Estado de cuenta alimentado por eventos |
 | `exchange_info.py` | Reglas por símbolo, redondeo exacto y aprendizaje |
 | `errors.py` | Catálogo de códigos de error, diagnóstico y registro |
@@ -40,6 +40,42 @@ Código en el paquete `executor/`:
 | `grid.py` | Bots Grid |
 | `service.py` | Orquestación y comandos del dashboard |
 | `web/` | Servidor HTTP/WebSocket y dashboard |
+
+## Ancho de banda (Render)
+
+Render factura el tráfico **de salida**. En las conexiones que abre el executor (Binance, proxy, Telegram,
+auto-ping) se factura como **Service-Initiated** todo lo que el executor envía, incluidos los ACK TCP/TLS que
+genera cada paquete recibido. Antes el executor recibía el mercado entero cada segundo (`!markPrice@arr@1s` +
+`!miniTicker@arr`, ≈ 750 MB/h de entrada para ~785 símbolos), y solo confirmar esos paquetes producía ≈ 5 MB/h
+de salida facturable aunque se usaran 2 o 3 símbolos.
+
+Con `MARKET_STREAMS=lite` (por defecto) la conexión de mercado recibe solo:
+
+| Qué | Stream | Frecuencia |
+| --- | --- | --- |
+| Símbolos con posición o trade abierto | `<símbolo>@markPrice` | 3 s (con más de 300 se usa `!markPrice@arr`, uno solo) |
+| Símbolos con bot Grid activo | `<símbolo>@markPrice@1s` | 1 s (con más de 300 se usa `!markPrice@arr@1s`) |
+| Símbolo que se mira en el dashboard / API | `<símbolo>@markPrice@1s` + `<símbolo>@miniTicker` | 1 s, hasta 2 min después de la última consulta; siempre los 40 más recientes y, si ya estaban suscritos, hasta 60 |
+| Listados y estados de contratos | `!contractInfo` | solo cuando cambian |
+| Lista de mercados del dashboard | `!miniTicker@arr` | solo con el dashboard visible: una foto completa (3 envíos) cada 5 min y un refresco de 1 envío cada 30 s |
+
+Las suscripciones cambian en caliente (`SUBSCRIBE`/`UNSUBSCRIBE`, sin reconectar y como mucho 4 mensajes por
+segundo; Binance admite 10). Un símbolo que deja de hacer falta se mantiene 60 s y luego se descarta su precio.
+Para un símbolo nuevo (señal, grid, consulta) se pide el precio por la WebSocket API mientras llega su stream; un
+símbolo que no está en el exchangeInfo solo se suscribe si Binance devuelve precio. Las consultas (`/api/live`,
+dashboard) nunca suben la conexión de ~650 streams (Binance admite 1024); las posiciones y grids no tienen tope.
+`/api/live` solo da `last`/`change_pct` si el ticker del símbolo llega en vivo (no de la foto de la lista de
+mercados). Si los precios dejan de llegar 20 s con streams activos, la conexión se reinicia; si reconectar no lo
+arregla (p. ej. un símbolo deslistado que sigue en el exchangeInfo local), la espera se dobla cada vez hasta 15 min.
+Un símbolo que Binance responde como inexistente (`-1121`) deja de suscribirse durante 10 min. Si Binance rechazara `SUBSCRIBE`, se reconecta con la lista
+nueva y la foto de mercados va por una conexión aparte de un solo uso. Con 1 posición abierta el executor recibe ≈ 0.25 MB/h
+(unas 1 000 veces menos) y la salida facturable baja a ≈ 0.1-0.2 MB/h.
+
+- `MARKET_STREAMS=full` vuelve al comportamiento anterior (todo el mercado cada segundo).
+- Las conexiones piden compresión `permessage-deflate` y el auto-ping (`KEEPALIVE_URL`) hace `HEAD /ready`
+  (sin cuerpo).
+- La pestaña *Sistema* del dashboard y `GET /health` → `network` muestran el tráfico por conexión (MB/h
+  recibidos y enviados) y una estimación de lo que factura Render (MB/h y GB/mes).
 
 ## exchangeInfo predefinido
 
@@ -249,7 +285,8 @@ ambos y las pruebas los ejecutan contra el executor.
 | `SIGNAL_SECRETS` | — | Secretos adicionales aceptados, separados por comas (p. ej. al rotar el secreto) |
 | `CORS_ORIGINS` | `*` | Orígenes permitidos para la API (CORS). El WebSocket del dashboard solo acepta el mismo sitio o los orígenes listados explícitamente |
 | `TRUST_PROXY` | `true` en Render | Tomar la IP del cliente de `X-Forwarded-For` |
-| `KEEPALIVE_URL` / `KEEPALIVE_S` | `RENDER_EXTERNAL_URL` / `600` | Auto-ping para que Render no duerma el servicio (con UptimeRobot u otro monitor externo puedes poner `KEEPALIVE_S=0`) |
+| `KEEPALIVE_URL` / `KEEPALIVE_S` | `RENDER_EXTERNAL_URL` / `600` | Auto-ping (`HEAD /ready`) para que Render no duerma el servicio (con UptimeRobot u otro monitor externo puedes poner `KEEPALIVE_S=0`) |
+| `MARKET_STREAMS` | `lite` | `lite`: solo los símbolos necesarios (ahorra ancho de banda) · `full`: todo el mercado cada segundo |
 | `MAX_PRICE_AGE_S` | `5` | Antigüedad máxima del precio de referencia |
 | `DATA_DIR` | `data` | Estado persistente (trades, grids, exchangeInfo descargado) |
 | `EXCHANGE_INFO_FILE` | `exchangeInfo.txt` | Base predefinida de reglas (respuesta cruda de Binance) |
