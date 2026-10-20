@@ -50,6 +50,7 @@ class FillResult:
     step: Decimal = Decimal("1")
     fixes: list = field(default_factory=list)
     status: str = ""
+    update_ms: int = 0  # hora (de Binance) del último fill
 
     @property
     def ok(self) -> bool:
@@ -305,6 +306,7 @@ class OrderExecutor:
                 safe_float(result.get("origQty")) if result.get("status") in ("FILLED", "NEW") else 0.0)
             avg = safe_float(result.get("avgPrice")) or safe_float(result.get("price")) or self.mark(ctx.symbol) or ctx.ref_price
             fill.status = result.get("status", "")
+            fill.update_ms = max(fill.update_ms, int(safe_float(result.get("updateTime"))))
             if executed > 0:
                 fill.qty += executed
                 notional += executed * avg

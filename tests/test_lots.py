@@ -128,7 +128,10 @@ async def test_unknown_trade_id_never_closes_quantity_opened_outside(service, fa
 async def test_adopted_position_is_closed_by_any_trade_id(service, fake):
     t = service.trades
     trade = await t.open_trade(SYM, "LONG", notional=30)
-    trade.lots = {}                              # como una posición adoptada tras perder trades.json
+    t._unmap_trade(trade)
+    del t.trades[trade.key]                      # se perdió trades.json: la posición se adopta sin lotes
+    await wait_for(lambda: service.core.account.position(SYM, "LONG") is not None)
+    assert t.adopt_untracked() == 1 and not t.get_trade(SYM, "LONG").lot_tracked
     close(t, 99)
     await wait_for(lambda: amt(fake) == 0 and t.get_trade(SYM, "LONG") is None)
 

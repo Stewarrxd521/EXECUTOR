@@ -172,13 +172,20 @@ class FakeBinance:
                    "up": "0", "mt": "cross", "iw": "0", "ps": ps}]}})
         return realized
 
+    def _ms(self) -> int:
+        """Hora de Binance en ms, estrictamente creciente (dos fills seguidos nunca empatan)."""
+        self._last_ms = max(getattr(self, "_last_ms", 0) + 1, int(time.time() * 1000))
+        return self._last_ms
+
     def _otu(self, o: dict, exec_type: str, last_qty: float = 0.0, last_price: float = 0.0, realized: float = 0.0) -> dict:
-        return {"e": "ORDER_TRADE_UPDATE", "E": int(time.time() * 1000), "T": int(time.time() * 1000), "o": {
+        now = self._ms()
+        o["updateTime"] = now
+        return {"e": "ORDER_TRADE_UPDATE", "E": now, "T": now, "o": {
             "s": o["symbol"], "c": o["clientOrderId"], "S": o["side"], "o": o["type"], "ot": o.get("origType", o["type"]),
             "f": o.get("timeInForce", "GTC"), "q": str(o["origQty"]), "p": str(o.get("price", 0)),
             "ap": str(o.get("avgPrice", 0)), "sp": "0", "x": exec_type, "X": o["status"], "i": o["orderId"],
             "l": str(last_qty), "z": str(o.get("executedQty", 0)), "L": str(last_price), "N": "USDT",
-            "n": str(last_price * last_qty * 0.0004), "T": int(time.time() * 1000), "t": self._next(),
+            "n": str(last_price * last_qty * 0.0004), "T": now, "t": self._next(),
             "m": o["type"] == "LIMIT", "R": o.get("reduceOnly", False), "ps": o["positionSide"], "cp": False,
             "rp": str(realized)}}
 

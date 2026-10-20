@@ -410,6 +410,9 @@ class ExecutorService:
             needed = self._want_market()
             if not self._traffic_samples or now - self._traffic_samples[-1][0] >= 60:
                 self._traffic_samples.append((now, self._traffic_totals()))
+            if int(now) % 15 == 0 and self.trades._lot_attempts:
+                # Cierres de lote sin respuesta de Binance: se confirman aunque el bot ya no reintente.
+                self.trades._spawn(self.trades.verify_lot_attempts())
             market = self.core.market
             try:
                 await market.sync_subscriptions()
