@@ -54,6 +54,7 @@ class FakeBinance:
         self.true_steps = {s: Decimal(r["step"]) for s, r in RULES.items()}
         self.true_steps.update({k: Decimal(v) for k, v in (true_steps or {}).items()})
         self.positions: dict[tuple[str, str], dict] = {}
+        self.done_orders: dict[int, dict] = {}  # órdenes ya ejecutadas (siguen visibles en order.status)
         self.orders: dict[int, dict] = {}
         self.algos: dict[int, dict] = {}
         self.leverage: dict[str, int] = {s: 20 for s in self.marks}
@@ -262,8 +263,9 @@ class FakeBinance:
             return {"orderId": o["orderId"], "status": "CANCELED"}
         if method == "order.status":
             oid = int(p.get("orderId") or 0)
-            o = self.orders.get(oid) or next((x for x in self.orders.values()
-                                              if x["clientOrderId"] == p.get("origClientOrderId")), None)
+            known = {**self.done_orders, **self.orders}
+            o = known.get(oid) or next((x for x in known.values()
+                                        if x["clientOrderId"] == p.get("origClientOrderId")), None)
             if o is None:
                 raise _Err(-2013, "Order does not exist.")
             return dict(o)
@@ -317,10 +319,12 @@ class FakeBinance:
         if p["type"] == "MARKET":
             self.push(self._otu(order, "NEW"))
             self._apply_fill(order, self.marks[sym], float(qty))
+            self.done_orders[oid] = order  # Binance las sigue respondiendo en order.status
             return {**order, "executedQty": str(order["executedQty"]), "avgPrice": str(order["avgPrice"])}
         crosses = (p["side"] == "BUY" and price >= self.marks[sym]) or (p["side"] == "SELL" and price <= self.marks[sym])
         if crosses:
             self._apply_fill(order, self.marks[sym], float(qty))
+            self.done_orders[oid] = order
             return {**order, "executedQty": str(order["executedQty"]), "avgPrice": str(order["avgPrice"])}
         self.orders[oid] = order
         self.push(self._otu(order, "NEW"))

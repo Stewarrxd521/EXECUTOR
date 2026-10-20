@@ -30,6 +30,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections import Counter, OrderedDict, deque
@@ -51,7 +52,7 @@ READY_WAIT_S = 30.0          # máximo que una señal espera la 1.ª sincronizac
 SIGNAL_ID_TTL_S = 900.0      # un signal_id explícito (reintentos del cliente) no se ejecuta dos veces
 RECENT_CLOSE_TTL_S = 30.0    # un tramo (open) que llega tras el close de su trade_id no reabre
 UNKNOWN_OPEN_CHECKS = (1.0, 3.0, 8.0)  # relecturas de la posición tras una apertura de estado desconocido
-LOT_CLOSE_WAIT_S = 60.0      # un cierre por trade_id espera a que termine otro cierre del mismo símbolo
+CLOSE_WAIT_S = 60.0          # un cierre espera a que termine otro cierre del mismo trade (no se descarta)
 LOT_NOTE = "lote"  # notes de un registro que es solo el lote de un trade_id (la posición siguió abierta)
 
 CLOSE_REASONS = {
@@ -67,6 +68,34 @@ CLOSE_REASONS = {
     "MANUAL_WEB": ("🖐", "CIERRE MANUAL (WEB)"),
     "NETTED": ("➖", "NETEADA POR SEÑAL OPUESTA"),
 }
+
+_BOT_RE = re.compile(r"[a-z0-9_.-]{1,32}")
+
+
+def normalize_bot(value: Any) -> str:
+    """Nombre del bot que envía la señal (campo ``bot`` o ruta ``/b/<bot>/signal``)."""
+    bot = str(value or "").strip().lower()
+    return bot if _BOT_RE.fullmatch(bot) else ""
+
+
+def _split_ref(ref: Any) -> tuple[int, str]:
+    """(trade_id, bot) de un lote."""
+    text = str(ref or "0")
+    bot, _, tid = text.rpartition(":")
+    try:
+        return int(float(tid or 0)), bot
+    except (TypeError, ValueError, OverflowError):
+        return 0, bot
+
+
+def lot_ref(bot: str, trade_id: Any) -> Any:
+    """Identificador del lote: el trade_id (int) o «bot:trade_id» si el bot se identifica."""
+    try:
+        tid = int(float(trade_id or 0))
+    except (TypeError, ValueError, OverflowError):
+        tid = 0
+    return f"{bot}:{tid}" if bot and tid else tid
+
 
 _TP_ALIASES = ("tp", "tp_price", "take_profit")
 _SL_ALIASES = ("sl", "sl_price", "stop_loss")
@@ -112,9 +141,16 @@ class Trade:
     # Multiplicador: cantidad que pidió el bot y factor medio aplicado (real ≈ bot × factor).
     bot_quantity: float = 0.0
     multiplier: float = 1.0
-    # Lote de cada trade_id: cantidad real que abrió (y aún no cerró el executor). "0" = sin trade_id
-    # (manual/API). Lo que la posición tenga de más (adoptada, abierta fuera) no es de ningún lote.
+    # Lote de cada trade_id ("5" o "bot:5"): cantidad real que abrió y aún no cerró el executor.
+    # "0" = sin trade_id (manual/API). Lo que la posición tenga de más (adoptada, abierta fuera) no
+    # es de ningún lote. Las aperturas asumidas (-2019, sin orden real) van aparte.
     lots: dict = field(default_factory=dict)
+    assumed_lots: dict = field(default_factory=dict)
+    bot: str = ""
+    # PnL propio de un lote: Binance calcula el realizado con la entrada media de la posición; el
+    # ajuste lo lleva a la entrada del lote (y el resto de la posición recibe el ajuste contrario).
+    pnl_adjust: float = 0.0
+    ref_entry: float = 0.0
 
     @property
     def key(self) -> tuple[str, str]:
@@ -156,35 +192,82 @@ class Trade:
         return data
 
     @staticmethod
-    def lot_key(trade_id: Any) -> str:
-        try:
-            return str(int(float(trade_id or 0)))
-        except (TypeError, ValueError, OverflowError):
-            return "0"
+    def lot_key(ref: Any) -> str:
+        if isinstance(ref, str) and ":" in ref:
+            return ref
+        return str(lot_ref("", ref))
 
-    def add_lot(self, trade_id: Any, qty: float) -> None:
-        key = self.lot_key(trade_id)
-        self.lots[key] = float(D(fmt(self.lots.get(key, 0.0) + qty)))
+    def add_lot(self, ref: Any, qty: float, assumed: bool = False) -> None:
+        if not assumed:
+            self.fit_lots()  # una reducción anterior no se reparte sobre el lote nuevo
+        lots = self.assumed_lots if assumed else self.lots
+        key = self.lot_key(ref)
+        lots[key] = float(D(fmt(lots.get(key, 0.0) + qty)))
+
+    @property
+    def real_quantity(self) -> float:
+        """Cantidad con orden real (sin las aperturas asumidas)."""
+        return self.quantity if not self.order_assumed else 0.0
 
     def effective_lots(self, real_qty: Optional[float] = None) -> dict[str, float]:
         """Cantidad de cada lote frente a la posición real: si Binance tiene menos de lo registrado
         (TP/SL o cierres hechos fuera del executor), cada lote baja en proporción."""
-        real = self.quantity if real_qty is None else real_qty
+        real = self.real_quantity if real_qty is None else real_qty
         total = sum(self.lots.values())
         factor = min(1.0, real / total) if total > 0 else 0.0
         return {k: v * factor for k, v in self.lots.items() if v > 0}
 
+    def fit_lots(self, real_qty: Optional[float] = None) -> None:
+        """Fija en los lotes una reducción ya confirmada (cada lote en proporción)."""
+        real = self.real_quantity if real_qty is None else real_qty
+        if self.lots and real < sum(self.lots.values()) - 1e-12:
+            self.lots = {k: float(D(fmt(v))) for k, v in self.effective_lots(real).items()}
+
     def unassigned_qty(self, real_qty: Optional[float] = None) -> float:
         """Cantidad de la posición que no es de ningún lote (adoptada o abierta fuera del executor)."""
-        real = self.quantity if real_qty is None else real_qty
+        real = self.real_quantity if real_qty is None else real_qty
         return max(0.0, real - sum(self.lots.values()))
 
+    def lot_tranches(self, ref: Any) -> list[dict]:
+        key = self.lot_key(ref)
+        return [t for t in self.tranches
+                if self.lot_key(lot_ref(t.get("bot", ""), t.get("trade_id", 0))) == key and "trade_id" in t]
+
+    def lot_multiplier(self, ref: Any) -> float:
+        """Factor del multiplicador que recibió ese trade_id (cantidad real / cantidad del bot)."""
+        rows = [t for t in self.lot_tranches(ref) if not t.get("assumed")]
+        real = sum(safe_float(t.get("qty")) for t in rows)
+        bot = sum(safe_float(t.get("bot_qty")) for t in rows)
+        return real / bot if real > 0 and bot > 0 else (self.multiplier or 1.0)
+
+    def lot_entry(self, ref: Any) -> float:
+        """Precio medio de entrada de ese trade_id (sus fills); sin datos, el de la posición."""
+        rows = [t for t in self.lot_tranches(ref) if not t.get("assumed") and safe_float(t.get("fill_price")) > 0]
+        qty = sum(safe_float(t.get("qty")) for t in rows)
+        return sum(safe_float(t["fill_price"]) * safe_float(t.get("qty")) for t in rows) / qty if qty > 0 \
+            else self.entry_price
+
     def lots_view(self) -> list[list]:
-        rows = [[int(k), v] for k, v in self.effective_lots().items()]
+        rows = [[k, v] for k, v in self.effective_lots().items()]
+        rows += [[k, v] for k, v in self.assumed_lots.items() if v > 0 and k not in self.lots]
         rest = self.unassigned_qty()
         if rest > 0 and self.lots:
             rows.append([None, rest])
-        return sorted(rows, key=lambda r: (r[0] is None, r[0] or 0))
+
+        def order(r):
+            tid = str(r[0]).rsplit(":", 1)[-1]
+            return (r[0] is None, int(tid) if tid.isdigit() else 0, str(r[0]))
+        return sorted(rows, key=order)
+
+    def booked_pnl(self, close_price: float) -> float:
+        """PnL de un trade cerrado: el realizado de Binance (o el de precio si aún no llegó) menos
+        comisiones, más el ajuste a la entrada propia del lote."""
+        if self.realized_exchange:
+            base = self.realized_exchange
+        else:
+            entry = self.ref_entry or self.entry_price
+            base = (close_price - entry) * self.quantity * (1 if self.direction == "LONG" else -1)
+        return base - self.fees_usdt + self.pnl_adjust
 
     def sync_quantity(self, real_qty: float) -> None:
         """Ajusta la cantidad a la real conservando la proporción bot/real.
@@ -195,6 +278,7 @@ class Trade:
         if self.quantity > 0 and self.bot_quantity > 0 and real_qty >= 0:
             self.bot_quantity = self.bot_quantity * real_qty / self.quantity
         self.quantity = real_qty
+        self.fit_lots(real_qty)
 
     def note_tranche_scale(self, factor: float, bot_qty: float, real_qty: float) -> None:
         """Acumula la cantidad pedida por el bot y recalcula el factor medio del trade."""
@@ -227,6 +311,12 @@ class Signal:
     source: str
     ip: str = ""
     dedupe_key: str = ""
+    bot: str = ""
+
+    @property
+    def ref(self) -> Any:
+        """Lote de la señal: su trade_id, o «bot:trade_id» si el bot se identifica."""
+        return lot_ref(self.bot, self.trade_id)
 
 
 def _fresh_status() -> dict:
@@ -276,6 +366,7 @@ class TradeManager:
         self._open_alerts: dict[str, float] = {}
         self._close_retryable: dict[tuple[str, str], bool] = {}
         self._no_lot: set[tuple[str, str]] = set()  # el último close_trade no encontró lote del trade_id
+        self._lot_attempts: dict[tuple, dict] = {}   # cierre de lote sin respuesta: se verifica antes de reenviar
         self._reconciling: set[tuple[str, str]] = set()
         self._skipped_closed: dict[str, float] = {}
         self._recent_closed: dict[tuple[int, str, str], float] = {}
@@ -448,6 +539,8 @@ class TradeManager:
                  "ok": ok, "detail": str(detail)[:400]}
         if sig is not None:
             entry.update({"signal_id": sig.signal_id, "trade_id": sig.trade_id, "source": sig.source})
+            if sig.bot:
+                entry["bot"] = sig.bot
             if sig.data.get("level") not in (None, ""):
                 entry["level"] = sig.data.get("level")
         entry.update(extra)
@@ -502,16 +595,17 @@ class TradeManager:
         if sig.action == "open" and status != 503:
             self._alert_open_failed(sig, error)
         if sig.action == "open" and sig.trade_id and status != 503:  # 503 = reintentable, no es definitivo
-            self._mark_rejected(sig.trade_id, sig.symbol)
+            self._mark_rejected(sig.ref, sig.symbol)
         log.warning("Señal %s %s %s rechazada: %s", sig.action.upper(), sig.symbol, sig.direction, error)
         return status, {"ok": False, "error": error, "signal_id": sig.signal_id, **extra}, None
 
-    def _mark_rejected(self, trade_id: int, symbol: str) -> None:
-        if (trade_id, symbol) in self.paper_map:
+    def _mark_rejected(self, ref: Any, symbol: str) -> None:
+        key = Trade.lot_key(ref)
+        if any(key in t.lots or key in t.assumed_lots for (s, _), t in self.trades.items() if s == symbol):
             return  # ese trade_id ya tiene posición abierta (otro tramo sí entró)
         if any(s == symbol for s, _ in self._reconciling):
             return  # otro tramo de estado desconocido aún se verifica
-        self._rejected_ids[(trade_id, symbol)] = time.time()
+        self._rejected_ids[(ref, symbol)] = time.time()
         while len(self._rejected_ids) > 1000:
             self._rejected_ids.popitem(last=False)
 
@@ -580,7 +674,8 @@ class TradeManager:
         except (TypeError, ValueError, OverflowError):
             trade_id = 0
         explicit_id = str(signal_id or data.get("signal_id") or data.get("idempotency_key") or "")[:100]
-        sig = Signal(action, symbol, direction, trade_id, data, explicit_id or secrets.token_hex(6), source, ip)
+        sig = Signal(action, symbol, direction, trade_id, data, explicit_id or secrets.token_hex(6), source, ip,
+                     bot=normalize_bot(data.get("bot") or data.get("bot_id")))
 
         self.status["signals_received"] += 1
         self.status["last_signal_time"] = time.strftime("%H:%M:%S UTC", time.gmtime())
@@ -701,7 +796,7 @@ class TradeManager:
         try:
             await self._await_ready()
             await self._wait_tasks(prior_closes or [])
-            already_closed = self._closed_recently(sig.trade_id, symbol, direction)
+            already_closed = self._closed_recently(sig.ref, symbol, direction)
             if already_closed is None:
                 # Multiplicador (manual o automático por balance): escala el tamaño pedido.
                 factor = self.multiplier.effective() if self.multiplier is not None else 1.0
@@ -723,6 +818,7 @@ class TradeManager:
                 baseline = before.qty if before is not None else 0.0
                 trade = await self.open_trade(symbol, direction, signal_price=price, quantity=quantity,
                                               notional=notional, paper_trade_id=sig.trade_id, source="signal",
+                                              bot=sig.bot,
                                               leverage=lev, level=level, signal_id=sig.signal_id,
                                               multiplier=factor, bot_quantity=bot_quantity)
                 already_closed = self._skipped_closed.pop(sig.signal_id, None)
@@ -750,23 +846,23 @@ class TradeManager:
                 # funcionar) y se relee la posición real para registrarla si existe.
                 self._reconciling.add((symbol, direction))
                 self._spawn(self._reconcile_unknown_open(symbol, direction, sig.trade_id, baseline, factor,
-                                                         bot_quantity))
+                                                         bot_quantity, bot=sig.bot))
                 entry = self._log_signal("open", symbol, direction, False,
                                          "estado desconocido: se verifica la posición real en Binance", sig)
             else:
                 if sig.trade_id:
-                    self._mark_rejected(sig.trade_id, symbol)
+                    self._mark_rejected(sig.ref, symbol)
                 entry = self._log_signal("open", symbol, direction, False, "no ejecutada (ver pestaña Errores)", sig)
                 self._alert_open_failed(sig, "Binance la rechazó (ver pestaña Errores)")
             return {"ok": False, "detail": entry["detail"]}
 
         self.status["signals_open"] += 1
-        self._rejected_ids.pop((sig.trade_id, symbol), None)
+        self._rejected_ids.pop((sig.ref, symbol), None)
         # ¿Llegó antes un close para esta apertura? Se marca YA (sin esperas de por medio)
         # para que un tramo posterior del mismo trade_id no reabra mientras se cierra.
-        pending = self._take_pending_close(sig.trade_id, symbol, direction)
+        pending = self._take_pending_close(sig.ref, symbol, direction)
         if pending is not None:
-            self._note_closed(sig.trade_id, symbol, direction)
+            self._note_closed(sig.ref, symbol, direction)
         detail = f"#{trade.id} qty={trade.quantity:g} @ {trade.entry_price:g}" + (" (ASUMIDA)" if trade.order_assumed else "")
         if factor != 1.0:
             detail += f" — multiplicador x{factor:g}"
@@ -779,6 +875,7 @@ class TradeManager:
                 try:
                     await self.set_protection(symbol, trade.direction, kind, trig)
                     protections.append(kind)
+                    detail += self._shared_protection_note(trade, sig, kind)
                 except BinanceAPIError as err:
                     detail += f" — {kind} no colocado: {ErrorDoctor.diagnose(err).info.title}"
         if protections:
@@ -788,23 +885,24 @@ class TradeManager:
         if pending is not None and self.trades.get(trade.key) is trade:
             log.warning("Cierre diferido aplicado a %s %s (llegó antes que la apertura)", symbol, direction)
             ok = await self.close_trade(trade, pending["reason"], close_price=pending["close_price"],
-                                        bot_pnl=pending["bot_pnl"], closed_by="signal", lot_id=sig.trade_id)
+                                        bot_pnl=pending["bot_pnl"], closed_by="signal", lot=sig.ref)
             self._no_lot.discard(trade.key)
             if ok:
                 self.status["signals_close"] += 1
             else:
-                self._recent_closed.pop((sig.trade_id, symbol, direction), None)
+                self._recent_closed.pop((sig.ref, symbol, direction), None)
             self._log_signal("close", symbol, direction, ok, "cierre diferido aplicado (llegó antes que la apertura)",
                              sig)
         return {"ok": True, "detail": detail, "trade": trade.to_dict()}
 
     async def _reconcile_unknown_open(self, symbol: str, direction: str, paper_id: int, baseline: float,
-                                      factor: float = 1.0, bot_quantity: float = 0.0) -> None:
+                                      factor: float = 1.0, bot_quantity: float = 0.0, bot: str = "") -> None:
         """Tras una apertura de estado desconocido, registra lo que Binance sí abrió.
 
         Solo se atribuye a la señal la cantidad que supera lo que ya había
-        (``baseline``) y lo que ya está registrado: nunca una posición ajena.
+        (``baseline``) y lo que ya es de otros lotes: nunca una posición ajena.
         """
+        ref = lot_ref(bot, paper_id)
         try:
             for delay in UNKNOWN_OPEN_CHECKS:
                 await asyncio.sleep(delay)
@@ -812,7 +910,8 @@ class TradeManager:
                 async with self._lock(symbol):
                     pos, confirmed = await self._fresh_position(symbol, direction)
                     trade = self.trades.get((symbol, direction))
-                    tracked = trade.quantity if trade is not None else 0.0
+                    # Lo ya asignado a lotes (no trade.quantity: una sincronización pudo sumar ya el fill).
+                    tracked = sum(trade.lots.values()) if trade is not None and not trade.order_assumed else 0.0
                     real = pos.qty if pos is not None else 0.0
                     tol = float(self.core.exinfo.get(symbol, pos.entry_price if pos else 0.0).step_size) / 2
                     if pos is None or real - max(baseline, tracked) <= tol:
@@ -826,25 +925,28 @@ class TradeManager:
                         trade = self.adopt_position(pos, paper_id=paper_id, source="signal")
                         trade.bot_quantity, trade.multiplier = 0.0, 1.0
                         trade.note_tranche_scale(factor, bot_quantity, pos.qty)
-                        trade.add_lot(paper_id, added)  # lo que ya había antes no es de esta señal
+                        trade.add_lot(ref, added)  # lo que ya había antes no es de esta señal
                         self._announce_open(trade)
                     else:
                         trade.note_tranche_scale(factor, bot_quantity, added)
+                        if trade.order_assumed:
+                            trade.order_assumed = False  # ahora hay posición real
+                        trade.fit_lots()
                         trade.quantity = pos.qty
                         trade.entry_price = pos.entry_price or trade.entry_price
-                        trade.add_lot(paper_id, added)
+                        trade.add_lot(ref, added)
                         if paper_id:
                             self._map_paper(trade, paper_id)
                     self.save()
                     log.warning("%s %s: la apertura de estado desconocido SÍ se ejecutó (posición %s); registrada",
                                 direction, symbol, pos.qty)
-                    self._rejected_ids.pop((paper_id, symbol), None)
-                    pending = self._take_pending_close(paper_id, symbol, direction) if paper_id else None
+                    self._rejected_ids.pop((ref, symbol), None)
+                    pending = self._take_pending_close(ref, symbol, direction) if paper_id else None
                     if pending is not None:
-                        self._note_closed(paper_id, symbol, direction)
+                        self._note_closed(ref, symbol, direction)
                 if pending is not None and self.trades.get(trade.key) is trade:
                     ok = await self.close_trade(trade, pending["reason"], close_price=pending["close_price"],
-                                                bot_pnl=pending["bot_pnl"], closed_by="signal", lot_id=paper_id)
+                                                bot_pnl=pending["bot_pnl"], closed_by="signal", lot=ref)
                     self._no_lot.discard(trade.key)
                     if ok:
                         self.status["signals_close"] += 1
@@ -933,47 +1035,56 @@ class TradeManager:
                 pass  # hace cola detrás de quien tenga el lock del símbolo
         trade = self._resolve_trade(sig.trade_id, symbol, direction)
         detail = ""
+        ref = sig.ref
         if trade is not None:
             symbol = symbol or trade.symbol
-            if quantity and (trade.multiplier or 1.0) != 1.0:
-                # Cierre parcial: la cantidad del bot se escala con el factor que recibió la operación.
-                quantity *= trade.multiplier
-            self._close_retryable.pop(trade.key, None)
-            self._no_lot.discard(trade.key)
-            # Con trade_id solo se cierra lo de ese trade_id; sin trade_id, la posición entera.
-            ok = await self.close_trade(trade, reason, close_price=close_price, max_qty=quantity or None,
-                                        bot_pnl=bot_pnl, closed_by="signal", alert=final, lot_id=sig.trade_id)
-            if not ok and not final and self._close_retryable.pop(trade.key, False):
-                return {"ok": False, "retryable": True, "detail": "fallo transitorio de conexión con Binance"}
-            detail = "cerrada" if ok else "error al cerrar (ver pestaña Errores)"
-            if ok and sig.trade_id and self.trades.get(trade.key) is trade:
-                detail = f"cerrado el trade_id {sig.trade_id}; la posición sigue abierta con {trade.quantity:g}"
-            if not ok and trade.key in self._no_lot:
+            lk = Trade.lot_key(ref)
+            if (sig.trade_id and (ref, trade.symbol) in self._rejected_ids
+                    and lk not in trade.lots and lk not in trade.assumed_lots):
+                ok = False
+                detail = f"cierre ignorado: el trade_id {sig.trade_id} nunca se abrió en el executor"
+            else:
+                if quantity:
+                    # Cierre parcial: la cantidad del bot se escala con el factor que recibió ese trade_id.
+                    quantity *= trade.lot_multiplier(ref) if sig.trade_id else (trade.multiplier or 1.0)
+                self._close_retryable.pop(trade.key, None)
                 self._no_lot.discard(trade.key)
-                if (sig.trade_id, trade.symbol) in self._rejected_ids:
-                    detail = f"cierre ignorado: el trade_id {sig.trade_id} nunca se abrió en el executor"
-                else:
-                    # Su apertura puede llegar tarde: el cierre queda en espera (como sin posición).
-                    self._remember_pending_close(sig.trade_id, trade.symbol, trade.direction, reason,
-                                                 close_price, bot_pnl)
-                    detail = (f"la posición {trade.symbol} {trade.direction} no tiene cantidad del trade_id "
-                              f"{sig.trade_id} (es de otros trade_id): no se toca; el cierre queda en espera "
-                              f"{PENDING_CLOSE_TTL_S:.0f}s por si su apertura llega tarde")
-            if ok and not quantity:
-                self._note_closed(sig.trade_id, trade.symbol, trade.direction)
-        elif (sig.trade_id and (sig.trade_id, symbol) in self._rejected_ids
+                # Con trade_id solo se cierra lo de ese trade_id; sin trade_id, la posición entera.
+                ok = await self.close_trade(trade, reason, close_price=close_price, max_qty=quantity or None,
+                                            bot_pnl=bot_pnl, closed_by="signal", alert=final, lot=ref)
+                if not ok and not final and self._close_retryable.pop(trade.key, False):
+                    return {"ok": False, "retryable": True, "detail": "fallo transitorio de conexión con Binance"}
+                detail = "cerrada" if ok else "error al cerrar (ver pestaña Errores)"
+                if ok and sig.trade_id and self.trades.get(trade.key) is trade:
+                    detail = f"cerrado el trade_id {sig.trade_id}; la posición sigue abierta con {trade.quantity:g}"
+                if not ok and trade.key in self._no_lot:
+                    self._no_lot.discard(trade.key)
+                    if self._closed_recently(ref, trade.symbol, trade.direction) is not None:
+                        ok, detail = True, f"el trade_id {sig.trade_id} ya estaba cerrado"
+                    else:
+                        # Su apertura puede llegar tarde: el cierre queda en espera (como sin posición).
+                        self._remember_pending_close(ref, trade.symbol, sig.direction or None, reason,
+                                                     close_price, bot_pnl)
+                        detail = (f"la posición {trade.symbol} {trade.direction} no tiene cantidad del trade_id "
+                                  f"{sig.trade_id} (es de otros trade_id): no se toca; el cierre queda en espera "
+                                  f"{PENDING_CLOSE_TTL_S:.0f}s por si su apertura llega tarde")
+                elif not ok and trade.status != "OPEN":
+                    ok, detail = True, "la posición ya se cerró (otro cierre total llegó antes)"
+                if ok and not quantity and sig.trade_id:
+                    self._note_closed(ref, trade.symbol, trade.direction)
+        elif (sig.trade_id and (ref, symbol) in self._rejected_ids
               and not await self._untracked_position(symbol, direction)):
             ok = False
             detail = f"cierre ignorado: el trade_id {sig.trade_id} nunca se abrió en el executor"
         else:
             ok = await self.close_symbol(symbol, direction, reason, paper_id=sig.trade_id, bot_pnl=bot_pnl,
-                                         closed_by="signal", lot_id=sig.trade_id) if symbol else False
+                                         closed_by="signal", lot=ref) if symbol else False
             if ok:
                 detail = "cerrada (posición sin trade local)"
                 if not quantity:
-                    self._note_closed(sig.trade_id, symbol, direction)
+                    self._note_closed(ref, symbol, direction)
             elif sig.trade_id:
-                self._remember_pending_close(sig.trade_id, symbol, direction, reason, close_price, bot_pnl)
+                self._remember_pending_close(ref, symbol, direction, reason, close_price, bot_pnl)
                 detail = (f"sin posición todavía: el cierre queda en espera {PENDING_CLOSE_TTL_S:.0f}s "
                           "por si la apertura llega tarde")
             else:
@@ -1058,7 +1169,8 @@ class TradeManager:
         try:
             await self.set_protection(symbol, direction, kind, trigger)
             self.status["signals_tp_set" if kind == "TP" else "signals_sl_set"] += 1
-            self._log_signal(sig.action, symbol, direction, True, f"trigger {trigger:g}", sig)
+            note = self._shared_protection_note(self.trades.get((symbol, direction)), sig, kind)
+            self._log_signal(sig.action, symbol, direction, True, f"trigger {trigger:g}{note}", sig)
             return {"ok": True, "detail": f"{kind} @ {trigger:g}"}
         except BinanceAPIError as err:
             self.status["signals_rejected"] += 1
@@ -1072,6 +1184,22 @@ class TradeManager:
         order_type = "TAKE_PROFIT_MARKET" if sig.action == "close_tp" else "STOP_MARKET"
         task = self._spawn(self._signal_unprotect(sig, order_type))
         return 200, {"ok": True, "action": sig.action, "symbol": sig.symbol}, task
+
+    def _shared_protection_note(self, trade: Optional[Trade], sig: Signal, kind: str) -> str:
+        """Binance aplica el TP/SL a la posición entera: si en ella hay lotes de otros trade_id, al
+        dispararse también los cierra. Se avisa (dashboard, log y detalle de la señal)."""
+        if trade is None or not sig.trade_id:
+            return ""
+        own = Trade.lot_key(sig.ref)
+        others = [k for k in trade.lots if k != own]
+        if not others:
+            return ""
+        msg = (f"{trade.symbol} {trade.direction}: el {kind} del trade_id {sig.trade_id} protege la posición "
+               f"entera, que también tiene lotes de otros trade_id ({', '.join(others)}); si se dispara, los "
+               f"cierra también")
+        log.warning(msg)
+        self.core.bus.emit("protect_shared", msg, "warning", symbol=trade.symbol)
+        return f" — ⚠️ el {kind} cubre también otros trade_id"
 
     async def _signal_unprotect(self, sig: Signal, order_type: str) -> dict:
         await self._await_ready()
@@ -1111,13 +1239,14 @@ class TradeManager:
     async def open_trade(self, symbol: str, direction: str, *, signal_price: float = 0.0, quantity: float = 0.0,
                          notional: float = 0.0, paper_trade_id: int = 0, source: str = "signal",
                          leverage: Optional[int] = None, level: float = 0.0,
-                         signal_id: str = "", multiplier: float = 1.0, bot_quantity: float = 0.0) -> Optional[Trade]:
+                         signal_id: str = "", multiplier: float = 1.0, bot_quantity: float = 0.0,
+                         bot: str = "") -> Optional[Trade]:
         symbol, direction = symbol.upper(), direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
         async with self._lock(symbol):
             if source == "signal" and paper_trade_id:
                 # Un close de este trade_id pudo terminar mientras se esperaba el lock.
-                age = self._closed_recently(paper_trade_id, symbol, direction)
+                age = self._closed_recently(lot_ref(bot, paper_trade_id), symbol, direction)
                 if age is not None:
                     self._skipped_closed[signal_id] = age
                     return None
@@ -1153,6 +1282,8 @@ class TradeManager:
             tranche = {"level": level, "notional_req": desired, "signal_price": signal_price, "trade_id": paper_trade_id,
                        "signal_id": signal_id, "ts": time.time(), "multiplier": multiplier,
                        "bot_qty": bot_quantity}
+            if bot:
+                tranche["bot"] = bot
             try:
                 fill = await self.orders.market(ctx, qty, prefix=f"X{paper_trade_id or 0}", owner=owner)
             except BinanceAPIError as err:
@@ -1163,7 +1294,7 @@ class TradeManager:
                     log.warning("[ASUMIDA] %s %s: margen insuficiente, se registra como abierta", direction, symbol)
                     trade = self._register_entry(symbol, direction, ref, float(qty), applied_lev, paper_trade_id,
                                                  "MARGIN_INSUFFICIENT", self.core.account.is_hedge, rules.step_size,
-                                                 assumed=True, source=source)
+                                                 assumed=True, source=source, bot=bot)
                     if trade is not None:
                         trade.tranches.append({**tranche, "qty": float(qty), "fill_price": ref, "assumed": True})
                         if source == "signal":
@@ -1180,7 +1311,7 @@ class TradeManager:
                 return None
             hedge = fill.position_side in ("LONG", "SHORT")
             trade = self._register_entry(symbol, direction, fill.avg_price or ref, fill.qty, applied_lev,
-                                         paper_trade_id, fill.order_id, hedge, fill.step, source=source)
+                                         paper_trade_id, fill.order_id, hedge, fill.step, source=source, bot=bot)
             for cid in fill.client_ids:
                 self.orders.own(cid, trade if trade else owner)
             self.core.account.mark_updated(symbol, direction)
@@ -1200,9 +1331,10 @@ class TradeManager:
             return trade
 
     def _register_entry(self, symbol, direction, price, qty, leverage, paper_id, order_id, hedge, step,
-                        assumed=False, source="signal") -> Optional[Trade]:
+                        assumed=False, source="signal", bot="") -> Optional[Trade]:
         key = (symbol, direction)
         now = utc_now_str()
+        ref = lot_ref(bot, paper_id)
         if hedge:
             existing = self.trades.get(key)
         else:
@@ -1214,17 +1346,25 @@ class TradeManager:
                           open_time=now, leverage=leverage, paper_trade_id=paper_id, entry_order_id=str(order_id),
                           current_price=price, order_assumed=assumed, hedge_mode=hedge, step_size=fmt(step),
                           source=source)
-            trade.add_lot(paper_id, qty)
+            trade.add_lot(ref, qty, assumed=assumed)
             self.trades[key] = trade
             self._map_paper(trade, paper_id)
             self.save()
             return trade
 
-        if hedge or existing.direction == direction:
+        if assumed and not existing.order_assumed:
+            # Apertura asumida (-2019, sin orden real) sobre una posición real: solo se anota su lote.
+            existing.add_lot(ref, qty, assumed=True)
+            tag = "AMPLIADA (asumida)"
+        elif hedge or existing.direction == direction:
+            if existing.order_assumed and not assumed:
+                # Primera orden real sobre lo asumido: la cantidad pasa a ser la real.
+                existing.quantity, existing.entry_price, existing.order_assumed = 0.0, price, False
+            existing.fit_lots()
             new_qty = existing.quantity + qty
             existing.entry_price = (existing.entry_price * existing.quantity + price * qty) / new_qty
             existing.quantity = float(D(fmt(new_qty)))
-            existing.add_lot(paper_id, qty)
+            existing.add_lot(ref, qty, assumed=assumed)
             tag = "AMPLIADA"
         else:
             # One-way: neto con signo (+ LONG / − SHORT), igual que Binance.
@@ -1237,9 +1377,9 @@ class TradeManager:
             new_dir = "LONG" if signed > 0 else "SHORT"
             if new_dir != existing.direction:
                 existing.entry_price = price
-                existing.lots = {Trade.lot_key(paper_id): abs(signed)}  # lo que queda es de la señal nueva
+                existing.lots = {Trade.lot_key(ref): abs(signed)}  # lo que queda es de la señal nueva
             else:
-                existing.lots = existing.effective_lots(abs(signed))  # reducida: cada lote en proporción
+                existing.fit_lots(abs(signed))  # reducida: cada lote en proporción
             old_key = existing.key
             del self.trades[old_key]
             existing.direction = new_dir
@@ -1247,9 +1387,9 @@ class TradeManager:
             self.trades[existing.key] = existing
             self._rekey_paper(old_key, existing.key)
             tag = "INVERTIDA" if new_dir == direction else "REDUCIDA"
-        existing.leverage = leverage
-        existing.entry_order_id = str(order_id)
-        existing.order_assumed = existing.order_assumed or assumed
+        if not (assumed and not existing.order_assumed):
+            existing.leverage = leverage
+            existing.entry_order_id = str(order_id)
         existing.hedge_mode = hedge
         if paper_id:
             existing.paper_trade_id = paper_id
@@ -1333,21 +1473,17 @@ class TradeManager:
 
     async def close_trade(self, trade: Trade, reason: str, close_price: float = 0.0,
                           max_qty: Optional[float] = None, bot_pnl: Optional[float] = None,
-                          closed_by: str = "signal", alert: bool = True, lot_id: int = 0) -> bool:
-        """Cierra el trade con una orden reduceOnly.
+                          closed_by: str = "signal", alert: bool = True, lot: Any = 0) -> bool:
+        """Cierra el trade con órdenes reduceOnly.
 
-        Con ``lot_id`` (el trade_id de la señal) solo se cierra lo de ese trade_id, aunque sea el
-        último lote: si la posición real tiene más (otro bot en el mismo símbolo), el resto sigue
-        abierto. Un trade_id sin lote en la posición solo cierra la parte que no es de ningún lote;
-        si no hay, no toca nada y lo indica en ``self._no_lot``.
+        Con ``lot`` (el trade_id de la señal, o «bot:trade_id») solo se cierra lo de ese
+        trade_id; ver ``_close_lot``. Sin ``lot``: la posición entera (o ``max_qty``).
         """
         key = trade.key
-        if lot_id:
-            # Varios trade_id del mismo símbolo pueden cerrarse a la vez (p. ej. sus TP en el mismo
-            # instante): cada uno espera su turno en vez de descartarse.
-            deadline = time.time() + LOT_CLOSE_WAIT_S
-            while key in self._closing and time.time() < deadline:
-                await asyncio.sleep(0.05)
+        # Otro cierre del mismo trade en curso (otro trade_id, el dashboard, close_all) va primero.
+        deadline = time.time() + CLOSE_WAIT_S
+        while key in self._closing and time.time() < deadline:
+            await asyncio.sleep(0.05)
         if key in self._closing or self.trades.get(key) is not trade:
             return False
         self._closing.add(key)
@@ -1355,7 +1491,9 @@ class TradeManager:
             async with self._lock(trade.symbol):
                 if self.trades.get(key) is not trade:
                     return False
-                if close_price and not lot_id:
+                if lot:
+                    return await self._close_lot(trade, reason, close_price, max_qty, bot_pnl, closed_by, alert, lot)
+                if close_price:
                     trade.signal_close_price = close_price
                 pos, known = await self._fresh_position(trade.symbol, trade.direction)
                 market_px = self.core.market.price(trade.symbol)
@@ -1363,29 +1501,14 @@ class TradeManager:
                     if not trade.order_assumed:
                         log.info("%s %s: Binance confirma que ya no hay posición; se cierra el registro",
                                  trade.symbol, trade.direction)
-                    if close_price:
-                        trade.signal_close_price = close_price
                     self._finalize(trade, reason, close_price or market_px or trade.entry_price,
                                    bot_pnl=bot_pnl, closed_by=closed_by)
                     return True
                 base = pos.qty if pos is not None else trade.quantity
                 rules = self.core.exinfo.get(trade.symbol, market_px)
                 step = float(rules.qty_step(True))
-                whole_lot = orphan = False
-                if lot_id:
-                    lot_qty = trade.effective_lots(base).get(Trade.lot_key(lot_id), 0.0)
-                    if lot_qty <= step / 2:
-                        # trade_id sin lote en esta posición: solo lo que no es de ningún otro trade_id.
-                        lot_qty, orphan = trade.unassigned_qty(base), True
-                    if lot_qty <= step / 2:
-                        self._no_lot.add(key)
-                        return False
-                    whole_lot = not (max_qty and max_qty > 0 and max_qty < lot_qty - step / 2)
-                    qty = min(lot_qty, max_qty, base) if max_qty and max_qty > 0 else min(lot_qty, base)
-                    partial = qty < base - step / 2
-                else:
-                    qty = min(base, max_qty) if max_qty and max_qty > 0 else base
-                    partial = bool(max_qty) and qty < base - step / 2
+                qty = min(base, max_qty) if max_qty and max_qty > 0 else base
+                partial = bool(max_qty) and qty < base - step / 2
                 if partial:
                     # Cantidad parcial al múltiplo exacto del step (p. ej. 0.003 × 3 = 0.009000000000000001).
                     rounded = float(rules.round_qty(D(fmt(qty)), True, "nearest"))
@@ -1398,16 +1521,12 @@ class TradeManager:
                 if not partial:
                     qty = base  # cierre total: la cantidad real exacta (nunca una fracción del step)
                     await self.orders.cancel_protection(trade.symbol, trade.direction)
-                # El lote cerrado entero pasa a un registro propio (su PnL y comisiones de cierre).
-                lot_trade = self._lot_trade(trade, lot_id, qty, close_price) if partial and lot_id and whole_lot \
-                    else None
                 side = "SELL" if trade.direction == "LONG" else "BUY"
                 ctx = OrderContext(trade.symbol, side, trade.direction, "close", rules, reduce_only=True)
                 filled, fill_price = 0.0, 0.0
                 for attempt in range(2):
                     try:
-                        fill = await self.orders.market(ctx, D(fmt(qty)), prefix=f"C{trade.id}",
-                                                        owner=lot_trade or trade)
+                        fill = await self.orders.market(ctx, D(fmt(qty)), prefix=f"C{trade.id}", owner=trade)
                         filled, fill_price = fill.qty, fill.avg_price
                         break
                     except BinanceAPIError as err:
@@ -1435,19 +1554,11 @@ class TradeManager:
                         retryable = not partial and diag.action in (Action.RETRY, Action.CHECK_STATUS)
                         self._close_retryable[key] = retryable
                         if alert or not retryable:
-                            self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",
-                                               symbol=trade.symbol, code=diag.code, solution=diag.info.solution)
-                            self.core.telegram.send(f"⚠️ <b>No se pudo cerrar</b> <code>{trade.symbol}</code>\n"
-                                                    f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
+                            self._alert_close_error(trade, diag)
                         return False
                 if partial:
                     done = filled or qty
-                    if lot_trade is not None:
-                        self._split_lot(trade, lot_trade, lot_id, orphan, done, base)
-                        self._book_close(lot_trade, reason, fill_price or close_price or market_px or trade.entry_price,
-                                         bot_pnl=bot_pnl, closed_by=closed_by)
-                        return True
-                    self._reduce_lots(trade, base, done, lot_id)
+                    self._reduce_lots(trade, base, done)
                     if base < trade.quantity:
                         trade.sync_quantity(base)  # reducción externa aún no registrada
                     if trade.bot_quantity > 0:
@@ -1458,15 +1569,6 @@ class TradeManager:
                     return True
                 # Residuo (p. ej. un fill que llegó mientras se cerraba): una orden más.
                 pos3, _ = await self._fresh_position(trade.symbol, trade.direction)
-                if pos3 is not None and pos3.qty > 0 and lot_id:
-                    # Se abrió algo mientras se cerraba este trade_id: no es suyo, sigue abierto sin lote.
-                    log.warning("%s %s: tras cerrar el trade_id %s quedan %s abiertos por fuera; no se tocan",
-                                trade.symbol, trade.direction, lot_id, pos3.qty)
-                    trade.lots, trade.quantity = {}, pos3.qty
-                    self._unmap_paper_id(trade, lot_id)
-                    self.save()
-                    self.core.bus.emit("partial_close", f"Cierre del trade_id {lot_id} en {trade.symbol}", "info")
-                    return True
                 if pos3 is not None and pos3.qty > 0:
                     log.warning("%s %s: quedó un residuo de %s tras el cierre; se envía otra orden",
                                 trade.symbol, trade.direction, pos3.qty)
@@ -1474,76 +1576,269 @@ class TradeManager:
                         await self.orders.market(ctx, D(fmt(pos3.qty)), prefix=f"C{trade.id}", owner=trade)
                     except BinanceAPIError as err:
                         self.orders._record(err, "close.residual", trade.symbol)
-                if lot_id:
-                    trade.paper_trade_id = int(lot_id)
-                    if close_price:
-                        trade.signal_close_price = close_price
                 self._finalize(trade, reason, fill_price or close_price or market_px or trade.entry_price,
                                bot_pnl=bot_pnl, closed_by=closed_by)
                 return True
         finally:
             self._closing.discard(key)
 
-    def _lot_trade(self, trade: Trade, lot_id: int, qty: float, close_price: float) -> Trade:
-        """Registro propio del lote de un trade_id que se cierra mientras la posición sigue abierta."""
-        lot_id = int(lot_id)
-        tranches = [t for t in trade.tranches if t.get("trade_id") == lot_id]
-        opened = min((t.get("ts") or trade.opened_ts for t in tranches), default=trade.opened_ts)
-        self.counter += 1
-        return Trade(id=self.counter, symbol=trade.symbol, direction=trade.direction, entry_price=trade.entry_price,
-                     quantity=qty, open_time=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(opened)),
-                     leverage=trade.leverage, paper_trade_id=lot_id, current_price=trade.current_price,
-                     hedge_mode=trade.hedge_mode, step_size=trade.step_size, source=trade.source,
-                     tp_price=trade.tp_price, sl_price=trade.sl_price, opened_ts=opened, paper_ids=[lot_id],
-                     tranches=tranches, multiplier=trade.multiplier, notes=LOT_NOTE,
-                     bot_quantity=qty / (trade.multiplier or 1.0), signal_close_price=close_price,
-                     signal_entry_price=next((t["signal_price"] for t in tranches if t.get("signal_price")), 0.0))
+    def _alert_close_error(self, trade: Trade, diag) -> None:
+        self.core.bus.emit("close_failed", f"{trade.symbol}: {diag.info.title}", "error",
+                           symbol=trade.symbol, code=diag.code, solution=diag.info.solution)
+        self.core.telegram.send(f"⚠️ <b>No se pudo cerrar</b> <code>{trade.symbol}</code>\n"
+                                f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
 
-    def _split_lot(self, trade: Trade, lot_trade: Trade, lot_id: int, orphan: bool, done: float,
-                   base: float) -> None:
-        """Descuenta del trade el lote ya cerrado; lo demás sigue abierto con sus lotes."""
-        share = min(1.0, done / base) if base > 0 else 1.0
-        entry_fees = trade.fees_usdt * share  # su parte de las comisiones de apertura
-        trade.fees_usdt -= entry_fees
-        lot_trade.fees_usdt += entry_fees
-        lot_trade.quantity = done
-        lots = trade.effective_lots(base)
-        if not orphan:
-            lots.pop(Trade.lot_key(lot_id), None)
-        trade.lots = lots
-        trade.quantity = float(D(fmt(max(0.0, base - done))))
-        if trade.bot_quantity > 0:
-            trade.bot_quantity = max(0.0, trade.bot_quantity - done / (trade.multiplier or 1.0))
-        trade.tranches = [t for t in trade.tranches if t.get("trade_id") != int(lot_id)]
-        self._unmap_paper_id(trade, lot_id)
+    async def _close_lot(self, trade: Trade, reason: str, close_price: float, max_qty: Optional[float],
+                         bot_pnl: Optional[float], closed_by: str, alert: bool, lot: Any) -> bool:
+        """Cierra solo lo del trade_id ``lot`` (con el lock del símbolo y el trade en ``_closing``).
+
+        * Su lote entero (o ``max_qty`` si es menor): aunque sea el último lote, si la posición
+          real tiene más (otro bot en el mismo símbolo), el resto sigue abierto.
+        * Un trade_id sin lote solo cierra algo si la posición no tiene ningún lote (adoptada tras
+          perder ``trades.json``); si no, no toca nada (``self._no_lot``).
+        * Cada cierre queda en el historial con su propio registro (PnL, comisiones, bot_pnl).
+        * Si la respuesta de Binance se pierde, el siguiente intento consulta la orden anterior por
+          su clientOrderId antes de enviar otra: nunca se cierra dos veces.
+        """
+        key, lk = trade.key, Trade.lot_key(lot)
+        tid, bot = _split_ref(lot)
+        pos, known = await self._fresh_position(trade.symbol, trade.direction)
+        market_px = self.core.market.price(trade.symbol)
+        base = pos.qty if pos is not None else (0.0 if known or trade.order_assumed else trade.real_quantity)
+        rules = self.core.exinfo.get(trade.symbol, market_px or trade.entry_price)
+        step = float(rules.qty_step(True))
+        tol = step / 2
+        args = {"reason": reason, "close_price": close_price, "max_qty": max_qty, "bot_pnl": bot_pnl,
+                "closed_by": closed_by}
+
+        # 1) Un intento anterior de este lote cuya respuesta se perdió: ¿se ejecutó?
+        attempt = self._lot_attempts.pop((key, lk), None)
+        if attempt is not None:
+            executed = await self._attempt_executed(trade.symbol, attempt["record"])
+            if executed is None:
+                self._lot_attempts[(key, lk)] = attempt
+                self._close_retryable[key] = True
+                log.warning("%s %s: no se pudo confirmar si se ejecutó el cierre anterior del trade_id %s; "
+                            "no se reenvía", trade.symbol, trade.direction, lot)
+                return False
+            if executed > tol:
+                log.warning("%s %s: el cierre anterior del trade_id %s sí se ejecutó (%s)", trade.symbol,
+                            trade.direction, lot, executed)
+                record = attempt["record"]
+                self._finish_lot(trade, record, lk, attempt["orphan"], executed, base + executed, base,
+                                 close_price or market_px or trade.entry_price, attempt["args"])
+                left = attempt["qty"] - executed
+                if self.trades.get(key) is not trade or attempt["orphan"] or left <= tol:
+                    return True
+                # Falta parte de lo que se pidió: se cierra ahora (solo esa parte).
+                max_qty = None if attempt["whole"] else left
+
+        # 2) Parte asumida (-2019, sin orden real): se descarta sin enviar nada.
+        lot_qty = trade.effective_lots(base).get(lk, 0.0)
+        assumed = trade.assumed_lots.get(lk, 0.0)
+        if lot_qty <= tol and assumed > 0:
+            trade.assumed_lots.pop(lk, None)
+            if trade.order_assumed and not trade.assumed_lots:
+                trade.paper_trade_id = tid or trade.paper_trade_id
+                self._finalize(trade, reason, close_price or market_px or trade.entry_price, bot_pnl=bot_pnl,
+                               closed_by=closed_by)
+            else:
+                record = self._lot_trade(trade, lot, assumed, close_price)
+                record.order_assumed = True
+                if trade.order_assumed:
+                    trade.quantity = max(0.0, trade.quantity - assumed)
+                self._unmap_lot(trade, lot)
+                self._book_close(record, reason, close_price or market_px or trade.entry_price, bot_pnl=bot_pnl,
+                                 closed_by=closed_by)
+            self._note_closed(lot, trade.symbol, trade.direction)
+            return True
+
+        # 3) Cuánto cerrar.
+        orphan = False
+        if lot_qty <= tol:
+            if trade.lots or trade.assumed_lots or base <= tol:
+                self._no_lot.add(key)  # la posición es de otros trade_id: no se toca
+                return False
+            lot_qty, orphan = base, True  # posición sin ningún lote (adoptada): es de quien la cierre
+        whole = not (max_qty and max_qty > 0 and max_qty < lot_qty - tol)
+        qty = min(lot_qty if whole else max_qty, base)
+        rounded = float(rules.round_qty(D(fmt(qty)), True, "nearest"))
+        if rounded <= 0:
+            log.warning("%s: el cierre de %s del trade_id %s es menor que el step %s; se ignora", trade.symbol,
+                        qty, lot, step)
+            return False
+        qty = min(rounded, base)
+        full = qty >= base - tol
+        if full:
+            qty = base
+            await self.orders.cancel_protection(trade.symbol, trade.direction)
+        record = self._lot_trade(trade, lot, qty, close_price)
+        side = "SELL" if trade.direction == "LONG" else "BUY"
+        ctx = OrderContext(trade.symbol, side, trade.direction, "close", rules, reduce_only=True)
+
+        # 4) Orden(es) reduceOnly a nombre del registro del lote.
+        filled = notional = 0.0
+        for attempt_no in range(2):
+            want = float(rules.round_qty(D(fmt(max(0.0, qty - filled))), True, "nearest"))
+            if want <= 0:
+                break
+            try:
+                fill = await self.orders.market(ctx, D(fmt(want)), prefix=f"C{trade.id}", owner=record)
+            except BinanceAPIError as err:
+                diag = ErrorDoctor.diagnose(err)
+                if diag.action in (Action.REFRESH_POSITION, Action.ALREADY_DONE):
+                    pos2, _ = await self._fresh_position(trade.symbol, trade.direction)
+                    if pos2 is None:
+                        log.info("%s %s: la posición ya no existe en Binance (%s)", trade.symbol, trade.direction,
+                                 diag.info.name)
+                        if filled <= tol:
+                            self._finalize(trade, reason, close_price or market_px or trade.entry_price,
+                                           bot_pnl=bot_pnl, closed_by=closed_by)
+                            return True
+                        break
+                    qty = min(qty, filled + pos2.qty)
+                    continue
+                if filled > tol:
+                    break  # lo ejecutado se registra; el resto queda en el lote
+                # Pudo ejecutarse sin respuesta: el próximo intento lo consulta por clientOrderId.
+                self._lot_attempts[(key, lk)] = {"record": record, "orphan": orphan, "args": args, "qty": qty,
+                                                 "whole": whole}
+                retryable = diag.action in (Action.RETRY, Action.CHECK_STATUS)
+                self._close_retryable[key] = retryable
+                if alert or not retryable:
+                    self._alert_close_error(trade, diag)
+                return False
+            except Exception:
+                if filled <= tol:
+                    self._lot_attempts[(key, lk)] = {"record": record, "orphan": orphan, "args": args, "qty": qty,
+                                                     "whole": whole}
+                raise
+            filled += fill.qty
+            notional += fill.qty * (fill.avg_price or market_px or trade.entry_price)
+            if fill.qty <= tol:
+                break
+        if filled <= tol:
+            log.warning("%s %s: la orden de cierre del trade_id %s no se ejecutó", trade.symbol, trade.direction, lot)
+            return False
+        fill_price = notional / filled if filled else 0.0
+        remaining = max(0.0, base - filled)
+        if full:
+            pos3, _ = await self._fresh_position(trade.symbol, trade.direction)
+            remaining = pos3.qty if pos3 is not None else 0.0
+            if remaining > tol and filled >= qty - tol:
+                # Se abrió algo por fuera mientras se cerraba: no es de este trade_id, sigue abierto.
+                log.warning("%s %s: tras cerrar el trade_id %s quedan %s abiertos por fuera (sin TP/SL)",
+                            trade.symbol, trade.direction, lot, remaining)
+        self._finish_lot(trade, record, lk, orphan, filled, base, remaining,
+                         fill_price or close_price or market_px or trade.entry_price, args)
+        return True
+
+    def _finish_lot(self, trade: Trade, record: Trade, lk: str, orphan: bool, done: float, base: float,
+                    remaining: float, price: float, args: dict) -> None:
+        """Registra el cierre de ``done`` del lote ``lk`` y deja el trade con lo que sigue abierto."""
+        step = safe_float(trade.step_size) or 0.0
+        tol = step / 2 if step else 1e-12
+        sign = 1 if trade.direction == "LONG" else -1
+        record.quantity = done
+        record.bot_quantity = done / (record.multiplier or 1.0)
+        record.ref_entry = trade.entry_price  # entrada media: la que usa Binance para el realizado
+        lot_done = True
+        if remaining <= tol:
+            # Posición cerrada: el registro del lote se queda con todo lo del trade.
+            record.id = trade.id
+            record.fees_usdt += trade.fees_usdt
+            record.realized_exchange += trade.realized_exchange
+            record.pnl_adjust = trade.pnl_adjust  # lo que los lotes ya cerrados dejaron a los que quedaban
+            record.tranches = trade.tranches
+            record.open_time, record.opened_ts = trade.open_time, trade.opened_ts
+            self._unmap_trade(trade)
+            self.trades.pop(trade.key, None)
+            for k in [k for k in self._lot_attempts if k[0] == trade.key]:
+                self._lot_attempts.pop(k, None)
+        else:
+            share = min(1.0, done / base) if base > 0 else 1.0
+            entry_fees = trade.fees_usdt * share  # su parte de las comisiones de apertura
+            trade.fees_usdt -= entry_fees
+            record.fees_usdt += entry_fees
+            if not orphan:
+                # PnL propio: la entrada del lote frente a la media de la posición.
+                adj = (trade.entry_price - record.entry_price) * done * sign
+                record.pnl_adjust += adj
+                trade.pnl_adjust -= adj
+            lots = trade.effective_lots(base)
+            rest = lots.get(lk, 0.0) - (0.0 if orphan else done)
+            closed_lot = not orphan and rest <= tol
+            if closed_lot:
+                lots.pop(lk, None)
+                trade.assumed_lots.pop(lk, None)
+                trade.tranches = [t for t in trade.tranches if t not in record.tranches]
+            elif not orphan:
+                lots[lk] = rest  # cierre parcial o no se llenó todo: lo demás sigue siendo de ese trade_id
+                lot_done = False
+            trade.lots = {k: float(D(fmt(v))) for k, v in lots.items()}
+            if closed_lot:
+                self._unmap_lot(trade, lk)
+            trade.quantity = float(D(fmt(remaining)))
+            if trade.bot_quantity > 0:
+                trade.bot_quantity = max(0.0, trade.bot_quantity - record.bot_quantity)
+        if lot_done and not orphan:
+            tid, bot = _split_ref(lk)
+            self._note_closed(lot_ref(bot, tid), trade.symbol, trade.direction)
         self.save()
         log.info("[#%d] %s %s: cerrado el trade_id %s (%s); siguen abiertos %s", trade.id, trade.direction,
-                 trade.symbol, lot_id, done, trade.quantity)
+                 trade.symbol, record.paper_trade_id, done, remaining)
+        self._book_close(record, args["reason"], price, bot_pnl=args["bot_pnl"], closed_by=args["closed_by"])
+
+    async def _attempt_executed(self, symbol: str, record: Trade) -> Optional[float]:
+        """Cantidad ejecutada por las órdenes de un intento (por su clientOrderId); None = sin confirmar."""
+        cids = [cid for cid, owner in list(self.orders.client_owner.items()) if owner is record]
+        total = 0.0
+        for cid in cids:
+            status, definitive = await self.orders.lookup_order(symbol, client_id=cid)
+            if not definitive:
+                return None
+            if status:
+                total += safe_float(status.get("executedQty"))
+        return total
+
+    def _lot_trade(self, trade: Trade, lot: Any, qty: float, close_price: float) -> Trade:
+        """Registro propio del cierre de un trade_id (dueño de su orden: recibe su PnL y comisiones)."""
+        tid, bot = _split_ref(lot)
+        tranches = trade.lot_tranches(lot)
+        opened = min((t.get("ts") or trade.opened_ts for t in tranches), default=trade.opened_ts)
+        self.counter += 1
+        lot_mult = trade.lot_multiplier(lot)
+        return Trade(id=self.counter, symbol=trade.symbol, direction=trade.direction,
+                     entry_price=trade.lot_entry(lot), quantity=qty,
+                     open_time=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(opened)),
+                     leverage=trade.leverage, paper_trade_id=tid, current_price=trade.current_price,
+                     hedge_mode=trade.hedge_mode, step_size=trade.step_size, source=trade.source,
+                     tp_price=trade.tp_price, sl_price=trade.sl_price, opened_ts=opened, paper_ids=[tid] if tid else [],
+                     tranches=tranches, multiplier=lot_mult, notes=LOT_NOTE, bot=bot,
+                     bot_quantity=qty / (lot_mult or 1.0), signal_close_price=close_price,
+                     signal_entry_price=next((t["signal_price"] for t in tranches if t.get("signal_price")), 0.0))
 
     @staticmethod
-    def _reduce_lots(trade: Trade, base: float, done: float, lot_id: int = 0) -> None:
-        """Cierre parcial por cantidad: se descuenta del lote del trade_id o, sin él, primero de lo
-        que no es de nadie y luego de cada lote en proporción."""
+    def _reduce_lots(trade: Trade, base: float, done: float) -> None:
+        """Cierre parcial por cantidad sin trade_id: primero lo que no es de nadie y luego cada lote en
+        proporción."""
         lots = trade.effective_lots(base)
-        key = Trade.lot_key(lot_id)
-        if lot_id and key in lots:
-            lots[key] = max(0.0, lots[key] - done)
-        else:
-            rest = max(0.0, done - trade.unassigned_qty(base))
-            total = sum(lots.values())
-            if rest > 0 and total > 0:
-                factor = max(0.0, (total - rest) / total)
-                lots = {k: v * factor for k, v in lots.items()}
-        trade.lots = {k: v for k, v in lots.items() if v > 1e-12}
+        rest = max(0.0, done - trade.unassigned_qty(base))
+        total = sum(lots.values())
+        if rest > 0 and total > 0:
+            factor = max(0.0, (total - rest) / total)
+            lots = {k: v * factor for k, v in lots.items()}
+        trade.lots = {k: float(D(fmt(v))) for k, v in lots.items() if v > 1e-12}
 
-    def _unmap_paper_id(self, trade: Trade, paper_id: int) -> None:
-        paper_id = int(paper_id or 0)
-        if not paper_id:
+    def _unmap_lot(self, trade: Trade, lot: Any) -> None:
+        """El trade_id deja de estar en la posición (salvo que otro bot use el mismo número)."""
+        tid, _ = _split_ref(lot)
+        if not tid or any(_split_ref(k)[0] == tid for k in list(trade.lots) + list(trade.assumed_lots)):
             return
-        if self.paper_map.get((paper_id, trade.symbol)) == trade.key:
-            del self.paper_map[(paper_id, trade.symbol)]
-        trade.paper_ids = [p for p in trade.paper_ids if int(p) != paper_id]
-        if trade.paper_trade_id == paper_id:
+        if self.paper_map.get((tid, trade.symbol)) == trade.key:
+            del self.paper_map[(tid, trade.symbol)]
+        trade.paper_ids = [p for p in trade.paper_ids if int(p) != tid]
+        if trade.paper_trade_id == tid:
             trade.paper_trade_id = int(trade.paper_ids[-1]) if trade.paper_ids else 0
 
     def _finalize(self, trade: Trade, reason: str, close_price: float, bot_pnl: Optional[float] = None,
@@ -1559,7 +1854,7 @@ class TradeManager:
         trade.close_price = close_price
         trade.close_time = utc_now_str()
         trade.closed_ts = time.time()
-        trade.pnl_usdt = trade.realized_exchange - trade.fees_usdt if trade.realized_exchange else trade.price_pnl(close_price)
+        trade.pnl_usdt = trade.booked_pnl(close_price)
         trade.roi_pct = trade.pnl_usdt / trade.notional_usdt * 100 if trade.notional_usdt else 0.0
         if bot_pnl is not None:
             trade.bot_pnl, trade.has_bot_pnl = float(bot_pnl), True
@@ -1600,11 +1895,11 @@ class TradeManager:
         )
 
     async def close_symbol(self, symbol: str, direction: Optional[str], reason: str, paper_id: int = 0,
-                           bot_pnl: Optional[float] = None, closed_by: str = "signal", lot_id: int = 0) -> bool:
+                           bot_pnl: Optional[float] = None, closed_by: str = "signal", lot: Any = 0) -> bool:
         """Cierra una posición real sin trade local (excepto si es de un grid).
 
         La posición se registra primero como trade (origen «externa») para que
-        el cierre quede en el historial y en el PnL realizado. Con ``lot_id`` solo
+        el cierre quede en el historial y en el PnL realizado. Con ``lot`` solo
         se cierra lo que no es de otros trade_id.
         """
         if not symbol:
@@ -1626,9 +1921,9 @@ class TradeManager:
         ok_any = False
         for pos in positions:
             # Una posición ya registrada (de otros trade_id) no se asocia a este trade_id.
-            trade = self.trades.get((pos.symbol, pos.direction)) if lot_id else None
+            trade = self.trades.get((pos.symbol, pos.direction)) if lot else None
             trade = trade or self.adopt_position(pos, paper_id=paper_id, source="externa")
-            ok = await self.close_trade(trade, reason, bot_pnl=bot_pnl, closed_by=closed_by, lot_id=lot_id)
+            ok = await self.close_trade(trade, reason, bot_pnl=bot_pnl, closed_by=closed_by, lot=lot)
             self._no_lot.discard(trade.key)
             ok_any = ok_any or ok
         return ok_any
@@ -1691,17 +1986,35 @@ class TradeManager:
             if isinstance(owner, Trade):
                 owner.fees_usdt += upd.fee_usdt
                 owner.realized_exchange += upd.realized_pnl
-                if owner.status != "OPEN" and upd.status == "FILLED" and owner.realized_exchange:
+                if owner.status != "OPEN" and upd.status == "FILLED":
                     before = owner.pnl_usdt
-                    owner.pnl_usdt = owner.realized_exchange - owner.fees_usdt
+                    owner.pnl_usdt = owner.booked_pnl(owner.close_price)
                     owner.roi_pct = owner.pnl_usdt / owner.notional_usdt * 100 if owner.notional_usdt else 0.0
                     self.realized_total += owner.pnl_usdt - before
                     self.save()
+                elif owner.notes == LOT_NOTE and owner.status == "OPEN" and upd.status == "FILLED":
+                    self._settle_lot_attempt(owner)  # cierre cuya respuesta se perdió: ya se ejecutó
             else:
                 trade = self._trade_for_position(upd.symbol, upd.position_side)
                 if trade is not None and owner is None:
                     trade.fees_usdt += upd.fee_usdt
                     trade.realized_exchange += upd.realized_pnl
+
+    def _settle_lot_attempt(self, record: Trade) -> None:
+        """Llegó el fill de un cierre de lote que había fallado sin respuesta: se registra ya."""
+        for (key, lk), attempt in list(self._lot_attempts.items()):
+            if attempt["record"] is not record:
+                continue
+            trade = self.trades.get(key)
+            if trade is None:
+                self._lot_attempts.pop((key, lk), None)
+                return
+            tid, bot = _split_ref(lk)
+            args = attempt["args"]
+            self._spawn(self.close_trade(trade, args["reason"], close_price=args["close_price"],
+                                         max_qty=args["max_qty"], bot_pnl=args["bot_pnl"],
+                                         closed_by=args["closed_by"], alert=False, lot=lot_ref(bot, tid)))
+            return
 
     def _trade_for_position(self, symbol: str, position_side: str) -> Optional[Trade]:
         if position_side in ("LONG", "SHORT"):

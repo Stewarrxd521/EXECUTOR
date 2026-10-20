@@ -650,8 +650,16 @@ class ExecutorClient:
         token: Optional[str] = None,
         timeout: float = 15.0,
         retries: int = 2,
+        bot: Optional[str] = None,
     ) -> None:
         self.base_url = _clean_url(base_url or os.getenv("EXECUTOR_URL", "") or "http://127.0.0.1:10000")
+        # Nombre del bot: separa sus trade_id de los de otros bots en el mismo símbolo. También vale
+        # EXECUTOR_URL=https://…/b/<bot> (lo que usan los bots desplegados): aquí se separa de la URL.
+        m = re.match(r"^(.*)/b/([A-Za-z0-9_.-]{1,32})$", self.base_url)
+        url_bot = ""
+        if m:
+            self.base_url, url_bot = m.group(1), m.group(2).lower()
+        self.bot = (bot if bot is not None else os.getenv("EXECUTOR_BOT", "") or url_bot).strip().lower()
         self.token = token if token is not None else os.getenv("EXECUTOR_TOKEN", "")
         # Se envían ambos si existen: el executor acepta la petición si cualquiera es válido.
         self.secret = secret if secret is not None else os.getenv("EXECUTOR_SECRET", DEFAULT_SECRET)
@@ -848,6 +856,8 @@ class ExecutorClient:
         Lleva Idempotency-Key, así que se reintenta sin riesgo de duplicar.
         """
         payload = _clean(dict(payload))
+        if self.bot and not payload.get("bot"):
+            payload["bot"] = self.bot
         sid = str(signal_id or payload.get("signal_id") or new_signal_id())
         payload["signal_id"] = sid
         return self.request("POST", "/signal", payload, query={"wait": 1 if wait else None},

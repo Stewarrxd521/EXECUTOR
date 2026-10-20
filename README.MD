@@ -185,19 +185,37 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
     entera solo cuando lo que queda en Binance es justo ese lote. Si la posición tiene más (por ejemplo, otro bot
     abrió en el mismo símbolo por fuera), se cierra solo la cantidad de ese `trade_id`, aunque sea el último.
   - `close` **sin `trade_id`** cierra la posición entera del símbolo (y de la dirección, si se indica).
-  - Un `trade_id` que no tiene cantidad en la posición (la posición es de otros `trade_id`) no la toca. El cierre
-    queda en espera 30 s por si su apertura llega tarde. Si la posición tiene cantidad que no es de ningún
-    `trade_id` (adoptada tras perder `trades.json`, abierta fuera del executor), solo se cierra esa parte.
-  - Si en Binance hay menos de lo registrado (TP/SL o cierres hechos fuera del executor), cada lote baja en
-    proporción.
-  - Cada lote cerrado queda en el historial con su propio PnL y comisiones. En el dashboard, la posición muestra
-    cuánto es de cada `trade_id`.
-  - Los cierres simultáneos de varios `trade_id` del mismo símbolo (TP en el mismo instante) se ejecutan uno tras
-    otro, sin perder ninguno.
+  - Un `trade_id` que no tiene cantidad en la posición nunca toca los lotes de otros ni lo abierto por fuera: el
+    cierre queda en espera 30 s por si su apertura llega tarde. Solo una posición **sin ningún lote** (adoptada
+    tras perder `trades.json`) la cierra el primer `trade_id` que lo pida, como antes.
+  - Si en Binance hay menos de lo registrado (TP/SL, ADL o cierres hechos fuera del executor), cada lote baja en
+    proporción en ese momento; un lote abierto después no carga con esa reducción.
+  - Cada cierre de un `trade_id` queda en el historial con su propio registro: su cantidad, su precio de entrada,
+    su PnL (con su entrada, no la media de la posición), sus comisiones y el PnL del bot. En el dashboard, la
+    posición muestra cuánto es de cada `trade_id`.
+  - Los cierres simultáneos del mismo símbolo (TP de varios `trade_id`, `close_all`, el cierre del dashboard) se
+    ejecutan uno tras otro, sin perder ninguno.
+  - Si Binance no responde a la orden de cierre de un lote, se reintenta como siempre, pero antes se consulta la
+    orden anterior por su `clientOrderId`: si ya se ejecutó, se registra y solo se envía lo que falte (nunca se
+    cierra dos veces). Si la orden se llena a medias, se envía otra por el resto del mismo `trade_id`.
+  - Una apertura **asumida** (`-2019` con `ASSUME_ON_MARGIN_ERROR`) no cuenta como cantidad real: su `close` no
+    envía órdenes ni reduce los lotes reales de otros `trade_id`.
   - Las posiciones abiertas antes de esta versión no tienen lotes: al arrancar, su cantidad se reparte a partes
     iguales entre sus `trade_id`.
   - La cuenta debe estar en **Hedge mode** para que LONG y SHORT del mismo símbolo sean posiciones distintas. En
     One-way, el executor avisa al arrancar (log, dashboard y Telegram).
+  - **TP/SL:** Binance aplica un TP/SL a la posición entera. Si un `trade_id` envía `tp`/`sl` (u `open_tp`/
+    `open_sl`) y en la posición hay lotes de otros `trade_id`, al dispararse los cierra también; el executor lo
+    avisa en el detalle de la señal y en el dashboard. Para que cada bot cierre solo lo suyo, que cierre con
+    `close` + `trade_id` (como app_25).
+- **Identidad de cada bot.** Si dos bots usan los mismos números de `trade_id` en el mismo símbolo (app.py numera
+  1, 2, 3… en cada proceso), sus lotes se mezclarían. Para separarlos, cada bot se identifica de una de estas formas:
+  - Sin tocar su código: su `EXECUTOR_URL` termina en `/b/<nombre>` (por ejemplo
+    `https://executor-xxxx.onrender.com/b/kline`). El executor sirve `/b/<nombre>/signal`, `/b/<nombre>/api/state`,
+    `/b/<nombre>/ws/signal`, `/b/<nombre>/health` y `/b/<nombre>/ready`.
+  - O enviando `"bot": "<nombre>"` en cada señal. `ExecutorClient(bot="kline")` (o `EXECUTOR_BOT`) lo añade solo,
+    y también lo toma de una `EXECUTOR_URL` con `/b/<nombre>`.
+  - El nombre: letras, números, `_`, `.` o `-` (máx. 32). Sin nombre, todo funciona como antes (solo `trade_id`).
 - `close` acepta `close_price`, `pnl` (PnL del bot, se compara con el real), `quantity` (cierre parcial; con
   `trade_id`, nunca más que su lote). Si llega antes que su `open` (o mientras se abre) se aplica en cuanto la
   posición existe; un tramo de ese `trade_id` que llegue hasta 30 s después del cierre se ignora (no reabre). El orden

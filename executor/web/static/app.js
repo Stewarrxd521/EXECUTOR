@@ -800,7 +800,13 @@
   function lotsText(p) {
     const lots = Array.isArray(p.lots) ? p.lots : [];
     if (lots.length < 2) return '';
-    return ' · ' + lots.map(([id, q]) => `${id === null ? 'sin trade_id' : id === 0 ? 'manual' : 'paper #' + esc(id)}: ${fq(q)}`).join(' · ');
+    const label = (id) => {
+      if (id === null) return 'sin trade_id';
+      const [bot, tid] = String(id).includes(':') ? String(id).split(':') : ['', String(id)];
+      if (tid === '0') return 'manual';
+      return `${bot ? esc(bot) + ' ' : 'paper '}#${esc(tid)}`;
+    };
+    return ' · ' + lots.map(([id, q]) => `${label(id)}: ${fq(q)}`).join(' · ');
   }
 
   function renderPositions() {
