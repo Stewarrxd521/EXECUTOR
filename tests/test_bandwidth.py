@@ -373,3 +373,98 @@ async def test_unknown_symbols_are_validated_once_and_in_parallel(fake, tmp_path
         assert not any("nope" in s for s in fake.market_subs)
     finally:
         await svc.stop()
+
+
+# ── Segunda verificación: símbolos sin datos, rotación de consultas, foto ligera ─────
+async def test_watchdog_backs_off_when_reconnecting_does_not_bring_prices():
+    import time
+    m = MarketData("ws://x", clock=None)
+    m.conn.connected = True
+    m._active = {"!contractInfo", "deadusdt@markPrice@1s"}      # símbolo que Binance ya no emite
+    calls = []
+
+    async def reconnect():
+        calls.append(1)
+
+    m.conn.reconnect = reconnect
+    m.conn.connected_since = 0.0
+    for quiet, expected in ((21, 1), (30, 1), (41, 2), (70, 2), (81, 3)):
+        m._last_price_ts = time.time() - quiet
+        await m._watchdog()
+        assert len(calls) == expected, (quiet, calls)
+    m._set_mark({"s": "ETHUSDT", "p": "1"}, time.time())         # llegan precios: vuelve a 20 s
+    m._last_price_ts = time.time() - 21
+    await m._watchdog()
+    assert len(calls) == 4
+
+
+def test_rotating_watch_queries_do_not_churn_subscriptions():
+    import time
+    m = MarketData("ws://x", clock=None)
+    now = time.time()
+    watched = {f"W{i:02d}USDT": now - i for i in range(45)}       # 45 consultados en rotación
+    m.want((), ticker_symbols=watched)
+    m._active = {f"w{i:02d}usdt@miniTicker" for i in range(45)}   # ya suscritos
+    assert {d for d in m._desired() if d.endswith("@miniTicker")} == m._active
+    m.want((), ticker_symbols={f"X{i:03d}USDT": now + 1 for i in range(100)})  # avalancha nueva
+    tickers = {d for d in m._desired() if d.endswith("@miniTicker")}
+    assert len(tickers) == MarketData.MAX_WATCH_KEEP
+    assert sum(t.startswith("x") for t in tickers) == MarketData.MAX_WATCH   # lo nuevo siempre entra
+
+
+async def test_markets_refresh_takes_one_array_after_a_full_snapshot():
+    import time
+    m = MarketData("ws://x", clock=None)
+    arr = [{"e": "24hrMiniTicker", "s": "BTCUSDT", "c": "1", "o": "1", "h": "1", "l": "1", "v": "1", "q": "1"}]
+    m.request_all_tickers()
+    assert m._snapshot_target == MarketData.SNAPSHOT_ARRAYS
+    for _ in range(MarketData.SNAPSHOT_ARRAYS):
+        r = m._handle(arr)
+    await r
+    assert not m._snapshot_pending
+    m.all_tickers_ts = time.time() - 30                          # refresco del dashboard
+    m.request_all_tickers()
+    assert m._snapshot_target == 1
+    await m._handle(arr)
+    assert not m._snapshot_pending
+    m._full_snapshot_ts = m.all_tickers_ts = time.time() - 400   # cada 5 min, otra completa
+    m.request_all_tickers()
+    assert m._snapshot_target == MarketData.SNAPSHOT_ARRAYS
+
+
+async def test_symbol_binance_no_longer_has_stops_being_watched(fake, tmp_path, snapshot_file, monkeypatch):
+    from executor.errors import BinanceAPIError
+    fake.marks.pop("TESTUSDT")                                   # en el exchangeInfo local, deslistado en Binance
+    svc = await _started(fake, tmp_path)
+    try:
+        calls = []
+
+        async def ticker_price(sym):
+            calls.append(sym)
+            raise BinanceAPIError(-1121, "Invalid symbol.")
+
+        monkeypatch.setattr(svc.core.ws, "ticker_price", ticker_price)
+        res = await svc.ensure_prices(["TESTUSDT"], wait_s=0.5)
+        assert res == {"TESTUSDT": 0.0} and calls == ["TESTUSDT"]
+        assert "TESTUSDT" not in svc.watch and "TESTUSDT" not in svc.core.market._watched
+        await svc.ensure_prices(["TESTUSDT"], wait_s=0.5)
+        svc.note_watch("TESTUSDT")                                   # el dashboard lo sigue pidiendo
+        assert calls == ["TESTUSDT"] and "TESTUSDT" not in svc.watch
+        await wait_for(lambda: "testusdt@miniTicker" not in fake.market_subs)
+    finally:
+        await svc.stop()
+
+
+async def test_live_without_symbols_has_the_mark_of_a_just_opened_position(fake, tmp_path, snapshot_file,
+                                                                           monkeypatch):
+    svc = await _started(fake, tmp_path)
+    try:
+        monkeypatch.setattr(svc.core.market, "want", lambda *a, **k: None)   # su stream aún no llegó
+        svc.trades.handle_signal({"action": "open", "trade_id": 1, "symbol": "ETHUSDT", "direction": "SHORT",
+                                  "price": 3000, "quantity": 0.01})
+        await wait_for(lambda: any(p.symbol == "ETHUSDT" for p in svc.core.account.positions.values()))
+        svc.core.market.marks.pop("ETHUSDT", None)
+        res = await svc.execute("live", {})
+        assert res["prices"]["ETHUSDT"]["mark"] > 0
+    finally:
+        await svc.stop()

@@ -219,10 +219,13 @@ class MarketData:
     # Con el tope, la conexión nunca pasa de ~650 streams (Binance admite 1024) ni crece por
     # peticiones sin token.
     MAX_WATCH = 40
+    MAX_WATCH_KEEP = 60         # los ya suscritos se mantienen hasta aquí (sin altas/bajas al rotar consultas)
     WATCH_GRACE_S = 120.0       # un símbolo mirado sigue suscrito 2 min desde la última consulta
     MAX_FRAMES_PER_S = 4        # Binance admite 10 mensajes/s por conexión: margen de sobra
     SNAPSHOT_ARRAYS = 3         # !miniTicker@arr solo trae lo que cambió en el último segundo
+    FULL_SNAPSHOT_EVERY_S = 300.0  # foto completa (3 envíos) cada 5 min; entre medias basta 1 envío
     WATCHDOG_S = 20.0           # sin datos de precio en 20 s con streams activos → reconexión
+    WATCHDOG_MAX_S = 900.0      # si reconectar no lo arregla (símbolo deslistado), se espera el doble cada vez
     SNAPSHOT_EVERY_S = 25.0     # foto de todos los mercados como mucho cada 25 s (solo con dashboard)
     UNSUBSCRIBE_GRACE_S = 60.0  # un símbolo que deja de hacer falta se mantiene 60 s (evita altas/bajas)
     STALE_S = 60.0              # (lite) un precio sin actualizar en 60 s no se usa para operar
@@ -247,9 +250,12 @@ class MarketData:
         self._snapshot_pending = False
         self._snapshot_asked = 0.0
         self._snapshot_arrays = 0
+        self._snapshot_target = self.SNAPSHOT_ARRAYS
+        self._full_snapshot_ts = 0.0
         self._snapshot_task: Optional[asyncio.Task] = None
         self._sent_ts: deque = deque(maxlen=32)
         self._last_price_ts = 0.0
+        self._watchdog_strikes = 0
         self.all_tickers_ts = 0.0
         self._lock = asyncio.Lock()
         self.conn = StreamConnection("market", self._url, self._handle, on_connect=self._on_connect,
@@ -263,7 +269,11 @@ class MarketData:
         keep = {st for st, ts in self._wanted.items() if now - ts < self.UNSUBSCRIBE_GRACE_S}
         self._wanted = {st: ts for st, ts in self._wanted.items() if st in keep}
         self._watched = {s: ts for s, ts in self._watched.items() if now - ts < self.WATCH_GRACE_S}
-        for sym in sorted(self._watched, key=self._watched.__getitem__, reverse=True)[:self.MAX_WATCH]:
+        ranked = sorted(self._watched, key=self._watched.__getitem__, reverse=True)
+        subscribed = {st.split("@")[0] for st in self._active if st.endswith("@miniTicker")}
+        chosen = ranked[:self.MAX_WATCH]  # lo último consultado siempre entra
+        chosen += [s for s in ranked[self.MAX_WATCH:] if s.lower() in subscribed][:self.MAX_WATCH_KEEP - len(chosen)]
+        for sym in chosen:
             keep |= {f"{sym.lower()}@markPrice@1s", f"{sym.lower()}@miniTicker"}
         fast = {st.split("@")[0] for st in keep if st.endswith("@markPrice@1s")}
         # Un símbolo con stream de 1 s no necesita además el de 3 s.
@@ -302,6 +312,10 @@ class MarketData:
                 sym = sym.upper()
                 self._watched[sym] = max(ts, self._watched.get(sym, 0.0))
 
+    def unwatch(self, symbol: str) -> None:
+        """Deja de suscribir un símbolo mirado (p. ej. Binance dice que ya no existe)."""
+        self._watched.pop(symbol.upper(), None)
+
     async def _url(self) -> str:
         streams = sorted(self._desired()) if self.mode == "lite" else list(self.FULL_STREAMS)
         self._url_streams = set(streams)
@@ -327,9 +341,13 @@ class MarketData:
         if not any(self._is_price_stream(st) for st in self._active):
             return
         quiet = time.time() - max(self._last_price_ts, self.conn.connected_since)
-        if quiet > self.WATCHDOG_S:
+        # Cada reconexión que no trae precios dobla la espera: si los streams activos son de un
+        # símbolo que Binance ya no emite (deslistado), no se reconecta cada 20 s para siempre.
+        limit = min(self.WATCHDOG_S * 2 ** self._watchdog_strikes, self.WATCHDOG_MAX_S)
+        if quiet > limit:
             log.warning("Mercado: %.0f s sin precios con %d stream(s) activos; reconectando", quiet,
                         len(self._active))
+            self._watchdog_strikes += 1
             self._last_price_ts = time.time()
             await self.conn.reconnect()
 
@@ -402,7 +420,7 @@ class MarketData:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
                 async with session.ws_connect(url, compress=15, max_msg_size=0) as ws:
                     arrays, deadline = 0, time.time() + 6
-                    while arrays < self.SNAPSHOT_ARRAYS and time.time() < deadline:
+                    while arrays < self._snapshot_target and time.time() < deadline:
                         msg = await ws.receive(timeout=max(0.1, deadline - time.time()))
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             break
@@ -413,6 +431,8 @@ class MarketData:
                             arrays += 1
                             for item in payload:
                                 self._set_ticker(item, time.time())
+                    if arrays >= self.SNAPSHOT_ARRAYS:
+                        self._full_snapshot_ts = time.time()
         except Exception as exc:
             log.warning("Mercado: foto de mercados no disponible (%r)", exc)
         finally:
@@ -431,6 +451,9 @@ class MarketData:
         self._snapshot_pending = True
         self._snapshot_asked = now
         self._snapshot_arrays = 0
+        # Los símbolos que no salen en un envío no cambiaron: tras una foto completa basta 1 envío.
+        full = now - self._full_snapshot_ts > self.FULL_SNAPSHOT_EVERY_S
+        self._snapshot_target = self.SNAPSHOT_ARRAYS if full else 1
 
     def on_tick(self, callback: Callable[[], None]) -> None:
         """Callback tras cada actualización de mark price."""
@@ -463,6 +486,7 @@ class MarketData:
         sym = item.get("s")
         price = safe_float(item.get("p"))
         self._last_price_ts = now
+        self._watchdog_strikes = 0
         if sym and price > 0:
             self.marks[sym] = MarkInfo(price, safe_float(item.get("i")), safe_float(item.get("r")),
                                        int(item.get("T") or 0), now)
@@ -493,9 +517,11 @@ class MarketData:
                     self.all_tickers_ts = now
                 elif self._snapshot_pending:
                     # !miniTicker@arr solo trae lo que cambió en el último segundo: se toman
-                    # SNAPSHOT_ARRAYS envíos y se deja de recibir el mercado entero.
+                    # SNAPSHOT_ARRAYS envíos (1 si es un refresco) y se deja de recibir el mercado entero.
                     self._snapshot_arrays += 1
-                    if self._snapshot_arrays >= self.SNAPSHOT_ARRAYS:
+                    if self._snapshot_arrays >= self._snapshot_target:
+                        if self._snapshot_arrays >= self.SNAPSHOT_ARRAYS:
+                            self._full_snapshot_ts = now
                         self._snapshot_pending = False
                         self.all_tickers_ts = now
                         return self.sync_subscriptions()

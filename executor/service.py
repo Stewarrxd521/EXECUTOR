@@ -94,6 +94,7 @@ class ExecutorService:
         logging.getLogger().addHandler(self.logs)
         self.history: dict[str, deque] = {}
         self.watch: dict[str, float] = {}
+        self._bad_symbols: dict[str, float] = {}   # símbolo -> cuándo Binance dijo que no existe (-1121)
         self._tasks: list[asyncio.Task] = []
         self._balance_dirty = False
         self._last_balance = 0.0
@@ -415,14 +416,28 @@ class ExecutorService:
                     del self.history[sym]
 
     MAX_UNKNOWN = 20  # símbolos fuera del exchangeInfo validados por la WS API en una consulta (/api/live: 20)
+    BAD_SYMBOL_S = 600.0  # un símbolo que Binance dice que no existe (-1121) no se vuelve a mirar en 10 min
 
     def note_watch(self, symbol: str) -> None:
         """Marca un símbolo como observado (gráfico y suscripción de precio). Solo símbolos reales:
         los del exchangeInfo local o los que Binance ya reportó (precio o ticker)."""
         market = self.core.market
+        if time.time() - self._bad_symbols.get(symbol, 0.0) < self.BAD_SYMBOL_S:
+            return
         if len(symbol) <= 30 and market.valid_symbol(symbol) and (
                 self.core.exinfo.known(symbol) or market.mark(symbol) or symbol in market.tickers):
             self.watch[symbol] = time.time()
+
+    async def _seed_price(self, sym: str) -> None:
+        """Precio por la WS API mientras llega (o si no llega) el stream del símbolo."""
+        try:
+            self.core.market.seed(sym, await self.core.ws.ticker_price(sym))
+        except Exception as exc:
+            log.warning("%s: sin precio de mercado (%s)", sym, exc)
+            if getattr(exc, "code", 0) == -1121:  # Binance: el símbolo no existe (deslistado o inventado)
+                self._bad_symbols[sym] = time.time()
+                self.watch.pop(sym, None)
+                self.core.market.unwatch(sym)
 
     async def ensure_prices(self, symbols, wait_s: float = 2.5) -> dict[str, float]:
         """Precio de varios símbolos aunque aún no estén suscritos (modo lite).
@@ -436,14 +451,9 @@ class ExecutorService:
         max_age = self.settings.max_price_age_s
         requested = [s for s in dict.fromkeys(symbols) if market.valid_symbol(s)]
         unknown = [s for s in requested if not (self.core.exinfo.known(s) or s in market.tickers or market.mark(s))]
-
-        async def validate(sym: str) -> None:  # se valida con Binance antes de suscribir
-            try:
-                market.seed(sym, await self.core.ws.ticker_price(sym))
-            except Exception as exc:
-                log.warning("%s: símbolo sin precio en Binance (%s)", sym, exc)
-
-        await asyncio.gather(*(validate(s) for s in unknown[:self.MAX_UNKNOWN]))
+        # Se validan con Binance antes de suscribir (los que ya dijo que no existen, no).
+        unknown = [s for s in unknown if time.time() - self._bad_symbols.get(s, 0.0) >= self.BAD_SYMBOL_S]
+        await asyncio.gather(*(self._seed_price(s) for s in unknown[:self.MAX_UNKNOWN]))
         for sym in requested:
             self.note_watch(sym)
         symbols = [s for s in requested if s in self.watch]  # los rechazados ni se esperan ni se repiten
@@ -458,15 +468,9 @@ class ExecutorService:
             while time.time() < deadline and any(not market.mark(s, max_age_s=max_age) for s in missing):
                 await asyncio.sleep(0.1)
 
-        async def fallback(sym: str) -> None:
-            try:
-                market.seed(sym, await self.core.ws.ticker_price(sym))
-            except Exception as exc:
-                log.warning("%s: sin precio de mercado (%s)", sym, exc)
-
         late = [s for s in missing if not market.mark(s, max_age_s=max_age)]
         if late:
-            await asyncio.gather(*(fallback(s) for s in late))
+            await asyncio.gather(*(self._seed_price(s) for s in late))
         return {s: market.price(s) for s in requested}
 
     async def ensure_price(self, symbol: str, wait_s: float = 2.5) -> float:
@@ -832,6 +836,9 @@ class ExecutorService:
         syms = [x.strip().upper() for x in str(a.get("symbols", "")).split(",") if x.strip()][:20]
         if syms:  # símbolos pedidos explícitamente: un único SUBSCRIBE (modo lite) o WS API
             await self.ensure_prices(syms, wait_s=1.5)
+        else:  # posiciones: ya tienen stream; la WS API solo si aún no llegó su primer precio
+            late = [s for s in sorted(self.needed_symbols()) if not self.core.market.mark(s)][:20]
+            await asyncio.gather(*(self._seed_price(s) for s in late))
         return self.live_view(syms or None)
 
     async def _cmd_symbol_info(self, a: dict):
