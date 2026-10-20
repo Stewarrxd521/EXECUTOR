@@ -866,6 +866,8 @@ class ExecutorClient:
                      reason: str = "MAIN_BOT", close_price: Optional[float] = None,
                      quantity: Optional[float] = None, pnl: Optional[float] = None, wait: bool = True,
                      **extra: Any) -> dict:
+        """Señal close. Con ``trade_id`` cierra solo la cantidad de ese trade_id (aunque otros bots
+        tengan posición en el mismo símbolo); sin ``trade_id``, la posición entera."""
         return self.signal({"action": "close", "trade_id": trade_id, "symbol": symbol.upper(),
                             "direction": direction.upper() if direction else None, "reason": reason,
                             "close_price": close_price, "quantity": quantity, "pnl": pnl, **extra}, wait=wait)

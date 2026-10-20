@@ -94,6 +94,7 @@ class ExecutorService:
         logging.getLogger().addHandler(self.logs)
         self.history: dict[str, deque] = {}
         self.watch: dict[str, float] = {}
+        self._one_way_warned = False
         self._bad_symbols: dict[str, float] = {}   # símbolo -> cuándo Binance dijo que no existe (-1121)
         self._tasks: list[asyncio.Task] = []
         self._balance_dirty = False
@@ -230,6 +231,14 @@ class ExecutorService:
         acct = self.core.account
         log.info("Cuenta sincronizada (%s): %d posiciones, modo %s, %d leverages en caché",
                  reason, len(acct.positions), "Hedge" if acct.is_hedge else "One-way", len(acct.leverage))
+        if acct.hedge_mode is False and not self._one_way_warned:
+            self._one_way_warned = True
+            msg = ("La cuenta de Binance Futures está en modo One-way: si dos bots abren LONG y SHORT en el mismo "
+                   "símbolo, Binance las compensa en una sola posición. Activa Hedge mode (Preferencias → Modo de "
+                   "posición) para que cada dirección tenga su posición.")
+            log.warning(msg)
+            self.core.bus.emit("position_mode", msg, "warning")
+            self.core.telegram.send(f"⚠️ <b>Modo One-way</b>\n{msg}")
 
     async def refresh_balance(self, force: bool = False) -> None:
         if not force and time.time() - self._last_balance < 3:
@@ -503,6 +512,7 @@ class ExecutorService:
                 "source": "grid" if grid else (trade.source if trade else "externa"),
                 "trade_id": trade.id if trade else None, "paper_id": trade.paper_trade_id if trade else None,
                 "paper_ids": trade.paper_ids if trade else [], "levels": trade.to_dict()["levels"] if trade else [],
+                "lots": trade.lots_view() if trade else [],
                 "multiplier": trade.multiplier if trade else 1.0,
                 "open_time": trade.open_time if trade else "", "assumed": False,
                 "fees": trade.fees_usdt if trade else 0.0,
@@ -518,7 +528,7 @@ class ExecutorService:
                 "roe": t.roe_pct, "notional": t.notional_usdt, "margin": t.margin_usdt, "leverage": t.leverage,
                 "margin_type": "", "liq": 0.0, "tp": t.tp_price, "sl": t.sl_price,
                 "source": t.source, "trade_id": t.id, "paper_id": t.paper_trade_id, "paper_ids": t.paper_ids,
-                "levels": t.to_dict()["levels"], "open_time": t.open_time, "multiplier": t.multiplier,
+                "levels": t.to_dict()["levels"], "lots": t.lots_view(), "open_time": t.open_time, "multiplier": t.multiplier,
                 "assumed": t.order_assumed or not self.settings.has_credentials, "fees": t.fees_usdt,
             })
         rows.sort(key=lambda r: (r["symbol"], r["direction"]))

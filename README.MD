@@ -178,10 +178,30 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
   como «señal duplicada» los tramos del mismo `trade_id` recibidos en menos de 10 s).
 - Si una apertura del bot no se ejecuta (rechazada o fallida en Binance) se avisa en el dashboard y por Telegram.
 - Una señal con `signal_id` (o header `Idempotency-Key`) nunca se ejecuta dos veces: así los reintentos son seguros.
-- `close` acepta `close_price`, `pnl` (PnL del bot, se compara con el real), `quantity` (cierre parcial). Si llega
-  antes que su `open` (o mientras se abre) se aplica en cuanto la posición existe; un tramo de ese `trade_id` que
-  llegue hasta 30 s después del cierre se ignora (no reabre). El orden se respeta por símbolo: un `close` espera a
-  los `open` recibidos antes que él, nunca a los posteriores.
+- **Cierre por `trade_id` (varios bots en el mismo símbolo).** Binance junta en una sola posición todo lo abierto en
+  el mismo símbolo y dirección, pero el executor guarda cuánto abrió cada `trade_id` (su **lote**: la cantidad real
+  llenada, con multiplicador incluido y sumando sus tramos).
+  - `close` **con `trade_id`** cierra solo el lote de ese `trade_id` (orden reduceOnly). La posición se cierra
+    entera solo cuando lo que queda en Binance es justo ese lote. Si la posición tiene más (por ejemplo, otro bot
+    abrió en el mismo símbolo por fuera), se cierra solo la cantidad de ese `trade_id`, aunque sea el último.
+  - `close` **sin `trade_id`** cierra la posición entera del símbolo (y de la dirección, si se indica).
+  - Un `trade_id` que no tiene cantidad en la posición (la posición es de otros `trade_id`) no la toca. El cierre
+    queda en espera 30 s por si su apertura llega tarde. Si la posición tiene cantidad que no es de ningún
+    `trade_id` (adoptada tras perder `trades.json`, abierta fuera del executor), solo se cierra esa parte.
+  - Si en Binance hay menos de lo registrado (TP/SL o cierres hechos fuera del executor), cada lote baja en
+    proporción.
+  - Cada lote cerrado queda en el historial con su propio PnL y comisiones. En el dashboard, la posición muestra
+    cuánto es de cada `trade_id`.
+  - Los cierres simultáneos de varios `trade_id` del mismo símbolo (TP en el mismo instante) se ejecutan uno tras
+    otro, sin perder ninguno.
+  - Las posiciones abiertas antes de esta versión no tienen lotes: al arrancar, su cantidad se reparte a partes
+    iguales entre sus `trade_id`.
+  - La cuenta debe estar en **Hedge mode** para que LONG y SHORT del mismo símbolo sean posiciones distintas. En
+    One-way, el executor avisa al arrancar (log, dashboard y Telegram).
+- `close` acepta `close_price`, `pnl` (PnL del bot, se compara con el real), `quantity` (cierre parcial; con
+  `trade_id`, nunca más que su lote). Si llega antes que su `open` (o mientras se abre) se aplica en cuanto la
+  posición existe; un tramo de ese `trade_id` que llegue hasta 30 s después del cierre se ignora (no reabre). El orden
+  se respeta por símbolo: un `close` espera a los `open` recibidos antes que él, nunca a los posteriores.
 - Si Binance no confirma una apertura (timeout, estado desconocido) el executor relee la posición real y la registra
   si se abrió, así el `close` del bot siempre la cierra.
 - `POST /signal?wait=1` espera el resultado en Binance (hasta `SIGNAL_WAIT_TIMEOUT_S`) y lo devuelve en `result`.
