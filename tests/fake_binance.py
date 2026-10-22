@@ -57,6 +57,8 @@ class FakeBinance:
         self.done_orders: dict[int, dict] = {}  # órdenes ya ejecutadas (siguen visibles en order.status)
         self.orders: dict[int, dict] = {}
         self.algos: dict[int, dict] = {}
+        self.history: dict[int, dict] = {}       # órdenes con algo ejecutado (GET /fapi/v1/allOrders)
+        self.all_orders_error = False
         self.leverage: dict[str, int] = {s: 20 for s in self.marks}
         self.wallet = 10_000.0
         self.seq = 1000
@@ -84,6 +86,7 @@ class FakeBinance:
         app.router.add_post("/fapi/v1/leverage", self._rest_leverage)
         app.router.add_get("/fapi/v1/openOrders", self._rest_open_orders)
         app.router.add_get("/fapi/v1/openAlgoOrders", self._rest_open_algos)
+        app.router.add_get("/fapi/v1/allOrders", self._rest_all_orders)
         app.router.add_get("/fapi/v1/exchangeInfo", self._rest_exinfo)
         app.router.add_get("/fapi/v1/leverageBracket", self._rest_brackets)
         app.router.add_get("/fapi/v1/positionSide/dual", self._rest_position_mode)
@@ -163,6 +166,7 @@ class FakeBinance:
                 pos["entry"] = price
         self.wallet += realized - price * qty * 0.0004
         order["executedQty"] = float(order.get("executedQty", 0)) + qty
+        self.history[order["orderId"]] = order  # GET /fapi/v1/allOrders
         order["avgPrice"] = price
         order["status"] = "FILLED"
         self.push(self._otu(order, "TRADE", last_qty=qty, last_price=price, realized=realized))
@@ -432,6 +436,16 @@ class FakeBinance:
     async def _rest_open_orders(self, request: web.Request) -> web.Response:
         self.rest_calls.append("openOrders")
         return web.json_response([dict(o, time=int(time.time() * 1000)) for o in self.orders.values()])
+
+    async def _rest_all_orders(self, request: web.Request) -> web.Response:
+        self.rest_calls.append("allOrders")
+        if self.all_orders_error:
+            return web.json_response({"code": -1001, "msg": "Internal error"}, status=500)
+        sym, limit = request.query.get("symbol"), int(request.query.get("limit", 500))
+        rows = [dict(o, executedQty=str(o["executedQty"]), avgPrice=str(o["avgPrice"]),
+                     origType=o.get("origType", o["type"]), time=o.get("updateTime", 0))
+                for o in self.history.values() if o["symbol"] == sym]
+        return web.json_response(sorted(rows, key=lambda o: o["orderId"])[-limit:])
 
     async def _rest_open_algos(self, request: web.Request) -> web.Response:
         self.rest_calls.append("openAlgoOrders")

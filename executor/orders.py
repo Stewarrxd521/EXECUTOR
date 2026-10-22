@@ -161,7 +161,7 @@ class OrderExecutor:
                     if not definitive:
                         # No se pudo confirmar: reenviar podría duplicar la orden.
                         raise
-                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].split("-")[0])
+                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].rsplit("-", 1)[0])
                     notes.append("orden no registrada en Binance; reenviada con nuevo clientOrderId")
                     continue
                 if action in (Action.RETRY, Action.RESYNC_TIME):
@@ -169,7 +169,7 @@ class OrderExecutor:
                     notes.append("reintento tras error transitorio")
                     continue
                 if action == Action.NEW_CLIENT_ID:
-                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].split("-")[0])
+                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].rsplit("-", 1)[0])
                     notes.append("nuevo clientOrderId")
                     continue
                 if action == Action.DROP_REDUCE_ONLY and "reduceOnly" in params:

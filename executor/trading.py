@@ -101,6 +101,80 @@ def lot_ref(bot: str, trade_id: Any) -> Any:
     return f"{bot}:{tid}" if bot and tid else tid
 
 
+CID_PREFIX_MAX = 19          # 36 caracteres de clientOrderId menos «-» + sello + aleatorio (new_client_id)
+_LOT_CID_RE = re.compile(r"([XK])(\d+)(?::([a-z0-9_.-]+))?")
+
+
+def lot_cid_prefix(kind: str, lot: Any) -> str:
+    """Prefijo del clientOrderId de una orden de un lote: «X5» / «X5:kline» (apertura), «K5:kline» (su cierre).
+    Con él, un reinicio sin ``trades.json`` rehace los lotes desde el historial de órdenes de Binance."""
+    tid, bot = _split_ref(lot)
+    prefix = f"{kind}{tid}"
+    room = CID_PREFIX_MAX - len(prefix) - 1
+    return f"{prefix}:{bot[:room]}" if bot and tid and room >= 3 else prefix
+
+
+def parse_lot_cid(cid: str) -> Optional[tuple[str, Any]]:
+    """(«X» apertura | «K» cierre, lote) de un clientOrderId puesto con ``lot_cid_prefix``."""
+    head, sep, _ = str(cid or "").rpartition("-")
+    m = _LOT_CID_RE.fullmatch(head) if sep else None
+    if not m:
+        return None
+    return m.group(1), lot_ref(m.group(3) or "", int(m.group(2)))
+
+
+def replay_lots(orders: list, direction: str, qty: float, tol: float) -> Optional["Trade"]:
+    """Rehace el libro de una posición (``qty`` en Binance) con su historial de órdenes: desde la última vez
+    que estuvo en cero, cada apertura propia suma a su lote, cada cierre de un lote lo resta y lo demás se
+    reparte como en vivo. None si el historial no llega hasta ese cero o no cuadra con la posición."""
+    rows = [o for o in orders if o.get("positionSide") == direction and safe_float(o.get("executedQty")) > 0]
+    rows.sort(key=lambda o: (int(safe_float(o.get("updateTime") or o.get("time"))), int(safe_float(o.get("orderId")))))
+    opening_side = "BUY" if direction == "LONG" else "SELL"
+    cur, start = qty, None
+    for i in range(len(rows) - 1, -1, -1):
+        executed = safe_float(rows[i]["executedQty"])
+        cur += -executed if rows[i].get("side") == opening_side else executed
+        if cur < -tol:
+            return None
+        if cur <= tol:
+            start = i
+            break
+    if start is None:
+        return None
+    book = Trade(id=0, symbol="", direction=direction, entry_price=0.0, quantity=qty, open_time="", leverage=1)
+    for o in rows[start:]:
+        executed = safe_float(o["executedQty"])
+        cid = str(o.get("clientOrderId") or "")
+        parsed = parse_lot_cid(cid)
+        if o.get("side") == opening_side:
+            if parsed and parsed[0] == "X":
+                lk = Trade.lot_key(parsed[1])
+            elif cid.startswith("M"):
+                lk = "0"  # LIMIT de entrada del dashboard
+            else:
+                book.credit("", executed)  # abierto por fuera: sin dueño
+                continue
+            book.credit(lk, executed)
+            tid, bot = _split_ref(parsed[1] if parsed else 0)
+            ms = int(safe_float(o.get("updateTime") or o.get("time")))
+            tranche = {"level": 0, "trade_id": tid, "qty": executed, "fill_price": safe_float(o.get("avgPrice")),
+                       "fill_ms": ms, "ts": ms / 1000, "order_id": o.get("orderId"), "rebuilt": True}
+            if bot:
+                tranche["bot"] = bot
+            book.tranches.append(tranche)
+        elif parsed and parsed[0] == "K":
+            book.debit(Trade.lot_key(parsed[1]), executed)
+        elif o.get("origType") == "LIQUIDATION" or cid.lower().startswith(("autoclose", "adl_autoclose")):
+            book.debit("~", executed)
+        else:
+            book.debit("*", executed)
+    if abs(book.ledger_qty - qty) > max(tol, 1e-9):
+        return None
+    book.tranches = [t for t in book.tranches
+                     if Trade.lot_key(lot_ref(t.get("bot", ""), t.get("trade_id", 0))) in book.lots]
+    return book
+
+
 _TP_ALIASES = ("tp", "tp_price", "take_profit")
 _SL_ALIASES = ("sl", "sl_price", "stop_loss")
 
@@ -424,6 +498,8 @@ class TradeManager:
         self._unknown_owner: dict[tuple, dict] = {}    # apertura de estado desconocido -> su owner (clientOrderIds)
         self._netted: set[tuple] = set()               # one-way: apertura opuesta ya aplicada en _register_entry
         self._detached: list[dict] = []                # cierres de lote sin confirmar de trades ya cerrados del todo
+        self._rebuilding: set[tuple[str, str]] = set()  # posiciones adoptadas cuyos lotes se rehacen al arrancar
+        self._rebuild_tried: dict[tuple[str, str], float] = {}
         self._cid_final: OrderedDict = OrderedDict()   # clientOrderId propio -> (llenado, precio medio) ya definitivo
         self._reconciling: set[tuple[str, str]] = set()
         self._skipped_closed: dict[str, float] = {}
@@ -877,12 +953,14 @@ class TradeManager:
         return now - ts if ts else None
 
     async def _await_ready(self) -> None:
-        if self.ready.is_set():
-            return
-        try:
-            await asyncio.wait_for(self.ready.wait(), READY_WAIT_S)
-        except asyncio.TimeoutError:
-            log.warning("La cuenta aún no se sincronizó; se ejecuta la señal igualmente")
+        if not self.ready.is_set():
+            try:
+                await asyncio.wait_for(self.ready.wait(), READY_WAIT_S)
+            except asyncio.TimeoutError:
+                log.warning("La cuenta aún no se sincronizó; se ejecuta la señal igualmente")
+        deadline = time.time() + READY_WAIT_S
+        while self._rebuilding and time.time() < deadline:
+            await asyncio.sleep(0.05)  # lotes de las posiciones adoptadas al arrancar
 
     async def _signal_open(self, sig: Signal, quantity: float, notional: float, margin: float,
                            prior_closes: Optional[list] = None) -> dict:
@@ -1143,6 +1221,10 @@ class TradeManager:
 
     def _resolve_trade(self, trade_id: int, symbol: str, direction: Optional[str], ref: Any = None) -> Optional[Trade]:
         if trade_id:
+            if ref:
+                for t in list(self.trades.values()):
+                    if not symbol or t.symbol == symbol:
+                        self._claim_cid_lot(t, ref)
             # Primero la posición que tiene el lote de ese trade_id (y de ese bot): el número solo
             # puede repetirse entre bots.
             key = Trade.lot_key(ref if ref else trade_id)
@@ -1451,6 +1533,10 @@ class TradeManager:
                                desired_notional=desired, ref_price=ref)
             log.info("Apertura %s %s: qty=%s (≈%.2f USDT, ref=%s, lev=%sx)", direction, symbol, fmt(qty),
                      float(qty) * ref, ref, applied_lev)
+            existing = self.trades.get((symbol, direction))
+            if existing is not None:
+                await self.rebuild_lots(existing)  # posición adoptada: primero sus lotes
+                self._claim_cid_lot(existing, lot_ref(bot, paper_trade_id))
             lk = Trade.lot_key(lot_ref(bot, paper_trade_id))
             owner = {"kind": "open", "symbol": symbol, "direction": direction, "lot": lk}
             tranche = {"level": level, "notional_req": desired, "signal_price": signal_price, "trade_id": paper_trade_id,
@@ -1462,7 +1548,8 @@ class TradeManager:
             prior = self.core.account.position(symbol, direction) \
                 if self.trades.get((symbol, direction)) is None and self.core.account.is_hedge else None
             try:
-                fill = await self.orders.market(ctx, qty, prefix=f"X{paper_trade_id or 0}", owner=owner)
+                fill = await self.orders.market(ctx, qty, prefix=lot_cid_prefix("X", lot_ref(bot, paper_trade_id)),
+                                                owner=owner)
             except BinanceAPIError as err:
                 diag = ErrorDoctor.diagnose(err)
                 if diag.action == Action.CHECK_STATUS:
@@ -1615,9 +1702,95 @@ class TradeManager:
                 continue
             if self.grid_owner(pos.symbol, pos.direction):
                 continue
-            self.adopt_position(pos, source="adoptada")
+            trade = self.adopt_position(pos, source="adoptada")
+            self._rebuilding.add(trade.key)
+            self._spawn(self._rebuild_adopted(trade))
             n += 1
         return n
+
+    async def _rebuild_adopted(self, trade: Trade) -> None:
+        try:
+            async with self._lock(trade.symbol):
+                if self.trades.get(trade.key) is trade:
+                    await self.rebuild_lots(trade)
+        except Exception:  # pragma: no cover
+            log.exception("No se pudieron rehacer los lotes de %s %s", trade.symbol, trade.direction)
+        finally:
+            self._rebuilding.discard(trade.key)
+
+    async def rebuild_lots(self, trade: Trade) -> bool:
+        """Posición sin lotes (reinicio sin ``trades.json``, disco efímero de Render): sus lotes se rehacen
+        con el historial de órdenes de Binance (clientOrderId de cada trade_id, últimos 7 días). Si el
+        historial no la explica, sigue sin lotes. Con el lock del símbolo."""
+        key = trade.key
+        if trade.lot_tracked or trade.lots or trade.assumed_lots or trade.order_assumed or not trade.hedge_mode \
+                or not self.settings.has_credentials or time.time() - self._rebuild_tried.get(key, 0.0) < 30:
+            return False
+        self._rebuild_tried[key] = time.time()
+        rules = self.core.exinfo.get(trade.symbol, trade.entry_price)
+        tol = float(rules.qty_step(True)) / 2
+        book = None
+        try:
+            for _ in range(2):
+                pos, known = await self._fresh_position(trade.symbol, trade.direction)
+                if pos is None or not known:
+                    return False
+                orders = await self.core.rest.all_orders(trade.symbol)
+                again, _ = await self._fresh_position(trade.symbol, trade.direction)
+                if again is not None and abs(again.qty - pos.qty) <= tol:
+                    book = replay_lots(orders, trade.direction, pos.qty, tol)
+                    break
+        except Exception as exc:
+            log.warning("%s %s: no se pudo leer el historial de órdenes (%s)", trade.symbol, trade.direction, exc)
+            return False
+        if book is None:
+            msg = (f"{trade.symbol} {trade.direction}: el historial de Binance (7 días) no explica la posición; "
+                   f"sigue sin lotes por trade_id (el primer close con trade_id la cierra entera)")
+            log.warning(msg)
+            self.core.bus.emit("lots_rebuild", msg, "warning", symbol=trade.symbol)
+            self.core.telegram.send(f"⚠️ <b>Lotes no recuperados</b> <code>{trade.symbol}</code> {trade.direction}\n"
+                                    "El historial de Binance no explica la posición: el primer close con "
+                                    "trade_id la cerrará entera")
+            return False
+        self._rebuild_tried.pop(key, None)
+        trade.lots, trade.unassigned, trade.tranches = book.lots, book.unassigned, book.tranches
+        trade.lot_tracked = True
+        trade.sync_quantity(book.ledger_qty)
+        for pid in list(trade.paper_ids):
+            if self.paper_map.get((int(pid), trade.symbol)) == key:
+                del self.paper_map[(int(pid), trade.symbol)]
+        trade.paper_ids = []
+        for t in sorted(book.tranches, key=lambda t: t.get("fill_ms", 0)):
+            self._map_paper(trade, int(t.get("trade_id") or 0))
+        trade.paper_trade_id = int(trade.paper_ids[-1]) if trade.paper_ids else 0
+        if book.tranches:
+            trade.opened_ts = min(t["ts"] for t in book.tranches)
+        self.save()
+        view = ", ".join(f"{k}: {v:g}" for k, v in book.lots.items()) or "ninguno"
+        log.warning("%s %s: lotes rehechos desde el historial de Binance: %s (sin trade_id: %g)", trade.symbol,
+                    trade.direction, view, book.unassigned)
+        self.core.bus.emit("lots_rebuild", f"{trade.symbol} {trade.direction}: lotes recuperados ({view})", "info",
+                           symbol=trade.symbol)
+        return True
+
+    def _claim_cid_lot(self, trade: Trade, lot: Any) -> None:
+        """Un lote rehecho desde el historial tiene el nombre del bot recortado (clientOrderId): con la primera
+        señal de ese bot pasa a su nombre completo."""
+        tid, bot = _split_ref(lot)
+        short = lot_cid_prefix("X", lot).partition(":")[2]
+        if not bot or not short or short == bot:
+            return
+        full, cut = Trade.lot_key(lot), Trade.lot_key(lot_ref(short, tid))
+        if full in trade.lots or full in trade.assumed_lots or cut not in trade.lots:
+            return
+        trade.lots[full] = trade.lots.pop(cut)
+        for t in trade.tranches:
+            if t.get("bot") == short and int(t.get("trade_id") or 0) == tid:
+                t["bot"] = bot
+        for kind, owner in list(trade.protect_lots.items()):
+            if owner == cut:
+                trade.protect_lots[kind] = full
+        self.save()
 
     def _announce_open(self, trade: Trade) -> None:
         tag = " [ASUMIDA]" if trade.order_assumed else ""
@@ -1834,7 +2007,9 @@ class TradeManager:
                 return True
             max_qty = None if done["whole"] else left
 
-        # 2) Libro cuadrado con la posición real.
+        # 2) Libro cuadrado con la posición real (una posición adoptada, primero con sus lotes del historial).
+        await self.rebuild_lots(trade)
+        self._claim_cid_lot(trade, lot)
         pos, known = await self._fresh_position(trade.symbol, trade.direction)
         base = pos.qty if pos is not None else (0.0 if known or trade.order_assumed else trade.real_quantity)
         if not trade.order_assumed:
@@ -1910,7 +2085,8 @@ class TradeManager:
             if want <= 0:
                 break
             try:
-                fill = await self.orders.market(ctx, D(fmt(want)), prefix=f"C{trade.id}", owner=record)
+                fill = await self.orders.market(ctx, D(fmt(want)), owner=record,
+                                                prefix=f"C{trade.id}" if orphan else lot_cid_prefix("K", lot))
             except BinanceAPIError as err:
                 diag = ErrorDoctor.diagnose(err)
                 if diag.action in (Action.REFRESH_POSITION, Action.ALREADY_DONE):

@@ -545,7 +545,7 @@ class ExecutorService:
         for r in rows:
             cid = r.get("client_id", "")
             r["origin"] = ("grid" if cid.startswith("G") else "tp/sl" if r["kind"] == "algo"
-                           else "executor" if cid[:1] in ("X", "C", "M", "L") else "externa")
+                           else "executor" if cid[:1] in ("X", "C", "K", "M", "L") else "externa")
         rows.sort(key=lambda r: r["time"], reverse=True)
         return rows
 

@@ -127,6 +127,7 @@ async def test_unknown_trade_id_never_closes_quantity_opened_outside(service, fa
 
 async def test_adopted_position_is_closed_by_any_trade_id(service, fake):
     t = service.trades
+    fake.all_orders_error = True                 # sin historial de Binance no se pueden rehacer sus lotes
     trade = await t.open_trade(SYM, "LONG", notional=30)
     t._unmap_trade(trade)
     del t.trades[trade.key]                      # se perdió trades.json: la posición se adopta sin lotes
