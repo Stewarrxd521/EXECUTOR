@@ -133,6 +133,12 @@ async def test_unconfirmed_close_is_settled_by_the_periodic_check(service, fake)
         return orig(method, p)
 
     fake._dispatch = dispatch
+    push = fake._push
+
+    async def no_order_events(event):            # y el evento final de la orden tampoco llega
+        if not (down["on"] and event.get("e") == "ORDER_TRADE_UPDATE"):
+            await push(event)
+    fake._push = no_order_events
     close(t, 1)
     await wait_for(lambda: t.signals(1, trade_id=1) and not t.signals(1, trade_id=1)[0]["ok"], timeout=10)
     assert amt(fake) == 0.02 and (trade.key, "1") in t._lot_attempts
@@ -242,7 +248,7 @@ async def test_reconciled_lot_keeps_its_own_multiplier_and_entry(service, fake, 
     fake.inject_after.append(("order.place", -1007, "Timeout waiting for response from backend server."))
     fake.inject.extend([STATUS_DOWN] * 3)
     open_(t, 1, 0.01)                            # x2 a 3200; la respuesta se pierde y se concilia
-    await wait_for(lambda: "1" in trade.lots and lots(trade)["2"] == 0.01, timeout=8)
+    await wait_for(lambda: "1" in trade.lots and lots(trade)["2"] == 0.01 and trade.lot_tranches("1"), timeout=8)
     real1 = trade.lots["1"]                      # ≈ 0.02 (×2), redondeada al step y al notional
     assert abs(trade.lot_multiplier("1") - real1 / 0.01) < 1e-9 and abs(trade.lot_entry("1") - 3200) < 1
     close(t, 1, quantity=0.01)                   # toda la cantidad del bot 1, en unidades del bot
