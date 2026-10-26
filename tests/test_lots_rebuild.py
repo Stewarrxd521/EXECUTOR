@@ -193,3 +193,21 @@ async def test_failed_history_read_is_retried_by_the_next_signal(fake, tmp_path,
         assert amt(fake) == 0.01 and lots(t.get_trade(SYM, "LONG")) == {"1": 0.01}
     finally:
         await svc.stop()
+
+
+async def test_partial_close_after_the_restart_uses_x1_for_rebuilt_tranches(fake, tmp_path, snapshot_file):
+    svc = await start(fake, tmp_path)
+    try:
+        t = svc.trades
+        open_(t, 2, 0.02, bot="app25")
+        await opened(t, fake, 0.02)
+        svc = await restart_without_state(svc, fake, tmp_path)
+        t = svc.trades
+        open_(t, 2, 0.03, bot="app25")            # nuevo tramo del mismo trade_id tras el reinicio
+        await opened(t, fake, 0.05)
+        close(t, 2, bot="app25", quantity=0.01)
+        await wait_for(lambda: amt(fake) == 0.04)
+        await asyncio.sleep(0.5)
+        assert amt(fake) == 0.04 and lots(t.get_trade(SYM, "LONG")) == {"app25:2": 0.04}
+    finally:
+        await svc.stop()

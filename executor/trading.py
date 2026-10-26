@@ -358,7 +358,9 @@ class Trade:
         """Factor del multiplicador que recibió ese trade_id (cantidad real / cantidad del bot)."""
         rows = [t for t in self.lot_tranches(ref) if not t.get("assumed")]
         real = sum(safe_float(t.get("qty")) for t in rows)
-        bot = sum(safe_float(t.get("bot_qty")) for t in rows)
+        # Un tramo sin cantidad del bot (rehecho del historial, apertura manual) cuenta con su factor (×1 si no lo tiene).
+        bot = sum(safe_float(t.get("bot_qty")) or safe_float(t.get("qty")) / (safe_float(t.get("multiplier")) or 1.0)
+                  for t in rows)
         return real / bot if real > 0 and bot > 0 else (self.multiplier or 1.0)
 
     def lot_entry(self, ref: Any) -> float:
