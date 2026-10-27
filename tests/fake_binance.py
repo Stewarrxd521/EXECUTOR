@@ -58,6 +58,7 @@ class FakeBinance:
         self.orders: dict[int, dict] = {}
         self.algos: dict[int, dict] = {}
         self.history: dict[int, dict] = {}       # órdenes con algo ejecutado (GET /fapi/v1/allOrders)
+        self.user_fills: list[dict] = []         # cada fill (GET /fapi/v1/userTrades)
         self.all_orders_error = False
         self.leverage: dict[str, int] = {s: 20 for s in self.marks}
         self.wallet = 10_000.0
@@ -87,6 +88,7 @@ class FakeBinance:
         app.router.add_get("/fapi/v1/openOrders", self._rest_open_orders)
         app.router.add_get("/fapi/v1/openAlgoOrders", self._rest_open_algos)
         app.router.add_get("/fapi/v1/allOrders", self._rest_all_orders)
+        app.router.add_get("/fapi/v1/userTrades", self._rest_user_trades)
         app.router.add_get("/fapi/v1/exchangeInfo", self._rest_exinfo)
         app.router.add_get("/fapi/v1/leverageBracket", self._rest_brackets)
         app.router.add_get("/fapi/v1/positionSide/dual", self._rest_position_mode)
@@ -169,7 +171,13 @@ class FakeBinance:
         self.history[order["orderId"]] = order  # GET /fapi/v1/allOrders
         order["avgPrice"] = price
         order["status"] = "FILLED"
-        self.push(self._otu(order, "TRADE", last_qty=qty, last_price=price, realized=realized))
+        event = self._otu(order, "TRADE", last_qty=qty, last_price=price, realized=realized)
+        self.user_fills.append({"symbol": sym, "id": len(self.user_fills) + 1, "orderId": order["orderId"],
+                                "side": side, "positionSide": ps, "price": str(price), "qty": str(qty),
+                                "realizedPnl": str(realized), "commission": str(price * qty * 0.0004),
+                                "commissionAsset": "USDT", "time": event["T"], "buyer": side == "BUY",
+                                "maker": False})
+        self.push(event)
         self.push({"e": "ACCOUNT_UPDATE", "E": int(time.time() * 1000), "a": {
             "m": "ORDER", "B": [{"a": "USDT", "wb": str(self.wallet), "cw": str(self.wallet), "bc": "0"}],
             "P": [{"s": sym, "pa": str(pos["amt"]), "ep": str(pos["entry"]), "bep": str(pos["entry"]), "cr": "0",
@@ -441,11 +449,24 @@ class FakeBinance:
         self.rest_calls.append("allOrders")
         if self.all_orders_error:
             return web.json_response({"code": -1001, "msg": "Internal error"}, status=500)
-        sym, limit = request.query.get("symbol"), int(request.query.get("limit", 500))
-        rows = [dict(o, executedQty=str(o["executedQty"]), avgPrice=str(o["avgPrice"]),
-                     origType=o.get("origType", o["type"]), time=o.get("updateTime", 0))
-                for o in self.history.values() if o["symbol"] == sym]
-        return web.json_response(sorted(rows, key=lambda o: o["orderId"])[-limit:])
+        sym, limit = request.query.get("symbol"), min(int(request.query.get("limit", 500)), 1000)
+        rows = sorted((dict(o, executedQty=str(o["executedQty"]), avgPrice=str(o["avgPrice"]),
+                            origType=o.get("origType", o["type"]), time=o.get("updateTime", 0))
+                       for o in self.history.values() if o["symbol"] == sym), key=lambda o: o["orderId"])
+        if request.query.get("orderId"):
+            first = int(request.query["orderId"])
+            return web.json_response([o for o in rows if o["orderId"] >= first][:limit])
+        return web.json_response(rows[-limit:])
+
+    async def _rest_user_trades(self, request: web.Request) -> web.Response:
+        self.rest_calls.append("userTrades")
+        if self.all_orders_error:
+            return web.json_response({"code": -1001, "msg": "Internal error"}, status=500)
+        q = request.query
+        sym, limit = q.get("symbol"), min(int(q.get("limit", 500)), 1000)
+        start, end = int(q.get("startTime", 0)), int(q.get("endTime", 2 ** 62))
+        rows = [f for f in self.user_fills if f["symbol"] == sym and start <= f["time"] <= end]
+        return web.json_response(rows[-limit:])
 
     async def _rest_open_algos(self, request: web.Request) -> web.Response:
         self.rest_calls.append("openAlgoOrders")

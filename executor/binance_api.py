@@ -515,10 +515,23 @@ class RestClient:
         data = await self.request("GET", "/fapi/v1/openOrders", {}, signed=True)
         return data if isinstance(data, list) else []
 
-    async def all_orders(self, symbol: str, limit: int = 1000) -> list:
-        """Órdenes del símbolo de los últimos 7 días (las más recientes; peso 5)."""
-        data = await self.request("GET", "/fapi/v1/allOrders", {"symbol": symbol, "limit": limit}, signed=True,
-                                  timeout=10)
+    async def all_orders(self, symbol: str, order_id: Optional[int] = None, limit: int = 1000) -> list:
+        """Órdenes del símbolo desde ``order_id`` (incluida), en orden; sin él, las más recientes (peso 5)."""
+        params: dict = {"symbol": symbol, "limit": limit}
+        if order_id:
+            params["orderId"] = int(order_id)
+        data = await self.request("GET", "/fapi/v1/allOrders", params, signed=True, timeout=10)
+        return data if isinstance(data, list) else []
+
+    async def user_trades(self, symbol: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None,
+                          limit: int = 1000) -> list:
+        """Fills del símbolo (los más recientes de la ventana, máx. 7 días; peso 5)."""
+        params: dict = {"symbol": symbol, "limit": limit}
+        if start_ms:
+            params["startTime"] = int(start_ms)
+        if end_ms:
+            params["endTime"] = int(end_ms)
+        data = await self.request("GET", "/fapi/v1/userTrades", params, signed=True, timeout=10)
         return data if isinstance(data, list) else []
 
     async def open_algo_orders(self) -> list:

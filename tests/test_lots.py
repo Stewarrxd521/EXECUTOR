@@ -133,8 +133,8 @@ async def test_adopted_position_is_closed_by_any_trade_id(service, fake):
     del t.trades[trade.key]                      # se perdió trades.json: la posición se adopta sin lotes
     await wait_for(lambda: service.core.account.position(SYM, "LONG") is not None)
     assert t.adopt_untracked() == 1 and not t.get_trade(SYM, "LONG").lot_tracked
-    close(t, 99)
-    await wait_for(lambda: amt(fake) == 0 and t.get_trade(SYM, "LONG") is None)
+    close(t, 99)                                 # se reintenta; en el último intento, la regla de antes
+    await wait_for(lambda: amt(fake) == 0 and t.get_trade(SYM, "LONG") is None, timeout=20)
 
 
 async def test_simultaneous_closes_of_several_trade_ids_all_execute(service, fake):

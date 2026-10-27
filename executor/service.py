@@ -140,10 +140,6 @@ class ExecutorService:
         if s.has_credentials:
             try:
                 await self.sync_account("arranque")
-                if s.adopt_positions:
-                    n = self.trades.adopt_untracked()
-                    if n:
-                        log.warning("%d posición(es) real(es) sin trade registrado se adoptaron como trades", n)
             except Exception as exc:
                 diag = ErrorDoctor.diagnose(exc)
                 self.core.journal.record(diag, "sync.arranque")
@@ -227,6 +223,12 @@ class ExecutorService:
         self.core.account.apply_positions_snapshot(positions, as_of=asked)
         await self.refresh_balance(force=True)
         self.trades.reconcile_after_sync(as_of=asked)
+        if self.settings.adopt_positions and not self.trades.adopted:
+            # Primera lectura de la cuenta (al arrancar, o más tarde si entonces falló): las posiciones sin
+            # trade (trades.json perdido) se adoptan y sus lotes se rehacen con el historial de Binance.
+            n = self.trades.adopt_untracked()
+            if n:
+                log.warning("%d posición(es) real(es) sin trade registrado se adoptaron como trades", n)
         self.trades.ready.set()
         acct = self.core.account
         log.info("Cuenta sincronizada (%s): %d posiciones, modo %s, %d leverages en caché",
@@ -980,7 +982,7 @@ class ExecutorService:
                                desired_notional=notional, ref_price=limit_price)
             owner = {"kind": "limit_entry", "symbol": symbol, "direction": direction, "leverage": lev_eff}
             result, params = await self.orders.limit(ctx, qty, rules.round_price(limit_price, "down" if side == "BUY" else "up"),
-                                                     prefix="M", owner=owner)
+                                                     prefix="X0", owner=owner)  # lote «0» (manual)
             self.core.bus.emit("order", f"LIMIT {direction} {symbol} {fmt(qty)} @ {params.get('price')}", "success")
             return {"order_id": result.get("orderId"), "qty": fmt(qty), "price": params.get("price")}
         trade = await self.trades.open_trade(symbol, direction, notional=notional, source="manual", leverage=lev)
