@@ -94,6 +94,7 @@ class ExecutorService:
         logging.getLogger().addHandler(self.logs)
         self.history: dict[str, deque] = {}
         self.watch: dict[str, float] = {}
+        self._one_way_warned = False
         self._bad_symbols: dict[str, float] = {}   # símbolo -> cuándo Binance dijo que no existe (-1121)
         self._tasks: list[asyncio.Task] = []
         self._balance_dirty = False
@@ -139,10 +140,6 @@ class ExecutorService:
         if s.has_credentials:
             try:
                 await self.sync_account("arranque")
-                if s.adopt_positions:
-                    n = self.trades.adopt_untracked()
-                    if n:
-                        log.warning("%d posición(es) real(es) sin trade registrado se adoptaron como trades", n)
             except Exception as exc:
                 diag = ErrorDoctor.diagnose(exc)
                 self.core.journal.record(diag, "sync.arranque")
@@ -226,10 +223,24 @@ class ExecutorService:
         self.core.account.apply_positions_snapshot(positions, as_of=asked)
         await self.refresh_balance(force=True)
         self.trades.reconcile_after_sync(as_of=asked)
+        if self.settings.adopt_positions and not self.trades.adopted:
+            # Primera lectura de la cuenta (al arrancar, o más tarde si entonces falló): las posiciones sin
+            # trade (trades.json perdido) se adoptan y sus lotes se rehacen con el historial de Binance.
+            n = self.trades.adopt_untracked()
+            if n:
+                log.warning("%d posición(es) real(es) sin trade registrado se adoptaron como trades", n)
         self.trades.ready.set()
         acct = self.core.account
         log.info("Cuenta sincronizada (%s): %d posiciones, modo %s, %d leverages en caché",
                  reason, len(acct.positions), "Hedge" if acct.is_hedge else "One-way", len(acct.leverage))
+        if acct.hedge_mode is False and not self._one_way_warned:
+            self._one_way_warned = True
+            msg = ("La cuenta de Binance Futures está en modo One-way: si dos bots abren LONG y SHORT en el mismo "
+                   "símbolo, Binance las compensa en una sola posición. Activa Hedge mode (Preferencias → Modo de "
+                   "posición) para que cada dirección tenga su posición.")
+            log.warning(msg)
+            self.core.bus.emit("position_mode", msg, "warning")
+            self.core.telegram.send(f"⚠️ <b>Modo One-way</b>\n{msg}")
 
     async def refresh_balance(self, force: bool = False) -> None:
         if not force and time.time() - self._last_balance < 3:
@@ -401,6 +412,9 @@ class ExecutorService:
             needed = self._want_market()
             if not self._traffic_samples or now - self._traffic_samples[-1][0] >= 60:
                 self._traffic_samples.append((now, self._traffic_totals()))
+            if int(now) % 15 == 0 and (self.trades._lot_attempts or self.trades._detached):
+                # Cierres de lote sin respuesta de Binance: se confirman aunque el bot ya no reintente.
+                self.trades._spawn(self.trades.verify_lot_attempts())
             market = self.core.market
             try:
                 await market.sync_subscriptions()
@@ -503,6 +517,7 @@ class ExecutorService:
                 "source": "grid" if grid else (trade.source if trade else "externa"),
                 "trade_id": trade.id if trade else None, "paper_id": trade.paper_trade_id if trade else None,
                 "paper_ids": trade.paper_ids if trade else [], "levels": trade.to_dict()["levels"] if trade else [],
+                "lots": trade.lots_view() if trade else [],
                 "multiplier": trade.multiplier if trade else 1.0,
                 "open_time": trade.open_time if trade else "", "assumed": False,
                 "fees": trade.fees_usdt if trade else 0.0,
@@ -518,7 +533,7 @@ class ExecutorService:
                 "roe": t.roe_pct, "notional": t.notional_usdt, "margin": t.margin_usdt, "leverage": t.leverage,
                 "margin_type": "", "liq": 0.0, "tp": t.tp_price, "sl": t.sl_price,
                 "source": t.source, "trade_id": t.id, "paper_id": t.paper_trade_id, "paper_ids": t.paper_ids,
-                "levels": t.to_dict()["levels"], "open_time": t.open_time, "multiplier": t.multiplier,
+                "levels": t.to_dict()["levels"], "lots": t.lots_view(), "open_time": t.open_time, "multiplier": t.multiplier,
                 "assumed": t.order_assumed or not self.settings.has_credentials, "fees": t.fees_usdt,
             })
         rows.sort(key=lambda r: (r["symbol"], r["direction"]))
@@ -532,7 +547,7 @@ class ExecutorService:
         for r in rows:
             cid = r.get("client_id", "")
             r["origin"] = ("grid" if cid.startswith("G") else "tp/sl" if r["kind"] == "algo"
-                           else "executor" if cid[:1] in ("X", "C", "M", "L") else "externa")
+                           else "executor" if cid[:1] in ("X", "C", "K", "M", "L") else "externa")
         rows.sort(key=lambda r: r["time"], reverse=True)
         return rows
 
@@ -967,7 +982,7 @@ class ExecutorService:
                                desired_notional=notional, ref_price=limit_price)
             owner = {"kind": "limit_entry", "symbol": symbol, "direction": direction, "leverage": lev_eff}
             result, params = await self.orders.limit(ctx, qty, rules.round_price(limit_price, "down" if side == "BUY" else "up"),
-                                                     prefix="M", owner=owner)
+                                                     prefix="X0", owner=owner)  # lote «0» (manual)
             self.core.bus.emit("order", f"LIMIT {direction} {symbol} {fmt(qty)} @ {params.get('price')}", "success")
             return {"order_id": result.get("orderId"), "qty": fmt(qty), "price": params.get("price")}
         trade = await self.trades.open_trade(symbol, direction, notional=notional, source="manual", leverage=lev)

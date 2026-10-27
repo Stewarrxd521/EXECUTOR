@@ -404,6 +404,8 @@ def build_app(service: ExecutorService) -> web.Application:
             return json_response({"ok": False, "error": "unauthorized"}, 401)
         wait = parse_bool(request.query.get("wait", data.pop("wait", None)), False)
         signal_id = request.headers.get("Idempotency-Key", "") or request.headers.get("X-Signal-Id", "")
+        if request.match_info.get("bot") and not data.get("bot"):
+            data["bot"] = request.match_info["bot"]  # EXECUTOR_URL=https://…/b/<bot>: identidad del bot
         status, body = await trades.submit_signal(data, source="http", ip=ip, wait=wait, signal_id=signal_id)
         return json_response(body, status)
 
@@ -428,6 +430,8 @@ def build_app(service: ExecutorService) -> web.Application:
                 await ws.send_str(dumps({"ok": False, "error": "invalid json", "status": 400}))
                 continue
             req_id = data.get("id")
+            if request.match_info.get("bot") and not data.get("bot"):
+                data["bot"] = request.match_info["bot"]
             if not authed:
                 secret = str(data.get("secret") or data.get("token") or "")
                 if not settings.check_signal_secret(secret):
@@ -491,7 +495,7 @@ def build_app(service: ExecutorService) -> web.Application:
         resp = await handler(request)
         body = getattr(resp, "body", None)
         if isinstance(body, (bytes, bytearray)):
-            key = "api_state" if request.path.startswith("/api/state") else "http"
+            key = "api_state" if request.path.rstrip("/").endswith("/api/state") else "http"
             service.web_traffic[key] += len(body)
         return resp
 
@@ -505,6 +509,13 @@ def build_app(service: ExecutorService) -> web.Application:
     add_route(app, "GET", "/api/state", api_state)
     add_route(app, "GET", "/health", health)
     add_route(app, "GET", "/ready", ready)
+    # Cada bot puede identificarse solo con su EXECUTOR_URL (https://…/b/<bot>): sus trade_id no se
+    # mezclan con los de otros bots aunque usen los mismos números en el mismo símbolo.
+    add_route(app, "POST", "/b/{bot}/signal", signal)
+    add_route(app, "GET", "/b/{bot}/api/state", api_state)
+    add_route(app, "GET", "/b/{bot}/health", health)
+    add_route(app, "GET", "/b/{bot}/ready", ready)
+    app.router.add_get("/b/{bot}/ws/signal", signal_ws)
     register_rest(app, service, auth)
     register_legacy(app, service, auth)
     app.router.add_get("/static/{name:app\\.(?:js|css)}", static_asset)

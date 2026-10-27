@@ -581,9 +581,9 @@ async def test_close_with_only_trade_id_before_open(service, fake):
 
 async def test_rejected_trade_id_still_closes_real_untracked_position(service, fake):
     t = service.trades
-    trade = await t.open_trade("ETHUSDT", "SHORT", notional=30)
+    trade = await t.open_trade("ETHUSDT", "SHORT", notional=30, paper_trade_id=31)
     t._unmap_trade(trade)
-    del t.trades[trade.key]  # posición real que el executor no tiene registrada
+    del t.trades[trade.key]  # posición real que el executor no tiene registrada (su lote sale del historial)
     t._rejected_ids[(31, "ETHUSDT")] = __import__("time").time()
     t.handle_signal({"action": "close", "trade_id": 31, "symbol": "ETHUSDT", "direction": "SHORT", "reason": "SL"})
     await wait_for(lambda: fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0)

@@ -50,6 +50,8 @@ class FillResult:
     step: Decimal = Decimal("1")
     fixes: list = field(default_factory=list)
     status: str = ""
+    update_ms: int = 0  # hora (de Binance) del último fill
+    by_cid: dict = field(default_factory=dict)  # clientOrderId -> cantidad llenada
 
     @property
     def ok(self) -> bool:
@@ -150,14 +152,16 @@ class OrderExecutor:
                 if action == Action.CHECK_STATUS:
                     await asyncio.sleep(1.0)  # dar tiempo a que el motor registre la orden
                     status, definitive = await self.lookup_order(ctx.symbol, client_id=params["newClientOrderId"])
-                    if status and status.get("status") not in ("REJECTED", "EXPIRED", "CANCELED"):
+                    if status and (status.get("status") not in ("REJECTED", "EXPIRED", "CANCELED")
+                                   or safe_float(status.get("executedQty")) > 0):
+                        # Se ejecutó (aunque sea en parte, p. ej. una IOC que expiró): no se reenvía entera.
                         notes.append("estado confirmado con order.status (no se duplicó la orden)")
                         self.core.journal.mark_fixed(entry, notes[-1])
                         return status, notes
                     if not definitive:
                         # No se pudo confirmar: reenviar podría duplicar la orden.
                         raise
-                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].split("-")[0])
+                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].rsplit("-", 1)[0])
                     notes.append("orden no registrada en Binance; reenviada con nuevo clientOrderId")
                     continue
                 if action in (Action.RETRY, Action.RESYNC_TIME):
@@ -165,7 +169,7 @@ class OrderExecutor:
                     notes.append("reintento tras error transitorio")
                     continue
                 if action == Action.NEW_CLIENT_ID:
-                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].split("-")[0])
+                    params["newClientOrderId"] = new_client_id(params["newClientOrderId"].rsplit("-", 1)[0])
                     notes.append("nuevo clientOrderId")
                     continue
                 if action == Action.DROP_REDUCE_ONLY and "reduceOnly" in params:
@@ -305,11 +309,14 @@ class OrderExecutor:
                 safe_float(result.get("origQty")) if result.get("status") in ("FILLED", "NEW") else 0.0)
             avg = safe_float(result.get("avgPrice")) or safe_float(result.get("price")) or self.mark(ctx.symbol) or ctx.ref_price
             fill.status = result.get("status", "")
+            fill.update_ms = max(fill.update_ms, int(safe_float(result.get("updateTime"))))
             if executed > 0:
                 fill.qty += executed
                 notional += executed * avg
             fill.order_ids.append(result.get("orderId", ""))
-            fill.client_ids.append(params["newClientOrderId"])
+            cid = result.get("clientOrderId") or params["newClientOrderId"]
+            fill.client_ids.append(cid)
+            fill.by_cid[cid] = fill.by_cid.get(cid, 0.0) + executed
             fill.position_side = params.get("positionSide", "BOTH")
             fill.step = ctx.rules.qty_step(True)
         fill.avg_price = notional / fill.qty if fill.qty else 0.0

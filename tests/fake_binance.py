@@ -54,8 +54,12 @@ class FakeBinance:
         self.true_steps = {s: Decimal(r["step"]) for s, r in RULES.items()}
         self.true_steps.update({k: Decimal(v) for k, v in (true_steps or {}).items()})
         self.positions: dict[tuple[str, str], dict] = {}
+        self.done_orders: dict[int, dict] = {}  # órdenes ya ejecutadas (siguen visibles en order.status)
         self.orders: dict[int, dict] = {}
         self.algos: dict[int, dict] = {}
+        self.history: dict[int, dict] = {}       # órdenes con algo ejecutado (GET /fapi/v1/allOrders)
+        self.user_fills: list[dict] = []         # cada fill (GET /fapi/v1/userTrades)
+        self.all_orders_error = False
         self.leverage: dict[str, int] = {s: 20 for s in self.marks}
         self.wallet = 10_000.0
         self.seq = 1000
@@ -83,6 +87,8 @@ class FakeBinance:
         app.router.add_post("/fapi/v1/leverage", self._rest_leverage)
         app.router.add_get("/fapi/v1/openOrders", self._rest_open_orders)
         app.router.add_get("/fapi/v1/openAlgoOrders", self._rest_open_algos)
+        app.router.add_get("/fapi/v1/allOrders", self._rest_all_orders)
+        app.router.add_get("/fapi/v1/userTrades", self._rest_user_trades)
         app.router.add_get("/fapi/v1/exchangeInfo", self._rest_exinfo)
         app.router.add_get("/fapi/v1/leverageBracket", self._rest_brackets)
         app.router.add_get("/fapi/v1/positionSide/dual", self._rest_position_mode)
@@ -162,22 +168,36 @@ class FakeBinance:
                 pos["entry"] = price
         self.wallet += realized - price * qty * 0.0004
         order["executedQty"] = float(order.get("executedQty", 0)) + qty
+        self.history[order["orderId"]] = order  # GET /fapi/v1/allOrders
         order["avgPrice"] = price
         order["status"] = "FILLED"
-        self.push(self._otu(order, "TRADE", last_qty=qty, last_price=price, realized=realized))
+        event = self._otu(order, "TRADE", last_qty=qty, last_price=price, realized=realized)
+        self.user_fills.append({"symbol": sym, "id": len(self.user_fills) + 1, "orderId": order["orderId"],
+                                "side": side, "positionSide": ps, "price": str(price), "qty": str(qty),
+                                "realizedPnl": str(realized), "commission": str(price * qty * 0.0004),
+                                "commissionAsset": "USDT", "time": event["T"], "buyer": side == "BUY",
+                                "maker": False})
+        self.push(event)
         self.push({"e": "ACCOUNT_UPDATE", "E": int(time.time() * 1000), "a": {
             "m": "ORDER", "B": [{"a": "USDT", "wb": str(self.wallet), "cw": str(self.wallet), "bc": "0"}],
             "P": [{"s": sym, "pa": str(pos["amt"]), "ep": str(pos["entry"]), "bep": str(pos["entry"]), "cr": "0",
                    "up": "0", "mt": "cross", "iw": "0", "ps": ps}]}})
         return realized
 
+    def _ms(self) -> int:
+        """Hora de Binance en ms, estrictamente creciente (dos fills seguidos nunca empatan)."""
+        self._last_ms = max(getattr(self, "_last_ms", 0) + 1, int(time.time() * 1000))
+        return self._last_ms
+
     def _otu(self, o: dict, exec_type: str, last_qty: float = 0.0, last_price: float = 0.0, realized: float = 0.0) -> dict:
-        return {"e": "ORDER_TRADE_UPDATE", "E": int(time.time() * 1000), "T": int(time.time() * 1000), "o": {
+        now = self._ms()
+        o["updateTime"] = now
+        return {"e": "ORDER_TRADE_UPDATE", "E": now, "T": now, "o": {
             "s": o["symbol"], "c": o["clientOrderId"], "S": o["side"], "o": o["type"], "ot": o.get("origType", o["type"]),
             "f": o.get("timeInForce", "GTC"), "q": str(o["origQty"]), "p": str(o.get("price", 0)),
             "ap": str(o.get("avgPrice", 0)), "sp": "0", "x": exec_type, "X": o["status"], "i": o["orderId"],
             "l": str(last_qty), "z": str(o.get("executedQty", 0)), "L": str(last_price), "N": "USDT",
-            "n": str(last_price * last_qty * 0.0004), "T": int(time.time() * 1000), "t": self._next(),
+            "n": str(last_price * last_qty * 0.0004), "T": now, "t": self._next(),
             "m": o["type"] == "LIMIT", "R": o.get("reduceOnly", False), "ps": o["positionSide"], "cp": False,
             "rp": str(realized)}}
 
@@ -262,8 +282,9 @@ class FakeBinance:
             return {"orderId": o["orderId"], "status": "CANCELED"}
         if method == "order.status":
             oid = int(p.get("orderId") or 0)
-            o = self.orders.get(oid) or next((x for x in self.orders.values()
-                                              if x["clientOrderId"] == p.get("origClientOrderId")), None)
+            known = {**self.done_orders, **self.orders}
+            o = known.get(oid) or next((x for x in known.values()
+                                        if x["clientOrderId"] == p.get("origClientOrderId")), None)
             if o is None:
                 raise _Err(-2013, "Order does not exist.")
             return dict(o)
@@ -317,10 +338,12 @@ class FakeBinance:
         if p["type"] == "MARKET":
             self.push(self._otu(order, "NEW"))
             self._apply_fill(order, self.marks[sym], float(qty))
+            self.done_orders[oid] = order  # Binance las sigue respondiendo en order.status
             return {**order, "executedQty": str(order["executedQty"]), "avgPrice": str(order["avgPrice"])}
         crosses = (p["side"] == "BUY" and price >= self.marks[sym]) or (p["side"] == "SELL" and price <= self.marks[sym])
         if crosses:
             self._apply_fill(order, self.marks[sym], float(qty))
+            self.done_orders[oid] = order
             return {**order, "executedQty": str(order["executedQty"]), "avgPrice": str(order["avgPrice"])}
         self.orders[oid] = order
         self.push(self._otu(order, "NEW"))
@@ -421,6 +444,29 @@ class FakeBinance:
     async def _rest_open_orders(self, request: web.Request) -> web.Response:
         self.rest_calls.append("openOrders")
         return web.json_response([dict(o, time=int(time.time() * 1000)) for o in self.orders.values()])
+
+    async def _rest_all_orders(self, request: web.Request) -> web.Response:
+        self.rest_calls.append("allOrders")
+        if self.all_orders_error:
+            return web.json_response({"code": -1001, "msg": "Internal error"}, status=500)
+        sym, limit = request.query.get("symbol"), min(int(request.query.get("limit", 500)), 1000)
+        rows = sorted((dict(o, executedQty=str(o["executedQty"]), avgPrice=str(o["avgPrice"]),
+                            origType=o.get("origType", o["type"]), time=o.get("updateTime", 0))
+                       for o in self.history.values() if o["symbol"] == sym), key=lambda o: o["orderId"])
+        if request.query.get("orderId"):
+            first = int(request.query["orderId"])
+            return web.json_response([o for o in rows if o["orderId"] >= first][:limit])
+        return web.json_response(rows[-limit:])
+
+    async def _rest_user_trades(self, request: web.Request) -> web.Response:
+        self.rest_calls.append("userTrades")
+        if self.all_orders_error:
+            return web.json_response({"code": -1001, "msg": "Internal error"}, status=500)
+        q = request.query
+        sym, limit = q.get("symbol"), min(int(q.get("limit", 500)), 1000)
+        start, end = int(q.get("startTime", 0)), int(q.get("endTime", 2 ** 62))
+        rows = [f for f in self.user_fills if f["symbol"] == sym and start <= f["time"] <= end]
+        return web.json_response(rows[-limit:])
 
     async def _rest_open_algos(self, request: web.Request) -> web.Response:
         self.rest_calls.append("openAlgoOrders")
