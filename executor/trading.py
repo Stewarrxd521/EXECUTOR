@@ -281,6 +281,7 @@ class Trade:
     rebuild: bool = False
     legacy: bool = False
     history_ms: int = 0
+    named_bots: list = field(default_factory=list)  # bots que ya abrieron con nombre en esta posición
     # TP/SL colocado desde la señal de un trade_id: su fill se descuenta primero de ese lote.
     protect_lots: dict = field(default_factory=dict)
 
@@ -1165,6 +1166,8 @@ class TradeManager:
         ref = lot_ref(bot, paper_id)
         lk = Trade.lot_key(ref)
         owner = self._unknown_owner.pop((symbol, direction), None)
+        first = self.trades.get((symbol, direction))
+        ledger0 = first.ledger_qty if first is not None and not first.order_assumed else 0.0
         try:
             for delay in UNKNOWN_OPEN_CHECKS:
                 await asyncio.sleep(delay)
@@ -1200,6 +1203,9 @@ class TradeManager:
                             # Un cierre de otro lote ya vio esta apertura como «sin dueño»: sigue siendo suya.
                             tracked -= min(ant["open"], trade.unassigned)
                         real = pos.qty if pos is not None else 0.0
+                        # Lo que ya había (``baseline``), menos lo que se cerró desde entonces (otros lotes).
+                        baseline = max(0.0, baseline - max(0.0, ledger0 - tracked))
+                        ledger0 = tracked
                         if pos is None or real - max(baseline, tracked) <= tol:
                             if confirmed:
                                 log.info("%s %s: la apertura de estado desconocido no se ejecutó", direction, symbol)
@@ -1676,6 +1682,8 @@ class TradeManager:
             if new and trade is not None and prior is not None and hedge:
                 trade.credit("", prior.qty)
             self._credit_fills(trade, fill, lk)
+            if trade is not None and bot and bot not in trade.named_bots:
+                trade.named_bots.append(bot)
             self.core.account.mark_updated(symbol, direction)
             if fill.fixes:
                 log.info("Apertura %s corregida automáticamente: %s", symbol, "; ".join(fill.fixes))
@@ -2193,7 +2201,8 @@ class TradeManager:
             named = [k for k in list(trade.lots) + list(trade.assumed_lots) if k.endswith(":" + plain)]
             rows = trade.lot_tranches(plain)
             since = self._bot_first_seen.get(bot, 0.0)
-            if plain in trade.lots and not named and rows and not any(t.get("bot") for t in rows) \
+            used = bot in trade.named_bots or any(t.get("bot") == bot for t in trade.tranches)
+            if plain in trade.lots and not named and not used and rows and not any(t.get("bot") for t in rows) \
                     and all(safe_float(t.get("ts")) < since for t in rows):
                 lk = plain
 
@@ -2641,11 +2650,11 @@ class TradeManager:
             self.save()
             return
         if ant and ant["reduce"] > 0:
+            # Este fill ya se había descontado al ver el hueco (en proporción, sin saber de quién era): se
+            # deshace ese reparto y se descuenta ahora con la regla de este fill (su TP/SL, ADL…).
             use = min(ant["reduce"], qty)
             ant["reduce"] -= use
-            qty -= use
-        if qty <= 0:
-            return
+            qty -= use - self._undo_guess(trade, ant, use)
         kind = "TP" if upd.orig_type.startswith("TAKE_PROFIT") else "SL" if upd.orig_type.startswith("STOP") else ""
         cid = upd.client_id.lower()
         if kind and trade.protect_lots.get(kind) in trade.lots:
@@ -2661,9 +2670,47 @@ class TradeManager:
                 if safe_float(t.get("fill_ms")) > upd.trade_time and not t.get("assumed"):
                     k = Trade.lot_key(lot_ref(t.get("bot", ""), t.get("trade_id", 0)))
                     newer[k] = newer.get(k, 0.0) + safe_float(t.get("qty"))
-        for lk in trade.debit(policy, qty, newer):
-            self._lot_emptied(trade, lk)
+        if qty > 1e-12:
+            for lk in trade.debit(policy, qty, newer):
+                self._lot_emptied(trade, lk)
+        self._close_corrected_lots(trade, ant)
         self.save()
+
+    def _undo_guess(self, trade: Trade, ant: dict, qty: float) -> float:
+        """Devuelve a cada lote (y a lo sin dueño) su parte de ``qty`` del reparto provisional de un hueco."""
+        guess = ant.get("guess") or {}
+        total = sum(guess.values())
+        if total <= 1e-12:
+            return 0.0
+        share = min(1.0, qty / total)
+        back = 0.0
+        for k, v in list(guess.items()):
+            q = v * share
+            guess[k] = v - q
+            back += q
+            if k == "":
+                trade.credit("", q)
+                continue
+            revived = k not in trade.lots
+            trade.credit(k, q)
+            if revived:  # el reparto lo había dejado en cero: vuelve a ser de su trade_id
+                self._map_paper(trade, _split_ref(k)[0])
+            ant.setdefault("credited", set()).add(k)
+        return back
+
+    def _close_corrected_lots(self, trade: Trade, ant: Optional[dict]) -> None:
+        """Un trade_id que ya cerró (con el reparto provisional) recupera cantidad al corregirlo: se cierra."""
+        if not ant:
+            return
+        tol = (safe_float(trade.step_size) or 0.0) / 2 or 1e-12
+        for k in list(ant.pop("credited", set())):
+            tid, bot = _split_ref(k)
+            ref = lot_ref(bot, tid)
+            if trade.lots.get(k, 0.0) > tol and self._closed_recently(ref, trade.symbol, trade.direction) is not None:
+                log.warning("%s %s: el trade_id %s ya cerró pero le quedaban %s; se cierran también", trade.symbol,
+                            trade.direction, k, trade.lots[k])
+                self._spawn(self._deferred_close(trade.symbol, trade.direction, tid, bot, {
+                    "reason": "BOTCLOSE", "close_price": 0.0, "bot_pnl": None}, "corregido"))
 
     def _lot_emptied(self, trade: Trade, lk: str) -> None:
         """Un lote quedó a cero por un fill de fuera (su TP/SL, ADL…): su close posterior no toca nada."""
@@ -2719,8 +2766,15 @@ class TradeManager:
             gap -= q
         if gap > tol:
             ant["reduce"] += gap
+            before = dict(trade.lots, **{"": trade.unassigned})
             for lk in trade.debit("*", gap):
                 self._lot_emptied(trade, lk)
+            # Reparto provisional: cuando llegue el evento real se deshace y se aplica su regla (TP/SL, ADL…).
+            guess = ant.setdefault("guess", {})
+            for k, v in before.items():
+                taken = v - (trade.unassigned if k == "" else trade.lots.get(k, 0.0))
+                if taken > 1e-12:
+                    guess[k] = guess.get(k, 0.0) + taken
         self.save()
 
     def _owned_cids(self, owner: Any) -> list[str]:
@@ -2932,12 +2986,13 @@ class TradeManager:
             if trigger <= 0:
                 continue
             try:
-                await self.set_protection(trade.symbol, trade.direction, kind, trigger, lot=lk)
+                await self.set_protection(trade.symbol, trade.direction, kind, trigger, lot=lk, lot_only=True)
             except BinanceAPIError as err:
                 log.warning("%s %s: no se pudo volver a poner el %s del trade_id %s (%s)", trade.symbol,
                             trade.direction, kind, lk, ErrorDoctor.diagnose(err).summary())
 
-    async def set_protection(self, symbol: str, direction: str, kind: str, trigger: float, lot: Any = 0) -> dict:
+    async def set_protection(self, symbol: str, direction: str, kind: str, trigger: float, lot: Any = 0,
+                             lot_only: bool = False) -> dict:
         """TP/SL de la posición. ``lot``: el trade_id que lo pidió. Si en la posición solo está su lote, cubre
         la cantidad de ese lote y su fill se descuenta de él; si hay más (otros lotes o cantidad sin dueño),
         cubre la posición entera y no es de ningún lote (el cierre de un trade_id no lo cancela)."""
@@ -2946,8 +3001,8 @@ class TradeManager:
         pos = self.core.account.position(symbol, direction)
         own = Trade.lot_key(lot) if lot else ""
         tol = (safe_float(trade.step_size) / 2 if trade is not None else 0.0) or 1e-12
-        alone = trade is not None and own in trade.lots and trade.unassigned <= tol \
-            and not [k for k in trade.lots if k != own] and not trade.assumed_lots
+        alone = trade is not None and own in trade.lots and (lot_only or (
+            trade.unassigned <= tol and not [k for k in trade.lots if k != own] and not trade.assumed_lots))
         if alone:
             qty = trade.lots[own]
         else:
