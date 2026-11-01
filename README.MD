@@ -41,6 +41,34 @@ Código en el paquete `executor/`:
 | `service.py` | Orquestación y comandos del dashboard |
 | `web/` | Servidor HTTP/WebSocket y dashboard |
 
+## Operaciones de milisegundos (latencia)
+
+El executor envía la orden en cuanto recibe la señal: dentro del proceso tarda ~1 ms (señal → orden enviada,
+medido con el simulador). Lo que domina en real es la red hasta Binance: cada consulta previa a la orden suma una
+ida y vuelta completa. Con `FAST_SIGNALS=true` (por defecto) no se hace ninguna cuando lo que ya se sabe basta:
+
+- **Apertura:** si la señal trae `price` y `quantity` (o `notional`) y no hay precio de mercado fresco, se usa el
+  de la señal en vez de consultar `ticker.price`.
+- **Cierre:** si la posición que el user stream ya informó cuadra con el libro de lotes y no hay nada pendiente de
+  confirmar, la orden sale sin releer la posición (con el user stream conectado y estable). Las órdenes de cierre
+  son `reduceOnly` y nunca piden más que el lote, así que no pueden cerrar de más. Si algo no cuadra, se relee.
+- Un `open` y su `close` que llegan en el mismo milisegundo se ejecutan en orden: el `close` espera a su `open`.
+
+Con 25 ms de ida y vuelta a Binance (medido con el simulador): apertura ~51 ms (antes ~101), cierre de un lote
+~15 ms (antes ~43). Compromiso del modo rápido: si en esos mismos milisegundos alguien cierra parte de la posición
+por fuera (ADL, otro bot, a mano) y el user stream aún no lo avisó, esa reducción no se reparte en proporción
+entre los lotes. `FAST_SIGNALS=false` relee siempre la posición antes de cerrar (+1 ida y vuelta).
+
+Para que en real las operaciones de milisegundos lleguen a tiempo:
+
+- **Región del servidor:** los servidores de Binance Futures están en Tokio (AWS ap-northeast-1). En Render, la
+  región más cercana es **Singapur** (~70 ms de ida y vuelta); desde Frankfurt son ~200–250 ms. Desde EE. UU.
+  Binance bloquea el acceso.
+- **Señales por WebSocket:** que los bots envíen por `/ws/signal` (conexión abierta) en vez de `POST /signal`
+  ahorra el handshake TLS/HTTP de cada señal.
+- **Bots en la misma región** que el executor.
+- Esto no es HFT de colocación (microsegundos): para eso hace falta un servidor junto a Binance y conexión directa.
+
 ## Ancho de banda (Render)
 
 Render factura el tráfico **de salida**. En las conexiones que abre el executor (Binance, proxy, Telegram,

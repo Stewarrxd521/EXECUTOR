@@ -572,6 +572,7 @@ class TradeManager:
         self._detached: list[dict] = []                # cierres de lote sin confirmar de trades ya cerrados del todo
         self._rebuilding: set[tuple[str, str]] = set()  # posiciones adoptadas cuyos lotes se rehacen al arrancar
         self._rebuild_tried: dict[tuple[str, str], float] = {}
+        self.user_conn = None                         # conexión del user stream (la pone el servicio)
         self._fired: dict[tuple, list] = {}            # posición -> TP/SL de trade_id disparados, aún sin su fill
         self._fired_orders: dict[int, str] = {}        # orderId de la orden que creó un TP/SL al dispararse -> lote
         self.adopted = False                          # ya se adoptaron las posiciones sin trade (1.ª lectura)
@@ -1611,7 +1612,11 @@ class TradeManager:
                 if age is not None:
                     self._skipped_closed[signal_id] = age
                     return None
-            ref = await self.reference_price(symbol, signal_price)
+            if signal_price > 0 and (quantity > 0 or notional > 0) and self.settings.fast_signals and \
+                    not self.core.market.mark(symbol, max_age_s=self.settings.max_price_age_s):
+                ref = signal_price  # la señal trae precio y cantidad: no se espera una consulta de precio
+            else:
+                ref = await self.reference_price(symbol, signal_price)
             if ref <= 0:
                 self.core.bus.emit("open_failed", f"{symbol}: sin precio disponible", "error", symbol=symbol)
                 return None
@@ -2000,6 +2005,22 @@ class TradeManager:
         )
 
     # ── Cierre ────────────────────────────────────────────────────────────
+    async def _position_for_close(self, trade: Trade) -> tuple[Optional[Position], bool]:
+        """Posición para un cierre. Si la que ya se conoce por el user stream cuadra con el libro de lotes (y no
+        hay nada pendiente de confirmar), se usa sin releerla: la orden sale una ida y vuelta antes. Las órdenes
+        de cierre son reduceOnly y nunca piden más que el lote, así que no pueden cerrar de más; si algo no
+        cuadra, se relee de Binance como siempre."""
+        conn = self.user_conn
+        stable = conn is not None and conn.connected and time.time() - conn.connected_since > 2.0
+        if self.settings.fast_signals and stable and not trade.order_assumed and not trade.rebuild:
+            pos = self.core.account.position(trade.symbol, trade.direction)
+            tol = (safe_float(trade.step_size) or 0.0) / 2 or 1e-12
+            pending = any(k[0] == trade.key for k in self._lot_attempts) or self._anticipation(trade.key) is not None
+            if pos is not None and not pending and abs(pos.qty - trade.ledger_qty) <= tol \
+                    and abs(pos.qty - trade.quantity) <= tol and not self.inflight(trade.symbol):
+                return pos, True
+        return await self._fresh_position(trade.symbol, trade.direction)
+
     async def _fresh_position(self, symbol: str, direction: str) -> tuple[Optional[Position], bool]:
         """Posición real del símbolo consultada AHORA por WS API.
 
@@ -2054,7 +2075,7 @@ class TradeManager:
         key = trade.key
         if close_price:
             trade.signal_close_price = close_price
-        pos, known = await self._fresh_position(trade.symbol, trade.direction)
+        pos, known = await self._position_for_close(trade)
         market_px = self.core.market.price(trade.symbol)
         if pos is None and (known or trade.order_assumed):
             if not trade.order_assumed:
@@ -2204,7 +2225,7 @@ class TradeManager:
             self._close_retryable[key] = True
             return False
         self._claim_cid_lot(trade, lot)
-        pos, known = await self._fresh_position(trade.symbol, trade.direction)
+        pos, known = await self._position_for_close(trade)
         base = pos.qty if pos is not None else (0.0 if known or trade.order_assumed else trade.real_quantity)
         if not trade.order_assumed:
             await self._reconcile_gap(trade, base, tol)

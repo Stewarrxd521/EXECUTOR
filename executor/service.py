@@ -89,6 +89,7 @@ class ExecutorService:
         self.trades.grid_owner = self.grids.owns
         self.grids.trade_owner = lambda s, d: self.trades.get_trade(s, d) is not None
         self.user = UserDataStream(settings.stream_base_url, ws, clock, self._on_user_event, self._on_user_connect)
+        self.trades.user_conn = self.user.conn
         market.on_tick(self._on_market_tick)
         self.logs = LogBuffer()
         logging.getLogger().addHandler(self.logs)

@@ -90,6 +90,7 @@ class Settings:
     assume_on_margin_error: bool = True
     margin_auto_reduce: bool = False
     max_price_age_s: float = 5.0
+    fast_signals: bool = True   # HFT: sin consultas previas a Binance cuando lo conocido ya basta (FAST_SIGNALS)
     signal_dedupe_ttl_s: float = 0.0
     signal_wait_timeout_s: float = 7.0
 
@@ -246,6 +247,7 @@ def load_settings() -> Settings:
         assume_on_margin_error=_env_bool("ASSUME_ON_MARGIN_ERROR", True),
         margin_auto_reduce=_env_bool("MARGIN_AUTO_REDUCE", False),
         max_price_age_s=_env_float("MAX_PRICE_AGE_S", 5.0),
+        fast_signals=_env_bool("FAST_SIGNALS", True),
         signal_dedupe_ttl_s=_env_float("SIGNAL_DEDUPE_TTL_S", 0.0),
         signal_wait_timeout_s=_env_float("SIGNAL_WAIT_TIMEOUT_S", 7.0),
         recv_window_ms=_env_int("RECV_WINDOW_MS", 5000),

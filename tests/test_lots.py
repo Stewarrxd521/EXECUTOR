@@ -182,6 +182,7 @@ async def test_partial_close_with_quantity_only_reduces_that_trade_id(service, f
 
 async def test_reduction_outside_the_executor_scales_each_trade_id(service, fake):
     t = service.trades
+    service.settings.fast_signals = False         # modo seguro: relee la posición antes de cerrar
     open_(t, 111, 0.02)
     await opened(t, fake, 0.02)
     open_(t, 112, 0.02)
@@ -661,3 +662,17 @@ async def test_lot_tp_fill_is_charged_to_its_lot_when_the_algo_event_comes_later
     fake.set_mark(SYM, 3100.0)
     await wait_for(lambda: amt(fake) == 0.01)
     await wait_for(lambda: lots(trade) == {"app25:2": 0.01})
+
+
+async def test_fast_close_sends_the_order_without_reading_the_position_first(service, fake):
+    t = service.trades
+    open_(t, 1, 0.01)
+    await opened(t, fake, 0.01)
+    open_(t, 2, 0.02)
+    await opened(t, fake, 0.03)
+    await asyncio.sleep(2.1)                     # user stream estable
+    fake.requests.clear()
+    close(t, 1)
+    await wait_for(lambda: amt(fake) == 0.02)
+    methods = [m for m, _ in fake.requests]
+    assert methods.index("order.place") == 0     # ninguna consulta antes de la orden
