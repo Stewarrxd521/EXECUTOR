@@ -571,14 +571,67 @@ async def test_bot_identity_from_the_executor_url(service, fake):
         assert (await client.get("/b/kline/api/state")).status in (200, 401)
 
 
-async def test_tp_of_one_trade_id_over_other_lots_is_warned(service, fake):
+def algos(fake):
+    return sorted((a["type"], a["clientAlgoId"].rsplit("-", 1)[0], float(a["quantity"])) for a in fake.algos.values())
+
+
+async def test_each_trade_id_has_its_own_tp_on_a_shared_position(service, fake):
     t = service.trades
-    open_(t, 1, 0.02)
+    open_(t, 1, 0.02, tp=3100, bot="kline")
     await opened(t, fake, 0.02)
-    open_(t, 2, 0.01, tp=3300)                   # su TP en Binance protege la posición entera
-    await wait_for(lambda: t.signals(1, trade_id=2) and t.signals(1, trade_id=2)[0]["ok"])
-    assert "cubre también otros trade_id" in t.signals(1, trade_id=2)[0]["detail"]
-    assert any(e["kind"] == "protect_shared" for e in service.core.bus.recent)
+    open_(t, 2, 0.01, tp=3200, sl=2900, bot="app25")
+    trade = await opened(t, fake, 0.03)
+    await wait_for(lambda: len(fake.algos) == 3)
+    assert algos(fake) == [("STOP_MARKET", "S2:app25", 0.01), ("TAKE_PROFIT_MARKET", "T1:kline", 0.02),
+                           ("TAKE_PROFIT_MARKET", "T2:app25", 0.01)]
+    fake.set_mark(SYM, 3100.0)                   # solo el TP de kline: cierra su 0.02
+    await wait_for(lambda: amt(fake) == 0.01)
+    await wait_for(lambda: lots(trade) == {"app25:2": 0.01})
+    assert algos(fake) == [("STOP_MARKET", "S2:app25", 0.01), ("TAKE_PROFIT_MARKET", "T2:app25", 0.01)]
+    fake.set_mark(SYM, 3200.0)                   # el TP de app25 cierra lo suyo; su SL se cancela
+    await wait_for(lambda: amt(fake) == 0 and t.get_trade(SYM, "LONG") is None)
+    await wait_for(lambda: not fake.algos)
+
+
+async def test_a_new_tp_replaces_only_that_trade_ids_tp(service, fake):
+    t = service.trades
+    open_(t, 1, 0.02, tp=3100)
+    await opened(t, fake, 0.02)
+    open_(t, 2, 0.01, tp=3200)
+    trade = await opened(t, fake, 0.03)
+    await wait_for(lambda: len(fake.algos) == 2)
+    t.handle_signal({"action": "open_tp", "trade_id": 1, "symbol": SYM, "direction": "LONG", "trigger_price": 3150})
+    await wait_for(lambda: sorted(float(a["triggerPrice"]) for a in fake.algos.values()) == [3150.0, 3200.0])
+    close(t, 2)                                  # cerrar el trade_id 2 cancela solo su TP
+    await wait_for(lambda: amt(fake) == 0.02)
+    await wait_for(lambda: algos(fake) == [("TAKE_PROFIT_MARKET", "T1", 0.02)])
+    assert lots(trade) == {"1": 0.02}
+    t.handle_signal({"action": "close_tp", "trade_id": 1, "symbol": SYM, "direction": "LONG"})
+    await wait_for(lambda: not fake.algos)
+
+
+async def test_lot_tp_follows_its_lot_after_a_partial_close(service, fake):
+    t = service.trades
+    open_(t, 1, 0.02, tp=3100)
+    await opened(t, fake, 0.02)
+    open_(t, 2, 0.01)
+    await opened(t, fake, 0.03)
+    close(t, 1, quantity=0.01)
+    await wait_for(lambda: amt(fake) == 0.02)
+    await wait_for(lambda: algos(fake) == [("TAKE_PROFIT_MARKET", "T1", 0.01)])
+    fake.set_mark(SYM, 3100.0)
+    await wait_for(lambda: amt(fake) == 0.01)
+    await asyncio.sleep(0.5)
+    assert amt(fake) == 0.01                     # la cantidad del trade_id 2 sigue abierta
+
+
+async def test_dashboard_tp_covers_the_position_and_keeps_the_lots_tps(service, fake):
+    t = service.trades
+    open_(t, 1, 0.02, tp=3100)
+    await opened(t, fake, 0.02)
+    await wait_for(lambda: fake.algos)
+    await t.set_protection(SYM, "LONG", "TP", 3300)   # sin trade_id: la posición entera
+    assert [a[1] for a in algos(fake)] == ["T1", "TP"]
 
 
 def test_client_takes_the_bot_from_its_executor_url(monkeypatch):
@@ -589,3 +642,22 @@ def test_client_takes_the_bot_from_its_executor_url(monkeypatch):
     c2 = executor_client.ExecutorClient("https://executor.example.com", bot="app25")
     assert c2.base_url == "https://executor.example.com" and c2.bot == "app25"
     assert executor_client.ExecutorClient("https://executor.example.com").bot == ""
+
+
+async def test_lot_tp_fill_is_charged_to_its_lot_when_the_algo_event_comes_later(service, fake):
+    t = service.trades
+    open_(t, 1, 0.02, tp=3100, bot="kline")
+    await opened(t, fake, 0.02)
+    open_(t, 2, 0.01, tp=3300, bot="app25")
+    trade = await opened(t, fake, 0.03)
+    await wait_for(lambda: len(fake.algos) == 2)
+    push = fake._push
+
+    async def late_algo(event):                  # el ALGO_UPDATE del disparo llega después del fill
+        if event.get("e") == "ALGO_UPDATE":
+            await asyncio.sleep(0.3)
+        await push(event)
+    fake._push = late_algo
+    fake.set_mark(SYM, 3100.0)
+    await wait_for(lambda: amt(fake) == 0.01)
+    await wait_for(lambda: lots(trade) == {"app25:2": 0.01})

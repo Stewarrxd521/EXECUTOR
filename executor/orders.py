@@ -22,6 +22,7 @@ from .exchange_info import SymbolRules
 from .precision import D, floor_step, fmt, safe_float
 
 log = logging.getLogger("executor.orders")
+_LOT_ALGO_RE = re.compile(r"[TS]\d+(?::[a-z0-9_.-]+)?")  # clientAlgoId del TP/SL de un trade_id (T5:kline-…)
 
 LEVERAGE_LADDER = [125, 100, 75, 50, 25, 20, 15, 10, 8, 5, 4, 3, 2, 1]
 _MIN_NOTIONAL_RE = re.compile(r"no smaller than\s+([\d.]+)", re.I)
@@ -405,20 +406,37 @@ class OrderExecutor:
         return current or target
 
     # ── TP / SL (Algo Order API por WebSocket) ────────────────────────────
+    def protection_targets(self, symbol: str, direction: Optional[str], types: set,
+                           client_prefix: Optional[str] = None, shared_only: bool = False) -> list:
+        """TP/SL abiertos del lado: los de un trade_id (``client_prefix``, p. ej. «T5:kline»), solo los de la
+        posición entera (``shared_only``) o todos."""
+        ps = self.position_side(direction) if direction else None
+        out = []
+        for o in self.core.account.algos_for(symbol, ps, types):
+            head = (o.client_id or "").rsplit("-", 1)[0]
+            if client_prefix is not None and head != client_prefix:
+                continue
+            if shared_only and _LOT_ALGO_RE.fullmatch(head):
+                continue
+            out.append(o)
+        return out
+
     async def place_protection(self, symbol: str, direction: str, kind: str, trigger: float,
-                               qty: Optional[float] = None) -> dict:
+                               qty: Optional[float] = None, client_prefix: Optional[str] = None) -> dict:
+        """TP/SL con ``qty`` (o la posición entera). ``client_prefix``: el del trade_id que lo pide (``T5:kline``):
+        solo reemplaza el suyo, y cada trade_id del mismo lado tiene el suyo; sin él, reemplaza el de la posición."""
         kind = kind.upper()
         order_type = "TAKE_PROFIT_MARKET" if kind == "TP" else "STOP_MARKET"
         rules = self.core.exinfo.get(symbol, trigger)
         ps = self.position_side(direction)
         side = "SELL" if direction == "LONG" else "BUY"
         trig = rules.round_price(trigger, "nearest")
-        # Reemplaza el TP/SL anterior del mismo tipo y lado.
-        for o in self.core.account.algos_for(symbol, ps, {order_type}):
+        for o in self.protection_targets(symbol, direction, {order_type}, client_prefix=client_prefix,
+                                         shared_only=client_prefix is None):
             await self.cancel_algo(o.id, symbol)
         params = {
             "symbol": symbol, "side": side, "type": order_type, "triggerPrice": fmt(trig),
-            "workingType": "MARK_PRICE", "positionSide": ps, "clientAlgoId": new_client_id(kind),
+            "workingType": "MARK_PRICE", "positionSide": ps, "clientAlgoId": new_client_id(client_prefix or kind),
         }
         if qty and qty > 0:
             params["quantity"] = fmt(rules.round_qty(qty, market=True, mode="nearest"))
@@ -470,9 +488,9 @@ class OrderExecutor:
         raise BinanceAPIError(0, f"no se pudo crear el {kind} de {symbol}")
 
     async def cancel_protection(self, symbol: str, direction: Optional[str] = None,
-                                kinds: Optional[set] = None) -> int:
-        ps = self.position_side(direction) if direction else None
+                                kinds: Optional[set] = None, client_prefix: Optional[str] = None,
+                                shared_only: bool = False) -> int:
         types = kinds or {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TAKE_PROFIT", "STOP", "TRAILING_STOP_MARKET"}
-        targets = self.core.account.algos_for(symbol, ps, types)
+        targets = self.protection_targets(symbol, direction, types, client_prefix, shared_only)
         results = await asyncio.gather(*(self.cancel_algo(o.id, symbol) for o in targets), return_exceptions=True)
         return sum(1 for r in results if r is True)

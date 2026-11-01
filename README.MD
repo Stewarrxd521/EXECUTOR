@@ -232,15 +232,19 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
     - Aun así, lo más seguro es un Render Disk (`DATA_DIR=/var/data`).
   - La cuenta debe estar en **Hedge mode** para que LONG y SHORT del mismo símbolo sean posiciones distintas. En
     One-way, el executor avisa al arrancar (log, dashboard y Telegram).
-  - **TP/SL:** el TP/SL que envía un `trade_id` (`tp`/`sl` en la apertura, u `open_tp`/`open_sl`):
-    - Si en la posición solo está su lote, cubre la cantidad de ese lote y al dispararse se descuenta de él. Antes
-      de cerrar ese `trade_id` por señal se cancela (para que no se dispare sobre otros bots justo después); si el
-      lote sigue abierto (cierre parcial o fallido), se vuelve a poner con lo que le queda.
-    - Si ya hay lotes de otros `trade_id` o cantidad abierta por fuera, cubre la posición entera, no es de ningún
-      `trade_id` (ningún cierre por `trade_id` lo cancela) y al dispararse se reparte entre todos. El executor lo
-      avisa en el detalle de la señal y en el dashboard. Binance admite un TP y un SL por lado: uno nuevo reemplaza
-      al anterior.
-    - Para que cada bot cierre solo lo suyo, lo más seguro es cerrar con `close` + `trade_id` (como app_25).
+  - **TP/SL por trade_id:** el TP/SL que envía un `trade_id` (`tp`/`sl` en la apertura, u `open_tp`/`open_sl`)
+    es solo suyo, aunque varios bots compartan par y lado:
+    - Se coloca con la cantidad de su lote y su lote en el `clientAlgoId` (`T5:kline-…` el TP, `S5:kline-…` el
+      SL). Binance admite varios TP/SL en la misma posición, cada uno con su cantidad.
+    - Uno nuevo del mismo `trade_id` reemplaza solo el suyo; `close_tp`/`close_sl` con `trade_id` cancela solo el
+      suyo.
+    - Al dispararse, su fill se descuenta de su lote. Si el lote queda en cero, se cancela también su otro TP/SL.
+    - Al cerrar ese `trade_id` por señal se cancela su TP/SL antes de enviar el cierre; si el lote sigue abierto
+      (cierre parcial o fallido), o se reduce por fuera, se vuelve a poner con la cantidad que le queda.
+    - Sin `trade_id` (dashboard o `open_tp` sin `trade_id`), el TP/SL cubre la posición entera y convive con los
+      de cada `trade_id`.
+    - Binance limita las órdenes condicionales abiertas por símbolo (normalmente 10): con muchos bots en el mismo
+      par, la que pase del límite se rechaza y se avisa en el detalle de la señal.
 - **Identidad de cada bot.** Si dos bots usan los mismos números de `trade_id` en el mismo símbolo (app.py numera
   1, 2, 3… en cada proceso), sus lotes se mezclarían. Para separarlos, cada bot se identifica de una de estas formas:
   - Sin tocar su código: su `EXECUTOR_URL` termina en `/b/<nombre>` (por ejemplo

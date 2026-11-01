@@ -369,6 +369,7 @@ class ExecutorService:
             self._balance_dirty = True
         elif kind == "ALGO_UPDATE":
             o = acct.apply_algo_update(evt)
+            self.trades.on_algo_update(o)
             if o.get("X") == "REJECTED" or o.get("rm"):
                 self.core.bus.emit("algo", f"{o.get('o')} {o.get('s')} rechazado: {o.get('rm', '')}", "error")
         elif kind == "ACCOUNT_CONFIG_UPDATE":
