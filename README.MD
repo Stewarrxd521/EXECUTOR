@@ -64,8 +64,11 @@ Para que en real las operaciones de milisegundos lleguen a tiempo:
 - **Región del servidor:** los servidores de Binance Futures están en Tokio (AWS ap-northeast-1). En Render, la
   región más cercana es **Singapur** (~70 ms de ida y vuelta); desde Frankfurt son ~200–250 ms. Desde EE. UU.
   Binance bloquea el acceso.
-- **Señales por WebSocket:** que los bots envíen por `/ws/signal` (conexión abierta) en vez de `POST /signal`
-  ahorra el handshake TLS/HTTP de cada señal.
+- **Señales por WebSocket:** los bots envían por `/ws/signal` (conexión abierta) en vez de `POST /signal`, sin
+  el handshake TLS/HTTP de cada señal. [`executor_ws_signal.py`](executor_ws_signal.py) (cópialo junto al bot, usa
+  `websockets`) abre la conexión al arrancar, se reconecta sola y, si el WebSocket no está disponible, envía por
+  `POST /signal` con el mismo `signal_id` (nunca se ejecuta dos veces). `app.py` ya lo usa; `EXECUTOR_USE_WS=false`
+  vuelve a `POST`. Una `EXECUTOR_URL` con `/b/<bot>` funciona igual (`/b/<bot>/ws/signal`).
 - **Bots en la misma región** que el executor.
 - Esto no es HFT de colocación (microsegundos): para eso hace falta un servidor junto a Binance y conexión directa.
 
