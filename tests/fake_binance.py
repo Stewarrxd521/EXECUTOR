@@ -281,14 +281,14 @@ class FakeBinance:
             if book is None:  # un nivel enorme al precio de llenado (mark ± slippage)
                 m, k = self.marks.get(p["symbol"], 0), self.slippage_pct / 100
                 book = {"bids": [[m * (1 - k), 1e9]], "asks": [[m * (1 + k), 1e9]]}
-            return {"lastUpdateId": 1, "bids": [[str(a), str(b)] for a, b in book["bids"]],
-                    "asks": [[str(a), str(b)] for a, b in book["asks"]]}
+            return {"lastUpdateId": 1, "bids": [[str(round(a, 8)), str(b)] for a, b in book["bids"]],
+                    "asks": [[str(round(a, 8)), str(b)] for a, b in book["asks"]]}
         if method == "ticker.book":
             book = self.book.get(p["symbol"])
             m, k = self.marks.get(p["symbol"], 0), self.slippage_pct / 100
             bid = book["bids"][0][0] if book else m * (1 - k)
             ask = book["asks"][0][0] if book else m * (1 + k)
-            return {"symbol": p["symbol"], "bidPrice": str(bid), "askPrice": str(ask)}
+            return {"symbol": p["symbol"], "bidPrice": str(round(bid, 8)), "askPrice": str(round(ask, 8))}
         if method == "ticker.price":
             return {"symbol": p["symbol"], "price": str(self.marks.get(p["symbol"], 0))}
         if method == "order.place":

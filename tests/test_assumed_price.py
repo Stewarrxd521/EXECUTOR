@@ -49,7 +49,7 @@ async def test_assumed_open_beyond_the_visible_book_uses_the_worst_level(service
 async def test_without_depth_the_best_ask_is_used(service, fake):
     t = service.trades
     fake.slippage_pct = 0.5
-    fake.inject += [MARGIN, ("depth", -1000, "An unknown error occured while processing the request.")]
+    fake.inject += [MARGIN, ("depth", -1121, "Invalid symbol.")]
     open_(t, 1, 0.01)
     trade = await assumed(t)
     assert trade.entry_price == 3015.0 and trade.tranches[0]["price_source"] == "mejor ask/bid"
