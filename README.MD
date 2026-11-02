@@ -152,6 +152,12 @@ en español, la causa típica, la solución y la **corrección automática** que
 | Orden dividida que falla a medias | Registra la parte ejecutada (nunca queda una posición sin trade) |
 | -2022, -2024 reduceOnly rechazado | Relee la posición; si ya está en 0 la da por cerrada |
 | -2019 margen insuficiente | Registra la posición como *asumida* (comportamiento anterior) o, con `MARGIN_AUTO_REDUCE=true`, reintenta con menos cantidad |
+
+> **Precio de una apertura asumida.** Binance no ejecuta nada, así que no hay fill real. Se registra el precio al
+> que se habría llenado la orden de mercado en ese instante: el libro de Binance (`depth`, asks para LONG, bids para
+> SHORT) recorrido por la cantidad (precio medio ponderado). Sin libro, el mejor ask/bid (`ticker.book`); sin eso, el
+> mark o el precio de la señal. El tramo guarda de dónde salió (`price_source`: `libro`, `mejor ask/bid`,
+> `referencia`).
 | -2011, -2013, -4046, -4059 | Ya estaba hecho: no es un error real |
 
 La pestaña **Errores** del dashboard muestra cada error con su explicación, si se autocorrigió y cómo, e incluye un

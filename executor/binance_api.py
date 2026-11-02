@@ -357,6 +357,16 @@ class BinanceWsApi:
         except (TypeError, ValueError, AttributeError):
             return 0.0
 
+    async def depth(self, symbol: str, limit: int = 20) -> dict:
+        """Libro de órdenes (peso 2 con limit ≤ 50)."""
+        result = await self.request("depth", {"symbol": symbol, "limit": limit})
+        return result if isinstance(result, dict) else {}
+
+    async def book_ticker(self, symbol: str) -> dict:
+        """Mejor bid/ask (peso 2)."""
+        result = await self.request("ticker.book", {"symbol": symbol})
+        return result if isinstance(result, dict) else {}
+
     async def start_user_stream(self) -> str:
         result = await self.request("userDataStream.start", with_api_key=True)
         return (result or {}).get("listenKey", "")
