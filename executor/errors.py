@@ -24,6 +24,9 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 
+_ORDER_METHODS = {"order.place", "algoOrder.place", "order.modify"}
+
+
 class Action(str, Enum):
     RETRY = "retry"
     WAIT = "wait"
@@ -558,8 +561,16 @@ class ErrorDoctor:
         elif code == -1013:
             if "notional" in low:
                 action = Action.RAISE_NOTIONAL
+            elif "percent_price" in low:
+                action = Action.CLAMP_PRICE      # fuera de la banda de precio: no es el tick
+            elif "market_lot_size" in low or "max" in low and "qty" in low:
+                action = Action.SPLIT_QTY
             elif "price" in low and "lot" not in low:
                 action = Action.FIX_PRICE_TICK
+        elif code in (-1000, -4116) and str(getattr(error, "method", "")) in _ORDER_METHODS:
+            # -1000 (UNKNOWN / 503) y -4116 (clientOrderId duplicado) en una orden: pudo ejecutarse.
+            # Se consulta su estado antes de reenviar (reenviar podría duplicarla).
+            action = Action.CHECK_STATUS
         elif code == 0 and http_status == 0:
             if "notional" in low:
                 action = Action.RAISE_NOTIONAL

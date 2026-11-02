@@ -35,7 +35,8 @@ def new_signal_id() -> str:
 
 class ExecutorSignalSocket:
     def __init__(self, base_url: str, secret: str, timeout: float = 5.0, http_timeout: float = 8.0,
-                 logger: Optional[Callable[[str], Any]] = None, connect: bool = True) -> None:
+                 logger: Optional[Callable[[str], Any]] = None, connect: bool = True,
+                 retry_for: float = 60.0) -> None:
         self.base_url = (base_url or "").strip().rstrip("/")
         self.secret = secret
         self.timeout = timeout
@@ -45,6 +46,8 @@ class ExecutorSignalSocket:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws: Any = None
         self._connected = threading.Event()
+        self._tried = threading.Event()   # ya se intentó conectar una vez (con éxito o no)
+        self.retry_for = retry_for        # segundos reintentando si el executor reinicia o no responde
         self._waiters: dict = {}
         self._ids = itertools.count(1)
         self._lock = threading.Lock()
@@ -58,7 +61,7 @@ class ExecutorSignalSocket:
             if self._loop is not None:
                 return
             try:
-                import websockets  # noqa: F401
+                import websockets  # noqa: F401  (solo se comprueba que está instalado)
             except ImportError:
                 self.log("[executor-ws] websockets no instalado: las señales irán por POST /signal")
                 return
@@ -69,7 +72,10 @@ class ExecutorSignalSocket:
     def _thread(self, loop: asyncio.AbstractEventLoop) -> None:
         asyncio.set_event_loop(loop)
         loop.create_task(self._run())
-        loop.run_forever()
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
 
     async def _connect(self):
         import websockets
@@ -102,6 +108,7 @@ class ExecutorSignalSocket:
             except Exception as exc:
                 self.log(f"[executor-ws] conexión caída ({exc!r}); se reconecta")
             finally:
+                self._tried.set()
                 self._connected.clear()
                 self._ws = None
                 for fut in list(self._waiters.values()):
@@ -127,16 +134,34 @@ class ExecutorSignalSocket:
     def send(self, payload: dict) -> dict:
         """Envía la señal (por WebSocket; si falla, por POST con el mismo ``signal_id``) y devuelve la respuesta
         del executor (``ok``, ``status``, ``detail``…). Nunca lanza: un fallo devuelve ``{"ok": False, ...}``."""
+        payload.setdefault("signal_id", new_signal_id())  # el mismo en cada reintento: nunca se ejecuta dos veces
         msg = dict(payload)
-        msg.setdefault("signal_id", new_signal_id())
-        if self._loop is not None and self._connected.wait(timeout=2.0 if self.sent_ws == 0 else 0.0):
-            try:
-                reply = asyncio.run_coroutine_threadsafe(self._send_ws(msg), self._loop).result(self.timeout + 1)
-                if int(reply.get("status") or 200) < 500:
-                    self.sent_ws += 1
+        deadline = time.monotonic() + self.retry_for
+        delay = 0.5
+        while True:
+            reply = self._send_once(msg)
+            status = int(reply.get("status") or (200 if reply.get("ok") else 0))
+            transient = status == 0 or status in (408, 425, 429) or status >= 500
+            if not transient or time.monotonic() + delay > deadline:
+                return reply
+            # El executor se reinicia (503), no responde o está saturado: se reintenta con el mismo signal_id.
+            self.log(f"[executor-ws] {msg.get('action')} {msg.get('symbol')}: {status or 'sin conexión'}; "
+                     f"reintento en {delay:g} s")
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+
+    def _send_once(self, msg: dict) -> dict:
+        if self._loop is not None:
+            if not self._tried.is_set():
+                self._tried.wait(timeout=2.0)  # la primera conexión aún se está abriendo
+            if self._connected.is_set():
+                try:
+                    reply = asyncio.run_coroutine_threadsafe(self._send_ws(msg), self._loop).result(self.timeout + 1)
+                    if int(reply.get("status") or 200) < 500:
+                        self.sent_ws += 1
                     return reply
-            except Exception as exc:
-                self.log(f"[executor-ws] {msg.get('action')} {msg.get('symbol')}: {exc!r}; se envía por POST")
+                except Exception as exc:
+                    self.log(f"[executor-ws] {msg.get('action')} {msg.get('symbol')}: {exc!r}; se envía por POST")
         return self._send_http(msg)
 
     def _send_http(self, msg: dict) -> dict:

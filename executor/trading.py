@@ -560,6 +560,7 @@ class TradeManager:
         self._unknown_open: dict[tuple[str, str], float] = {}
         self._open_alerts: dict[str, float] = {}
         self._close_retryable: dict[tuple[str, str], bool] = {}
+        self._close_wait: dict[tuple[str, str], float] = {}  # cierre frenado por rate limit: segundos de espera
         self._no_lot: set[tuple[str, str]] = set()  # el último close_trade no encontró lote del trade_id
         self._lot_attempts: dict[tuple, dict] = {}   # cierre de lote sin respuesta: se verifica antes de reenviar
         self._symbol_retryable: dict[str, bool] = {}  # close_symbol falló por un error transitorio
@@ -574,7 +575,9 @@ class TradeManager:
         self._rebuild_tried: dict[tuple[str, str], float] = {}
         self.user_conn = None                         # conexión del user stream (la pone el servicio)
         self._fired: dict[tuple, list] = {}            # posición -> TP/SL de trade_id disparados, aún sin su fill
-        self._fired_orders: dict[int, str] = {}        # orderId de la orden que creó un TP/SL al dispararse -> lote
+        self._fired_orders: dict[int, tuple] = {}      # orderId de la orden de un TP/SL disparado -> (lote, algoId)
+        self._fired_done: OrderedDict = OrderedDict()  # algoId ya atribuido (su FINISHED no se cuenta otra vez)
+        self._prot_locks: dict[tuple, asyncio.Lock] = {}  # (posición, lote): poner/quitar su TP/SL, de uno en uno
         self.adopted = False                          # ya se adoptaron las posiciones sin trade (1.ª lectura)
         self._bot_first_seen: dict[str, float] = {}   # bot -> primera vez que se identificó (lotes de antes, sin nombre)
         self._cid_final: OrderedDict = OrderedDict()   # clientOrderId propio -> (llenado, precio medio) ya definitivo
@@ -1159,7 +1162,13 @@ class TradeManager:
                     await self.set_protection(symbol, trade.direction, kind, trig, lot=sig.ref)
                     protections.append(kind)
                 except BinanceAPIError as err:
-                    detail += f" — {kind} no colocado: {ErrorDoctor.diagnose(err).info.title}"
+                    title = ErrorDoctor.diagnose(err).info.title
+                    detail += f" — {kind} no colocado: {title}"
+                    # El bot ya recibió su respuesta: se avisa aparte (dashboard y Telegram) para que no pase inadvertido.
+                    self.core.bus.emit("protect_failed", f"{symbol}: {kind} del trade_id {sig.trade_id} no colocado "
+                                       f"({title})", "error", symbol=symbol)
+                    self.core.telegram.send(f"⚠️ <b>{kind} no colocado</b> <code>{symbol}</code> trade_id "
+                                            f"{sig.trade_id}\n[{err.code}] {title}")
         if protections:
             detail += " — " + "/".join(protections) + " colocado(s)"
         self._log_signal("open", symbol, direction, True, detail, sig, executor_trade_id=trade.id)
@@ -1356,8 +1365,11 @@ class TradeManager:
                             bot_pnl: Optional[float], prior_opens: Optional[list] = None) -> dict:
         """Cierre por señal. Un error inesperado (p. ej. sin conexión) se reintenta: un
         cierre perdido deja la posición abierta."""
-        delays = CLOSE_RETRY_DELAYS
-        for attempt, delay in enumerate(delays):
+        delays = list(CLOSE_RETRY_DELAYS)
+        attempt = -1
+        while attempt + 1 < len(delays):
+            attempt += 1
+            delay = delays[attempt]
             if delay:
                 await asyncio.sleep(delay)
             final = attempt == len(delays) - 1
@@ -1373,6 +1385,14 @@ class TradeManager:
                 log.warning("Cierre %s %s (trade_id %s): fallo transitorio, reintento %d", sig.symbol,
                             sig.direction, sig.trade_id, attempt + 1)
                 last = result.get("detail", "fallo transitorio")
+                waits = [k for k in self._close_wait if k[0] == sig.symbol]
+                ban = max((self._close_wait.pop(k) for k in waits), default=0.0)
+                if ban > 0:
+                    # Rate limit / IP en pausa: el cierre no se abandona; se espera lo que pide Binance (máx. 5 min).
+                    pause = min(ban, 300.0) + 0.5
+                    log.warning("Cierre %s: Binance pide esperar %.0f s (rate limit); se reintenta entonces",
+                                sig.symbol, pause)
+                    delays[attempt + 1:attempt + 1] = [pause]
                 continue
             return result  # un rechazo definitivo de Binance ya se avisa en close_trade (close_failed + Telegram)
         self.status["signals_rejected"] += 1
@@ -1565,7 +1585,8 @@ class TradeManager:
                                                     client_prefix=prot_cid_prefix(kind, lk))
             trade.lot_prot.get(lk, {}).pop(kind, None)
         else:
-            n = await self.orders.cancel_protection(sig.symbol, sig.direction or None, {order_type})
+            # Sin trade_id: solo el de la posición entera; los TP/SL de cada trade_id siguen.
+            n = await self.orders.cancel_protection(sig.symbol, sig.direction or None, {order_type}, shared_only=True)
         self.status["signals_tp_closed" if sig.action == "close_tp" else "signals_sl_closed"] += 1
         self._log_signal(sig.action, sig.symbol, sig.direction, True, f"{n} orden(es) canceladas", sig)
         label = "TP" if sig.action == "close_tp" else "SL"
@@ -1664,10 +1685,23 @@ class TradeManager:
             # Lo que ya había en Binance sin trade (otro bot, a mano) no es de este trade_id.
             prior = self.core.account.position(symbol, direction) \
                 if self.trades.get((symbol, direction)) is None and self.core.account.is_hedge else None
+            error: Optional[BinanceAPIError] = None
             try:
                 fill = await self.orders.market(ctx, qty, prefix=lot_cid_prefix("X", lot_ref(bot, paper_trade_id)),
                                                 owner=owner)
-            except BinanceAPIError as err:
+            except BinanceAPIError as exc:
+                partial = getattr(exc, "partial_fill", None)
+                if partial is not None and partial.qty > 0:
+                    # Una parte ya se ejecutó (orden dividida): se registra lo real; el resto no se abrió.
+                    d = ErrorDoctor.diagnose(exc)
+                    log.warning("%s %s: se abrió %s de %s (el resto falló: [%s] %s)", direction, symbol,
+                                partial.qty, fmt(qty), d.code, d.info.title)
+                    partial.status = "FILLED"
+                    fill = partial
+                else:
+                    error = exc
+            if error is not None:
+                err = error
                 diag = ErrorDoctor.diagnose(err)
                 if diag.action == Action.CHECK_STATUS:
                     self._unknown_open[(symbol, direction)] = time.time()
@@ -1683,10 +1717,12 @@ class TradeManager:
                             trade.note_tranche_scale(multiplier, bot_quantity, float(qty))
                         self._announce_open(trade)
                     return trade
-                self.core.bus.emit("open_failed", f"{symbol}: {diag.info.title}", "error", symbol=symbol,
-                                   code=diag.code, solution=diag.info.solution)
+                tried = "; ".join(getattr(err, "fix_notes", []) or [])
+                self.core.bus.emit("open_failed", f"{symbol}: {diag.info.title}" + (f" ({tried})" if tried else ""),
+                                   "error", symbol=symbol, code=diag.code, solution=diag.info.solution)
                 self.core.telegram.send(f"⚠️ <b>Apertura fallida</b> {direction} <code>{symbol}</code>\n"
-                                        f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}")
+                                        f"[{diag.code}] {diag.info.title}\n💡 {diag.info.solution}"
+                                        + (f"\n🔧 {tried}" if tried else ""))
                 return None
             if not fill.ok:
                 self.core.bus.emit("open_failed", f"{symbol}: la orden no se ejecutó ({fill.status})", "error")
@@ -2117,6 +2153,12 @@ class TradeManager:
                 fill = await self.orders.market(ctx, D(fmt(want)), prefix=f"C{trade.id}", owner=trade)
             except BinanceAPIError as err:
                 diag = ErrorDoctor.diagnose(err)
+                partial = getattr(err, "partial_fill", None)
+                if partial is not None and partial.qty > 0:
+                    for cid, q in partial.by_cid.items():
+                        self._apply_fill(trade, cid, "*", -1, q)
+                    filled += partial.qty
+                    notional += partial.qty * (partial.avg_price or market_px or trade.entry_price)
                 if diag.action in (Action.REFRESH_POSITION, Action.ALREADY_DONE):
                     pos2, _ = await self._fresh_position(trade.symbol, trade.direction)
                     if pos2 is None:
@@ -2129,7 +2171,9 @@ class TradeManager:
                 # Solo se reintenta automáticamente un cierre TOTAL (cada intento relee la posición
                 # real). Un parcial nunca: si una parte ya se ejecutó (orden dividida o respuesta
                 # perdida), repetirlo cerraría de más; se avisa para revisarlo.
-                retryable = not partial and diag.action in (Action.RETRY, Action.CHECK_STATUS)
+                retryable = not partial and diag.action in (Action.RETRY, Action.CHECK_STATUS, Action.WAIT)
+                if diag.action == Action.WAIT:
+                    self._close_wait[key] = diag.retry_after_s
                 self._close_retryable[key] = retryable
                 if alert or not retryable:
                     self._alert_close_error(trade, diag)
@@ -2311,7 +2355,6 @@ class TradeManager:
             # Su TP/SL (con la cantidad de su lote) se cancela ANTES de cerrarlo: si se disparara justo después,
             # cerraría la cantidad de otros trade_id. Si el lote sigue abierto, se vuelve a poner con lo que quede.
             await self._cancel_lot_protection(trade, lk)
-        trade.lot_prot.pop(lk, None)
         record = self._lot_trade(trade, lk, qty, close_price, orphan=orphan)
         side = "SELL" if trade.direction == "LONG" else "BUY"
         ctx = OrderContext(trade.symbol, side, trade.direction, "close", rules, reduce_only=True)
@@ -2332,6 +2375,14 @@ class TradeManager:
                                                 prefix=f"C{trade.id}" if orphan else lot_cid_prefix("K", lk))
             except BinanceAPIError as err:
                 diag = ErrorDoctor.diagnose(err)
+                partial = getattr(err, "partial_fill", None)
+                if partial is not None and partial.qty > 0:
+                    # Una parte se cerró antes del error: cuenta (lo que falte se decide como un llenado parcial).
+                    for cid, q in partial.by_cid.items():
+                        self._apply_fill(trade, cid, src, -1, q)
+                    filled += partial.qty
+                    notional += partial.qty * (partial.avg_price or market_px or trade.entry_price)
+                    break
                 if diag.action in (Action.REFRESH_POSITION, Action.ALREADY_DONE):
                     pos2, _ = await self._fresh_position(trade.symbol, trade.direction)
                     if pos2 is None:
@@ -2349,10 +2400,16 @@ class TradeManager:
                     continue
                 # Pudo ejecutarse sin respuesta: se confirma por clientOrderId antes de reenviar.
                 attempt["active"], attempt["cids"] = False, self._owned_cids(record)
-                retryable = diag.action in (Action.RETRY, Action.CHECK_STATUS)
+                retryable = diag.action in (Action.RETRY, Action.CHECK_STATUS, Action.WAIT)
                 self._close_retryable[key] = retryable
+                if diag.action == Action.WAIT:
+                    self._close_wait[key] = diag.retry_after_s
                 if alert or not retryable:
                     self._alert_close_error(trade, diag)
+                if diag.action == Action.CHECK_STATUS:
+                    attempt["prot"] = own_prot  # si al confirmarlo el lote sigue abierto, vuelve su TP/SL
+                else:
+                    await self._restore_protection(trade, lk, own_prot)  # no se cerró: el lote no queda sin TP/SL
                 self.save()
                 return False
             except Exception:
@@ -2414,6 +2471,8 @@ class TradeManager:
         attempt["inferred_left"] = 0.0
         for cid in self._attempt_cids(attempt):
             self._infer_ref.pop(cid, None)
+        if attempt.get("prot") and not finalizing:
+            self._spawn(self._restore_protection(trade, lk, attempt.pop("prot")))
         executed = sum(q for q, _ in fills.values())
         if executed > tol:
             log.warning("%s %s: el cierre anterior del trade_id %s sí se ejecutó (%s)", trade.symbol,
@@ -2827,11 +2886,15 @@ class TradeManager:
                 out[kind] = o.trigger_price or out.get(kind, 0.0)
         return out
 
+    def _prot_lock(self, trade: Trade, lk: str) -> asyncio.Lock:
+        return self._prot_locks.setdefault((trade.key, lk), asyncio.Lock())
+
     async def _cancel_lot_protection(self, trade: Trade, lk: str) -> int:
         n = 0
-        for kind, otype in self._PROT_TYPES.items():
-            n += await self.orders.cancel_protection(trade.symbol, trade.direction, {otype},
-                                                     client_prefix=prot_cid_prefix(kind, lk))
+        async with self._prot_lock(trade, lk):
+            for kind, otype in self._PROT_TYPES.items():
+                n += await self.orders.cancel_protection(trade.symbol, trade.direction, {otype},
+                                                         client_prefix=prot_cid_prefix(kind, lk))
         return n
 
     def _drop_lot_protection(self, trade: Trade, lk: str) -> None:
@@ -2853,35 +2916,67 @@ class TradeManager:
             self._spawn(self._restore_protection(trade, lk, dict(trade.lot_prot[lk])))
 
     def on_algo_update(self, o: dict) -> None:
-        """ALGO_UPDATE: el TP/SL de un trade_id se disparó; su fill se descontará de ese lote."""
+        """ALGO_UPDATE: el TP/SL de un trade_id se disparó; los fills de su orden se descontarán de ese lote."""
         if o.get("X") not in ("TRIGGERED", "TRIGGERING", "FINISHED"):
             return
         parsed = parse_prot_cid(o.get("caid", ""))
-        if not parsed:
-            return
+        aid = o.get("aid")
+        if not parsed or aid in self._fired_done:
+            return  # FINISHED (o un aviso repetido) de un disparo ya atribuido
         kind, lot = parsed
+        lk = Trade.lot_key(lot)
         direction = o.get("ps") if o.get("ps") in ("LONG", "SHORT") else ("LONG" if o.get("S") == "SELL" else "SHORT")
         key = (o.get("s", ""), direction)
         if o.get("ai"):
-            self._fired_orders[int(safe_float(o["ai"]))] = Trade.lot_key(lot)
+            self._fired_orders[int(safe_float(o["ai"]))] = (lk, aid)
         fired = self._fired.setdefault(key, [])
-        if (kind, Trade.lot_key(lot), o.get("aid")) not in fired:
-            fired.append((kind, Trade.lot_key(lot), o.get("aid")))
+        if not any(e[2] == aid for e in fired):
+            fired.append((kind, lk, aid, time.time()))
+
+    def _lot_for_cid_key(self, trade: Trade, lk: str) -> str:
+        """El lote real de un clientAlgoId (con el nombre del bot recortado al caber en el id)."""
+        if lk in trade.lots:
+            return lk
+        tid, short = _split_ref(lk)
+        for k in trade.lots:
+            t2, bot = _split_ref(k)
+            if t2 == tid and bot and cid_bot(bot, tid) == short:
+                return k
+        return lk
 
     def _protection_owner(self, trade: Trade, upd: OrderUpdate, kind: str) -> Optional[str]:
-        """Lote cuyo TP/SL produjo este fill: por su orden, por el ALGO_UPDATE o, si no llegó, por cantidad."""
-        if upd.order_id in self._fired_orders:
-            return self._fired_orders.pop(upd.order_id)
-        fired = self._fired.get(trade.key) or []
-        for i, (k, lk, _) in enumerate(fired):
-            if k == kind:
-                fired.pop(i)
-                return lk
-        owners = [lk for lk, p in trade.lot_prot.items() if kind in p and lk in trade.lots]
-        if len(owners) == 1:
-            return owners[0]
-        match = [lk for lk in owners if abs(trade.lots[lk] - upd.qty) < 1e-9]
-        return match[0] if len(match) == 1 else None
+        """Lote cuyo TP/SL produjo este fill. Se decide una vez por orden (por «ai» del ALGO_UPDATE, por el
+        disparo pendiente o, si aún no llegó, por cantidad) y todos los fills de esa orden van al mismo lote."""
+        now = time.time()
+        hit = self._fired_orders.get(upd.order_id)
+        if hit is None:
+            fired = self._fired.get(trade.key) or []
+            fired[:] = [e for e in fired if now - e[3] < 120]
+            for e in fired:
+                if e[0] == kind:
+                    fired.remove(e)
+                    hit = (e[1], e[2])
+                    break
+            if hit is None:
+                owners = [lk for lk, p in trade.lot_prot.items() if kind in p and lk in trade.lots]
+                match = owners if len(owners) == 1 else \
+                    [lk for lk in owners if abs(trade.lots[lk] - upd.qty) < 1e-9]
+                hit = (match[0], None) if len(match) == 1 else None
+            if hit is not None:
+                self._fired_orders[upd.order_id] = hit
+        if hit is None:
+            return None
+        if hit[1] is not None:
+            self._fired_done[hit[1]] = now
+            for lst in self._fired.values():
+                lst[:] = [e for e in lst if e[2] != hit[1]]
+        if upd.status in ("FILLED", "CANCELED", "EXPIRED"):
+            self._fired_orders.pop(upd.order_id, None)
+        while len(self._fired_done) > 2000:
+            self._fired_done.popitem(last=False)
+        while len(self._fired_orders) > 2000:
+            self._fired_orders.pop(next(iter(self._fired_orders)))
+        return self._lot_for_cid_key(trade, hit[0])
 
     async def _order_outcome(self, symbol: str, cid: str) -> Optional[tuple[float, float]]:
         """(ejecutado, precio medio) de una orden propia: por su estado final en el user stream o por
@@ -3072,12 +3167,13 @@ class TradeManager:
             if trigger <= 0:
                 continue
             try:
-                await self.set_protection(trade.symbol, trade.direction, kind, trigger, lot=lk)
+                await self.set_protection(trade.symbol, trade.direction, kind, trigger, lot=lk, close_if_crossed=False)
             except BinanceAPIError as err:
                 log.warning("%s %s: no se pudo volver a poner el %s del trade_id %s (%s)", trade.symbol,
                             trade.direction, kind, lk, ErrorDoctor.diagnose(err).summary())
 
-    async def set_protection(self, symbol: str, direction: str, kind: str, trigger: float, lot: Any = 0) -> dict:
+    async def set_protection(self, symbol: str, direction: str, kind: str, trigger: float, lot: Any = 0,
+                             close_if_crossed: bool = True) -> dict:
         """TP/SL. ``lot``: el trade_id que lo pide: tiene el suyo, con la cantidad de su lote y su lote en el
         clientAlgoId (``T5:kline`` / ``S5:kline``); solo reemplaza el suyo, y al dispararse se descuenta de su lote.
         Sin trade_id (dashboard): cubre la posición entera y reemplaza el de la posición."""
@@ -3090,16 +3186,26 @@ class TradeManager:
                                   method="protect", transport="local")
         try:
             if own:
-                result = await self.orders.place_protection(symbol, direction, kind, trigger, qty=trade.lots[own],
+                async with self._prot_lock(trade, own):  # uno a la vez por lote: nunca dos TP del mismo lote
+                    if own not in trade.lots:
+                        raise BinanceAPIError(-1, f"el trade_id {own} ya no tiene cantidad", method="protect",
+                                              transport="local")
+                    result = await self.orders.place_protection(symbol, direction, kind, trigger,
+                                                                qty=trade.lots[own],
+                                                                client_prefix=prot_cid_prefix(kind, own))
+                    trade.lot_prot.setdefault(own, {})[kind] = trigger
+                    if own not in trade.lots:  # el lote se cerró mientras se colocaba
+                        await self.orders.cancel_protection(symbol, direction, {self._PROT_TYPES[kind]},
                                                             client_prefix=prot_cid_prefix(kind, own))
-                trade.lot_prot.setdefault(own, {})[kind] = trigger
+                        trade.lot_prot.pop(own, None)
             else:
                 qty = max(pos.qty if pos else 0.0, trade.ledger_qty if trade is not None else 0.0) or \
                     (trade.quantity if trade else 0.0)
                 result = await self.orders.place_protection(symbol, direction, kind, trigger, qty=qty or None)
         except BinanceAPIError as err:
-            if ErrorDoctor.diagnose(err).action != Action.TRIGGER_CROSSED or trade is None:
-                raise
+            if ErrorDoctor.diagnose(err).action != Action.TRIGGER_CROSSED or trade is None or not own \
+                    or not close_if_crossed:
+                raise  # un TP/SL de la posición entera que ya cruzó no cierra los lotes de todos: se rechaza
             # -2021: el precio ya pasó el disparo. Lo que ese TP/SL iba a hacer se hace ya: cerrar a mercado
             # su lote (o la posición, si no es de un trade_id).
             log.warning("%s %s: el %s @ %g ya se cruzó: se cierra a mercado %s", symbol, direction, kind, trigger,

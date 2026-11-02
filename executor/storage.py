@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -26,7 +27,13 @@ class JsonStore:
         try:
             return json.loads(self.path.read_text(encoding="utf-8"))
         except Exception as exc:
-            log.error("No se pudo leer %s (%s); se ignora", self.path, exc)
+            # Se guarda aparte (nunca se pisa): el primer guardado lo reemplazaría y se perdería el historial.
+            backup = self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}")
+            try:
+                os.replace(self.path, backup)
+            except OSError:
+                backup = None
+            log.error("No se pudo leer %s (%s); copia en %s", self.path, exc, backup)
             return default
 
     def save_now(self) -> None:
@@ -37,6 +44,8 @@ class JsonStore:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     json.dump(data, fh, ensure_ascii=False, indent=1, default=str)
+                    fh.flush()
+                    os.fsync(fh.fileno())  # en disco antes de reemplazar: un corte no deja el archivo a medias
                 os.replace(tmp, self.path)
             finally:
                 if os.path.exists(tmp):

@@ -1179,8 +1179,8 @@ class SignalSocket:
             await self.connect()
         assert self._conn is not None
         req_id = next(self._ids)
+        payload.setdefault("signal_id", new_signal_id())  # en el dict del llamador: reenviarlo es seguro
         msg = dict(payload)
-        msg.setdefault("signal_id", new_signal_id())
         msg.update({"id": req_id, "wait": wait})
         fut = asyncio.get_running_loop().create_future()
         self._waiters[req_id] = fut

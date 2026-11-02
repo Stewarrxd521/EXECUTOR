@@ -140,12 +140,16 @@ en español, la causa típica, la solución y la **corrección automática** que
 | -4014, -4029 tick | Redondea el precio al tick |
 | -4164 / -1013 notional mínimo | Sube la cantidad al mínimo exigido (y aprende el mínimo que indica Binance) |
 | -4061, -4060 positionSide | Detecta el modo real (Hedge/One-way) y reenvía |
-| -1106 reduceOnly en Hedge | Quita `reduceOnly` y reenvía |
-| -1006, -1007, 503 estado desconocido | Consulta `order.status` antes de reenviar: nunca duplica la orden |
+| -1106 reduceOnly en Hedge | Quita `reduceOnly` y reenvía (en One-way un cierre nunca va sin `reduceOnly`: se envía con su `positionSide`) |
+| -1006, -1007, -1000, 503 estado desconocido; -4116 id duplicado | Consulta la orden por su `clientOrderId` antes de reenviar: nunca la duplica. Un cierre no se reenvía: lo confirma su intento |
 | -1021 / -5028 reloj | Recalcula el desfase con los eventos del stream y reintenta |
-| -1003, 418, 429 rate limit | Pausa ese canal hasta que expire el ban; REST rota a otro proxy |
-| -4028, -4202, -4203 leverage | Baja por la escalera de leverage hasta uno aceptado |
-| -4131 PERCENT_PRICE en MARKET | Convierte a LIMIT IOC dentro de la banda |
+| -1003, -1015, 418, 429 rate limit | Pausa ese canal hasta que expire el ban; REST rota a otro proxy. Un **cierre** espera lo que pide Binance y se reenvía (aunque el ban dure minutos); una **apertura** se rechaza al momento (segundos tarde ya no es la señal del bot) |
+| -2027 posición máxima para el leverage (y -4028, -4202, -4203, -4403) | Baja el leverage un escalón cada vez (7 → 5 → 4) sin pasar de `LEVERAGE_MIN` y reenvía; solo entonces rechaza, diciendo por qué (en el mínimo, o Binance no dejó bajarlo). Las aperturas siguientes del símbolo usan ese leverage |
+| -4005 cantidad máxima | Divide la orden en partes |
+| -4131, -1013 PERCENT_PRICE en MARKET | Convierte a LIMIT IOC dentro de la banda (nunca cambia el stepSize) |
+| -2021 TP/SL ya cruzado | El de un `trade_id` cierra su lote a mercado (lo que iba a hacer); el de la posición entera se rechaza |
+| TP/SL: -1001, -1008, -1000, -4116 | Reintenta; si la respuesta se perdió, lo busca por su `clientAlgoId` antes de reenviar |
+| Orden dividida que falla a medias | Registra la parte ejecutada (nunca queda una posición sin trade) |
 | -2022, -2024 reduceOnly rechazado | Relee la posición; si ya está en 0 la da por cerrada |
 | -2019 margen insuficiente | Registra la posición como *asumida* (comportamiento anterior) o, con `MARGIN_AUTO_REDUCE=true`, reintenta con menos cantidad |
 | -2011, -2013, -4046, -4059 | Ya estaba hecho: no es un error real |
@@ -375,6 +379,7 @@ ambos y las pruebas los ejecutan contra el executor.
 | `PROXY_URLS` | — | Proxies HTTP separados por coma para REST (rotación y baneo por IP). `FIXIE_URL` sigue aceptándose |
 | `REST_PROXY_ALL` | `false` | Usar los proxies para todo el REST. Por defecto: leverage y exchangeInfo por proxy; el resto directo, pasando a un proxy si Binance bloquea la IP (403/451/-2015) |
 | `LEVERAGE` / `DEFAULT_LEVERAGE` | `4` | Leverage de las señales (editable desde el dashboard) |
+| `LEVERAGE_MIN` | `4` | Mínimo al que se baja el leverage ante -2027; por debajo, la apertura se rechaza |
 | `HIGH_PRICE_THRESHOLD` / `HIGH_PRICE_LEVERAGE` | `2.0` / `20` | Leverage para símbolos con precio alto |
 | `HEDGE_MODE` | `false` | Solo pista inicial: el modo real se detecta por WebSocket |
 | `BLOCKED_SYMBOLS` | `BTCUSDT,ETHUSDT,BTCUSDC,ETHUSDC` | Símbolos que no se abren por señal |

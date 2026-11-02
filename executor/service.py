@@ -306,7 +306,10 @@ class ExecutorService:
         while True:
             await asyncio.sleep(600)
             if self.core.exinfo.age_hours() >= self.settings.exchange_info_refresh_h:
-                await self.refresh_exchange_info("refresco programado")
+                try:
+                    await self.refresh_exchange_info("refresco programado")
+                except Exception as exc:  # un fallo (red, otra actualización en curso) no detiene el bucle
+                    log.warning("exchangeInfo: refresco programado fallido (%s); se reintenta luego", exc)
 
     async def _bootstrap_exinfo(self) -> None:
         """Genera el snapshot inicial, reintentando con espera creciente."""

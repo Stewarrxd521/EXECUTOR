@@ -67,6 +67,7 @@ class OrderExecutor:
     def __init__(self, core: Core):
         self.core = core
         self.client_owner: dict[str, object] = {}
+        self.leverage_cap: dict[str, int] = {}  # leverage al que se bajó por -2027 (posición máxima)
 
     # ── Helpers ───────────────────────────────────────────────────────────
     def position_side(self, direction: str) -> str:
@@ -143,6 +144,7 @@ class OrderExecutor:
                     self.core.journal.mark_fixed(entry, "; ".join(notes) or "reintento exitoso")
                 return result or {}, notes
             except BinanceAPIError as err:
+                err.fix_notes = notes  # lo intentado antes de rechazar (se muestra en la señal)
                 diag, entry = self._record(err, where, ctx.symbol, params=dict(params))
                 fixes += 1
                 if fixes > max_fixes:
@@ -159,8 +161,9 @@ class OrderExecutor:
                         notes.append("estado confirmado con order.status (no se duplicó la orden)")
                         self.core.journal.mark_fixed(entry, notes[-1])
                         return status, notes
-                    if not definitive:
-                        # No se pudo confirmar: reenviar podría duplicar la orden.
+                    if not definitive or ctx.reduce_only:
+                        # Sin confirmar, o un cierre: reenviar podría duplicarlo (un cierre duplicado tocaría la
+                        # cantidad de otro bot). El cierre lo confirma después su intento por clientOrderId.
                         raise
                     params["newClientOrderId"] = new_client_id(params["newClientOrderId"].rsplit("-", 1)[0])
                     notes.append("orden no registrada en Binance; reenviada con nuevo clientOrderId")
@@ -182,9 +185,9 @@ class OrderExecutor:
                     # de LEVERAGE_MIN) y se reenvía; si ni con el mínimo cabe, se rechaza.
                     leverage_drops += 1
                     before = self.core.account.leverage.get(ctx.symbol) or self.core.settings.leverage
-                    lowered = await self.lower_leverage(ctx.symbol, before)
+                    lowered, why = await self.lower_leverage(ctx.symbol, before)
                     if lowered is None:
-                        notes.append(f"ya en el leverage mínimo ({self.core.settings.leverage_min}x): se rechaza")
+                        notes.append(why)
                         raise
                     notes.append(f"leverage bajado de {before}x a {lowered}x ({diag.info.name})")
                     self.core.journal.mark_fixed(entry, notes[-1])
@@ -194,8 +197,14 @@ class OrderExecutor:
                     notes.append("nuevo clientOrderId")
                     continue
                 if action == Action.DROP_REDUCE_ONLY and "reduceOnly" in params:
+                    if params.get("positionSide") == "BOTH" and ctx.reduce_only:
+                        # Un cierre en One-way nunca va sin reduceOnly (podría abrir el lado contrario): si Binance
+                        # no lo acepta, la cuenta está en Hedge y se envía con su positionSide.
+                        params["positionSide"] = ctx.direction
+                        self.core.account.hedge_mode = True
                     params.pop("reduceOnly")
-                    notes.append("reduceOnly retirado")
+                    notes.append("reduceOnly retirado" + (f" (positionSide {ctx.direction})"
+                                                          if params["positionSide"] != "BOTH" else ""))
                     continue
                 if action == Action.FLIP_POSITION_SIDE:
                     if params.get("positionSide") in ("LONG", "SHORT"):
@@ -209,6 +218,8 @@ class OrderExecutor:
                         self.core.account.hedge_mode = True
                     notes.append(f"positionSide → {params['positionSide']} (modo real de la cuenta)")
                     continue
+                if action == Action.FIX_PRICE_TICK and price is None:
+                    raise  # una orden de mercado no tiene precio: no se toca el stepSize del símbolo
                 if action in (Action.FIX_PRECISION, Action.FIX_PRICE_TICK) and precision_rounds < 3:
                     precision_rounds += 1
                     coarsen_tick = action == Action.FIX_PRICE_TICK or (
@@ -329,6 +340,10 @@ class OrderExecutor:
                 step = rules.qty_step(True)
                 half = floor_step(part / 2, step)
                 if ErrorDoctor.diagnose(err).action != Action.SPLIT_QTY or splits >= 6 or half <= 0:
+                    if fill.qty > 0:
+                        # Partes anteriores ya ejecutadas: viajan con el error para que se registren.
+                        fill.avg_price = notional / fill.qty
+                        err.partial_fill = fill
                     raise
                 # Cantidad mayor al máximo (-4005): se envía en dos partes.
                 splits += 1
@@ -410,9 +425,9 @@ class OrderExecutor:
         results = await asyncio.gather(*jobs, return_exceptions=True)
         return sum(1 for r in results if r is True)
 
-    async def lower_leverage(self, symbol: str, current: int) -> Optional[int]:
+    async def lower_leverage(self, symbol: str, current: int) -> tuple[Optional[int], str]:
         """Baja el leverage del símbolo al siguiente escalón por debajo de ``current`` (nunca bajo
-        LEVERAGE_MIN). Devuelve el aplicado, o None si no se pudo bajar más."""
+        LEVERAGE_MIN). Devuelve (aplicado, "") o (None, por qué no se pudo)."""
         floor = max(1, min(self.core.settings.leverage_min, current))
         for lv in [x for x in LEVERAGE_LADDER if floor <= x < current]:
             try:
@@ -421,17 +436,20 @@ class OrderExecutor:
                 diag, _ = self._record(err, "leverage", symbol)
                 if diag.action == Action.LOWER_LEVERAGE:
                     continue
-                return None
+                return None, f"no se pudo bajar el leverage a {lv}x: [{diag.code}] {diag.info.title}"
             self.core.account.leverage[symbol] = lv
+            self.leverage_cap[symbol] = lv  # las siguientes aperturas no lo vuelven a subir (evita otro -2027)
             log.warning("Leverage %s: bajado de %sx a %sx", symbol, current, lv)
-            return lv
-        return None
+            return lv, ""
+        return None, f"ya en el leverage mínimo ({floor}x, LEVERAGE_MIN): la posición no cabe"
 
     # ── Leverage (único REST en el flujo de apertura, cacheado) ───────────
     async def ensure_leverage(self, symbol: str, target: int) -> int:
         rules = self.core.exinfo.get(symbol)
         if rules.max_leverage:
             target = min(target, rules.max_leverage)
+        if symbol in self.leverage_cap:
+            target = min(target, self.leverage_cap[symbol])
         current = self.core.account.leverage.get(symbol)
         if current == target:
             return target
@@ -497,7 +515,7 @@ class OrderExecutor:
             params["closePosition"] = "true"
         entry = None
         notes: list[str] = []
-        for _ in range(4):
+        for n in range(1, 8):
             try:
                 result = await self.core.ws.place_algo(**params)
                 self.core.account.register_algo_result(result)
@@ -517,8 +535,28 @@ class OrderExecutor:
                     notes.append(f"positionSide → {params['positionSide']}")
                     continue
                 if diag.action == Action.DROP_REDUCE_ONLY and "reduceOnly" in params:
+                    if params["positionSide"] == "BOTH":
+                        params["positionSide"] = direction  # One-way nunca sin reduceOnly: la cuenta es Hedge
                     params.pop("reduceOnly")
                     notes.append("reduceOnly retirado")
+                    continue
+                if diag.action in (Action.RETRY, Action.RESYNC_TIME):
+                    await asyncio.sleep(0.3 * n)
+                    notes.append("reintento tras error transitorio")
+                    continue
+                if diag.action == Action.WAIT and n <= 2:
+                    await asyncio.sleep(min(5.0, max(0.5, diag.retry_after)))
+                    notes.append("reintento tras límite de peticiones")
+                    continue
+                if diag.action in (Action.CHECK_STATUS, Action.NEW_CLIENT_ID):
+                    # ¿Se creó aunque no llegó la respuesta (o el id está duplicado)? Se busca por su clientAlgoId
+                    # antes de reenviar: nunca dos TP/SL iguales.
+                    found = await self._find_algo(symbol, params["clientAlgoId"])
+                    if found is not None:
+                        notes.append("TP/SL confirmado por su clientAlgoId (no se duplicó)")
+                        return found
+                    params["clientAlgoId"] = new_client_id(params["clientAlgoId"].rsplit("-", 1)[0])
+                    notes.append("no estaba creado: reenviado con otro clientAlgoId")
                     continue
                 if diag.action == Action.FIX_PRICE_TICK:
                     rules = self.core.exinfo.learn_coarser_tick(symbol, rules)
@@ -537,6 +575,21 @@ class OrderExecutor:
                     continue
                 raise
         raise BinanceAPIError(0, f"no se pudo crear el {kind} de {symbol}")
+
+    async def _find_algo(self, symbol: str, client_algo_id: str) -> Optional[dict]:
+        await asyncio.sleep(0.5)
+        for o in self.core.account.algos_for(symbol):
+            if o.client_id == client_algo_id:
+                return {"algoId": o.id, "clientAlgoId": o.client_id}
+        try:
+            rows = await self.core.rest.open_algo_orders()
+        except BinanceAPIError:
+            return None
+        for r in rows:
+            if r.get("clientAlgoId") == client_algo_id:
+                self.core.account.register_algo_result(r)
+                return r
+        return None
 
     async def cancel_protection(self, symbol: str, direction: Optional[str] = None,
                                 kinds: Optional[set] = None, client_prefix: Optional[str] = None,
