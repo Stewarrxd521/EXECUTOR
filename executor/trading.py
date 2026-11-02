@@ -1619,6 +1619,40 @@ class TradeManager:
             log.warning("%s sin precio de mercado: se usa el de la señal (%s)", symbol, fallback)
         return fallback
 
+    async def assumed_fill_price(self, symbol: str, side: str, qty: float, fallback: float) -> tuple[float, str]:
+        """Precio al que se habría llenado una orden de mercado que Binance no ejecutó (apertura asumida, -2019):
+        se recorre el libro en ese instante (asks para BUY, bids para SELL) y se toma el precio medio ponderado de
+        ``qty``. Sin libro, el mejor ask/bid; sin eso, ``fallback`` (mark o precio de la señal)."""
+        key = "asks" if side == "BUY" else "bids"
+        try:
+            levels = (await self.core.ws.depth(symbol, 20)).get(key) or []
+            left, cost, last = qty, 0.0, 0.0
+            for row in levels:
+                px, q = float(row[0]), float(row[1])
+                if px <= 0 or q <= 0:
+                    continue
+                take = min(left, q)
+                cost, left, last = cost + take * px, left - take, px
+                if left <= 1e-12:
+                    break
+            if last > 0 and qty > 0:
+                cost += max(left, 0.0) * last  # más allá de los 20 niveles: al peor precio visto
+                return round(cost / qty, 8), "libro"
+        except BinanceAPIError as err:
+            self.orders._record(err, "depth", symbol)
+        except (TypeError, ValueError, IndexError, AttributeError):
+            pass
+        try:
+            book = await self.core.ws.book_ticker(symbol)
+            px = float(book.get("askPrice" if side == "BUY" else "bidPrice") or 0)
+            if px > 0:
+                return px, "mejor ask/bid"
+        except BinanceAPIError as err:
+            self.orders._record(err, "ticker.book", symbol)
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return fallback, "referencia"
+
     async def open_trade(self, symbol: str, direction: str, *, signal_price: float = 0.0, quantity: float = 0.0,
                          notional: float = 0.0, paper_trade_id: int = 0, source: str = "signal",
                          leverage: Optional[int] = None, level: float = 0.0,
@@ -1707,12 +1741,15 @@ class TradeManager:
                     self._unknown_open[(symbol, direction)] = time.time()
                     self._unknown_owner[(symbol, direction)] = owner  # sus clientOrderIds se consultan después
                 if diag.info.code == -2019 and self.settings.assume_on_margin_error:
-                    log.warning("[ASUMIDA] %s %s: margen insuficiente, se registra como abierta", direction, symbol)
-                    trade = self._register_entry(symbol, direction, ref, float(qty), applied_lev, paper_trade_id,
+                    px, px_src = await self.assumed_fill_price(symbol, side, float(qty), ref)
+                    log.warning("[ASUMIDA] %s %s: margen insuficiente, se registra como abierta a %s (%s)",
+                                direction, symbol, px, px_src)
+                    trade = self._register_entry(symbol, direction, px, float(qty), applied_lev, paper_trade_id,
                                                  "MARGIN_INSUFFICIENT", self.core.account.is_hedge, rules.step_size,
                                                  assumed=True, source=source, bot=bot)
                     if trade is not None:
-                        trade.tranches.append({**tranche, "qty": float(qty), "fill_price": ref, "assumed": True})
+                        trade.tranches.append({**tranche, "qty": float(qty), "fill_price": px, "assumed": True,
+                                               "price_source": px_src})
                         if source == "signal":
                             trade.note_tranche_scale(multiplier, bot_quantity, float(qty))
                         self._announce_open(trade)

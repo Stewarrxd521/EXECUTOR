@@ -61,6 +61,7 @@ class FakeBinance:
         self.user_fills: list[dict] = []         # cada fill (GET /fapi/v1/userTrades)
         self.all_orders_error = False
         self.algo_fill_parts = 1
+        self.book: dict[str, dict] = {}  # libro explícito por símbolo: {"bids": [[px, qty]...], "asks": [...]}
         self.slippage_pct = 0.0          # % al que se llena una orden de mercado respecto del mark
         self.market_reply_new = False    # la respuesta de una MARKET llega como NEW sin avgPrice                        # en cuántos trades se llena un TP/SL disparado
         self.max_position_by_leverage: dict[int, float] = {}  # leverage -> notional máximo de la posición (-2027)
@@ -275,6 +276,19 @@ class FakeBinance:
                      "availableBalance": str(self.wallet * 0.9), "crossUnPnl": "0"}]
         if method in ("userDataStream.start", "userDataStream.ping"):
             return {"listenKey": "lk"}
+        if method == "depth":
+            book = self.book.get(p["symbol"])
+            if book is None:  # un nivel enorme al precio de llenado (mark ± slippage)
+                m, k = self.marks.get(p["symbol"], 0), self.slippage_pct / 100
+                book = {"bids": [[m * (1 - k), 1e9]], "asks": [[m * (1 + k), 1e9]]}
+            return {"lastUpdateId": 1, "bids": [[str(a), str(b)] for a, b in book["bids"]],
+                    "asks": [[str(a), str(b)] for a, b in book["asks"]]}
+        if method == "ticker.book":
+            book = self.book.get(p["symbol"])
+            m, k = self.marks.get(p["symbol"], 0), self.slippage_pct / 100
+            bid = book["bids"][0][0] if book else m * (1 - k)
+            ask = book["asks"][0][0] if book else m * (1 + k)
+            return {"symbol": p["symbol"], "bidPrice": str(bid), "askPrice": str(ask)}
         if method == "ticker.price":
             return {"symbol": p["symbol"], "price": str(self.marks.get(p["symbol"], 0))}
         if method == "order.place":
