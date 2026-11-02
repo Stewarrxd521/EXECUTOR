@@ -60,7 +60,9 @@ class FakeBinance:
         self.history: dict[int, dict] = {}       # órdenes con algo ejecutado (GET /fapi/v1/allOrders)
         self.user_fills: list[dict] = []         # cada fill (GET /fapi/v1/userTrades)
         self.all_orders_error = False
-        self.algo_fill_parts = 1                        # en cuántos trades se llena un TP/SL disparado
+        self.algo_fill_parts = 1
+        self.slippage_pct = 0.0          # % al que se llena una orden de mercado respecto del mark
+        self.market_reply_new = False    # la respuesta de una MARKET llega como NEW sin avgPrice                        # en cuántos trades se llena un TP/SL disparado
         self.max_position_by_leverage: dict[int, float] = {}  # leverage -> notional máximo de la posición (-2027)
         self.leverage: dict[str, int] = {s: 20 for s in self.marks}
         self.wallet = 10_000.0
@@ -351,8 +353,13 @@ class FakeBinance:
                  "avgPrice": 0.0, "timeInForce": p.get("timeInForce", "GTC"), "reduceOnly": p.get("reduceOnly") == "true"}
         if p["type"] == "MARKET":
             self.push(self._otu(order, "NEW"))
-            self._apply_fill(order, self.marks[sym], float(qty))
+            # Como Binance: una orden de mercado se llena contra el libro (precio del taker, no el mark).
+            slip = self.slippage_pct / 100 * (1 if p["side"] == "BUY" else -1)
+            self._apply_fill(order, round(self.marks[sym] * (1 + slip), 8), float(qty))
             self.done_orders[oid] = order  # Binance las sigue respondiendo en order.status
+            if self.market_reply_new:
+                # newOrderRespType=RESULT a veces responde NEW sin precio: el precio real llega por el user stream.
+                return {**order, "status": "NEW", "executedQty": "0", "avgPrice": "0.00"}
             return {**order, "executedQty": str(order["executedQty"]), "avgPrice": str(order["avgPrice"])}
         crosses = (p["side"] == "BUY" and price >= self.marks[sym]) or (p["side"] == "SELL" and price <= self.marks[sym])
         if crosses:

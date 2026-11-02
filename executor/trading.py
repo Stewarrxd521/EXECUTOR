@@ -1748,6 +1748,7 @@ class TradeManager:
                 if signal_price and not trade.signal_entry_price:
                     trade.signal_entry_price = signal_price
                 trade.tranches.append({**tranche, "qty": fill.qty, "fill_price": fill.avg_price,
+                                       "cids": list(fill.by_cid),
                                        "fill_ms": fill.update_ms or self.core.clock.now_ms(),
                                        "order_id": fill.order_id, "leverage": applied_lev,
                                        "leverage_target": target_lev})
@@ -3002,6 +3003,25 @@ class TradeManager:
     def _attempt_cids(self, attempt: dict) -> list[str]:
         return list(dict.fromkeys(list(attempt.get("cids") or []) + self._owned_cids(attempt["record"])))
 
+    def _note_real_price(self, trade: Trade, upd: OrderUpdate) -> None:
+        """El fill real de una apertura (user stream): su precio reemplaza al provisional del tramo (la respuesta
+        de la orden pudo no traerlo) y la entrada del trade pasa a la que calcula Binance para la posición."""
+        if upd.avg_price <= 0:
+            return
+        for t in trade.tranches:
+            if upd.client_id in (t.get("cids") or []):
+                px = t.setdefault("cid_px", {})
+                px[upd.client_id] = [upd.cum_qty, upd.avg_price]
+                qty = sum(q for q, _ in px.values())
+                if qty > 0:
+                    t["fill_price"] = sum(q * p for q, p in px.values()) / qty
+                    t["price_real"] = True
+                break
+        pos = self.core.account.position(trade.symbol, trade.direction)
+        if pos is not None and pos.entry_price > 0 and self.trades.get(trade.key) is trade:
+            trade.entry_price = pos.entry_price
+        self.save()
+
     def _rebook(self, rec: Trade) -> None:
         """Recalcula el PnL de un registro ya cerrado (comisión o ajuste que llegó después)."""
         before = rec.pnl_usdt
@@ -3063,6 +3083,10 @@ class TradeManager:
     def _book_close(self, trade: Trade, reason: str, close_price: float, bot_pnl: Optional[float] = None,
                     closed_by: str = "") -> None:
         """Pasa al historial un trade (o el lote de un trade_id) ya cerrado, con su PnL."""
+        px = trade.__dict__.get("_close_px") or {}
+        qty = sum(q for q, _ in px.values())
+        if qty > 0:
+            close_price = sum(q * p for q, p in px.values()) / qty  # el precio real de Binance (user stream)
         trade.status = reason
         trade.close_price = close_price
         trade.close_time = utc_now_str()
@@ -3258,6 +3282,7 @@ class TradeManager:
                     self._apply_fill(owner_trade, upd.client_id, owner.get("lot", ""), +1, upd.cum_qty)
                 if owner_trade is not None:
                     owner_trade.fees_usdt += upd.fee_usdt
+                    self._note_real_price(owner_trade, upd)
                     if owner_trade.close_time:
                         self._rebook(owner_trade)  # comisión de la apertura que llegó después del cierre
                 else:
@@ -3266,6 +3291,12 @@ class TradeManager:
             if isinstance(owner, Trade):
                 owner.fees_usdt += upd.fee_usdt
                 owner.realized_exchange += upd.realized_pnl
+                if upd.avg_price > 0:  # precio real de su cierre (el de la respuesta pudo no traerlo)
+                    px = owner.__dict__.setdefault("_close_px", {})
+                    px[upd.client_id] = (upd.cum_qty, upd.avg_price)
+                    qty = sum(q for q, _ in px.values())
+                    if owner.close_time and qty > 0:
+                        owner.close_price = sum(q * p for q, p in px.values()) / qty
                 # Libro: un registro de lote cierra su lote; un trade (cierre sin trade_id), la posición.
                 if owner.notes == LOT_NOTE:
                     parent = getattr(owner, "_parent", None)
@@ -3307,6 +3338,8 @@ class TradeManager:
             if trade is None or trade.key in self._closing or trade.order_assumed:
                 continue
             pos = self.core.account.position(symbol, trade.direction)
+            if pos is not None and pos.entry_price > 0:
+                trade.entry_price = pos.entry_price  # la entrada media real de Binance (aunque haya una orden en curso)
             if pos is None:
                 self._schedule_external_check(trade)
             elif abs(pos.qty - trade.quantity) > 1e-12 and not self._lock(symbol).locked():
