@@ -272,6 +272,7 @@ class Trade:
     bot_pnl: float = 0.0
     has_bot_pnl: bool = False
     signal_close_price: float = 0.0
+    close_price_source: str = ""  # cierre sin orden real (asumida): "libro", "mejor ask/bid" o "referencia"
     closed_by: str = ""
     # Multiplicador: cantidad que pidió el bot y factor medio aplicado (real ≈ bot × factor).
     bot_quantity: float = 0.0
@@ -429,8 +430,12 @@ class Trade:
         return real / bot if real > 0 and bot > 0 else (self.multiplier or 1.0)
 
     def lot_entry(self, ref: Any) -> float:
-        """Precio medio de entrada de ese trade_id (sus fills); sin datos, el de la posición."""
-        rows = [t for t in self.lot_tranches(ref) if not t.get("assumed") and safe_float(t.get("fill_price")) > 0]
+        """Precio medio de entrada de ese trade_id (sus fills); un lote solo asumido, el de sus tramos asumidos
+        (el libro de Binance en ese instante); sin datos, el de la posición."""
+        priced = [t for t in self.lot_tranches(ref) if safe_float(t.get("fill_price")) > 0]
+        rows = [t for t in priced if not t.get("assumed")]
+        if not rows and self.lot_key(ref) not in self.lots:
+            rows = priced  # sin fills reales: solo sus tramos asumidos
         qty = sum(safe_float(t.get("qty")) for t in rows)
         return sum(safe_float(t["fill_price"]) * safe_float(t.get("qty")) for t in rows) / qty if qty > 0 \
             else self.entry_price
@@ -1653,6 +1658,14 @@ class TradeManager:
             pass
         return fallback, "referencia"
 
+    async def _assumed_exit_price(self, trade: Trade, qty: float, fallback: float) -> tuple[float, str]:
+        """Cierre de una parte asumida: el precio de una orden de mercado de cierre en este instante (SELL
+        contra los bids si es LONG, BUY contra los asks si es SHORT) y su origen."""
+        side = "SELL" if trade.direction == "LONG" else "BUY"
+        px, src = await self.assumed_fill_price(trade.symbol, side, qty, fallback)
+        log.info("[ASUMIDA] %s %s: cierre de %s a %s (%s)", trade.direction, trade.symbol, fmt(qty), px, src)
+        return px, src
+
     async def open_trade(self, symbol: str, direction: str, *, signal_price: float = 0.0, quantity: float = 0.0,
                          notional: float = 0.0, paper_trade_id: int = 0, source: str = "signal",
                          leverage: Optional[int] = None, level: float = 0.0,
@@ -2153,13 +2166,15 @@ class TradeManager:
         pos, known = await self._position_for_close(trade)
         market_px = self.core.market.price(trade.symbol)
         if pos is None and (known or trade.order_assumed):
+            exit_px = close_price or market_px or trade.entry_price
             if not trade.order_assumed:
                 log.info("%s %s: Binance confirma que ya no hay posición; se cierra el registro",
                          trade.symbol, trade.direction)
+            else:
+                exit_px, trade.close_price_source = await self._assumed_exit_price(trade, trade.quantity, exit_px)
             await self._settle_before_finalize(trade)
             if self.trades.get(key) is trade:
-                self._finalize(trade, reason, close_price or market_px or trade.entry_price,
-                               bot_pnl=bot_pnl, closed_by=closed_by)
+                self._finalize(trade, reason, exit_px, bot_pnl=bot_pnl, closed_by=closed_by)
             return True
         base = pos.qty if pos is not None else trade.quantity
         rules = self.core.exinfo.get(trade.symbol, market_px)
@@ -2328,21 +2343,28 @@ class TradeManager:
         lot_qty = trade.lots.get(lk, 0.0)
         assumed = trade.assumed_lots.get(lk, 0.0)
         if lot_qty <= tol and assumed > 0:
+            # Sin orden real: el precio al que se habría cerrado a mercado (el libro de Binance ahora).
+            exit_px, exit_src = await self._assumed_exit_price(trade, assumed,
+                                                               close_price or market_px or trade.entry_price)
+            if self.trades.get(key) is not trade or trade.assumed_lots.get(lk, 0.0) != assumed \
+                    or trade.lots.get(lk, 0.0) > tol:
+                self._close_retryable[key] = True  # cambió mientras se leía el libro: se vuelve a evaluar
+                return False
             trade.assumed_lots.pop(lk, None)
             self._drop_lot_protection(trade, lk)
             if trade.order_assumed and not trade.assumed_lots:
                 trade.paper_trade_id = tid or trade.paper_trade_id
-                self._finalize(trade, reason, close_price or market_px or trade.entry_price, bot_pnl=bot_pnl,
-                               closed_by=closed_by)
+                trade.close_price_source = exit_src
+                self._finalize(trade, reason, exit_px, bot_pnl=bot_pnl, closed_by=closed_by)
             else:
                 record = self._lot_trade(trade, lk, assumed, close_price)
                 record.order_assumed = True
                 if trade.order_assumed:
                     trade.quantity = max(0.0, trade.quantity - assumed)
                 trade.tranches = [t for t in trade.tranches if t not in record.tranches]
+                record.close_price_source = exit_src
                 self._unmap_lot(trade, lk)
-                self._book_close(record, reason, close_price or market_px or trade.entry_price, bot_pnl=bot_pnl,
-                                 closed_by=closed_by)
+                self._book_close(record, reason, exit_px, bot_pnl=bot_pnl, closed_by=closed_by)
             self._note_closed(lot_ref(bot, tid), trade.symbol, trade.direction)
             self.save()
             return True

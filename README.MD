@@ -153,11 +153,14 @@ en español, la causa típica, la solución y la **corrección automática** que
 | -2022, -2024 reduceOnly rechazado | Relee la posición; si ya está en 0 la da por cerrada |
 | -2019 margen insuficiente | Registra la posición como *asumida* (comportamiento anterior) o, con `MARGIN_AUTO_REDUCE=true`, reintenta con menos cantidad |
 
-> **Precio de una apertura asumida.** Binance no ejecuta nada, así que no hay fill real. Se registra el precio al
-> que se habría llenado la orden de mercado en ese instante: el libro de Binance (`depth`, asks para LONG, bids para
-> SHORT) recorrido por la cantidad (precio medio ponderado). Sin libro, el mejor ask/bid (`ticker.book`); sin eso, el
-> mark o el precio de la señal. El tramo guarda de dónde salió (`price_source`: `libro`, `mejor ask/bid`,
-> `referencia`).
+> **Precios de una operación asumida.** Binance no ejecuta nada, así que no hay fill real. La apertura y el cierre
+> se registran al precio al que se habría llenado la orden de mercado en ese instante: el libro de Binance (`depth`,
+> 20 niveles) recorrido por la cantidad, con su precio medio ponderado. Abrir LONG o cerrar SHORT va contra los asks;
+> abrir SHORT o cerrar LONG, contra los bids. Así el PnL de una asumida incluye el spread y el deslizamiento, como
+> en real. Sin libro, el mejor ask/bid (`ticker.book`); sin eso, el mark o el precio de la señal. El origen queda
+> guardado: `price_source` en el tramo de apertura y `close_price_source` en el registro cerrado (`libro`,
+> `mejor ask/bid` o `referencia`); el CSV del historial incluye `order_assumed` y `close_price_source`. Un lote
+> asumido dentro de una posición real usa su propia entrada, no la media de la posición.
 | -2011, -2013, -4046, -4059 | Ya estaba hecho: no es un error real |
 
 La pestaña **Errores** del dashboard muestra cada error con su explicación, si se autocorrigió y cómo, e incluye un

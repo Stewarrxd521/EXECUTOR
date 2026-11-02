@@ -164,7 +164,7 @@ def register_rest(app: web.Application, service: ExecutorService, auth: Auth) ->
         cols = ["id", "paper_trade_id", "paper_ids", "symbol", "direction", "status", "source", "closed_by",
                 "open_time", "close_time", "entry_price", "close_price", "quantity", "leverage", "pnl_usdt",
                 "roi_pct", "roe_pct", "fees_usdt", "bot_pnl", "pnl_diff", "signal_entry_price",
-                "signal_close_price", "levels"]
+                "signal_close_price", "order_assumed", "close_price_source", "levels"]
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(cols)
