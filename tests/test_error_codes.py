@@ -11,8 +11,9 @@ from tests.conftest import wait_for
 from tests.test_lots import SYM, amt, close, lots, open_, opened
 
 # Lo que el executor arregla solo al abrir (y vuelve a enviar).
+# FIX_PRICE_TICK no: una orden de mercado no tiene precio que ajustar (se rechaza sin tocar el stepSize).
 FIXED_ON_OPEN = {Action.RETRY, Action.RESYNC_TIME, Action.CHECK_STATUS, Action.NEW_CLIENT_ID,
-                 Action.FIX_PRECISION, Action.FIX_PRICE_TICK, Action.RAISE_QTY, Action.RAISE_NOTIONAL,
+                 Action.FIX_PRECISION, Action.RAISE_QTY, Action.RAISE_NOTIONAL,
                  Action.CLAMP_PRICE, Action.LOWER_LEVERAGE, Action.SPLIT_QTY, Action.FLIP_POSITION_SIDE}
 MSG = {-4164: "Order's notional must be no smaller than 20 (unless you choose reduce only).",
        -1003: "Too many requests; current limit is 2400 requests per minute."}
