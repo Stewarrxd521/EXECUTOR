@@ -77,6 +77,7 @@ class Settings:
 
     # ── Riesgo / tamaño ───────────────────────────────────────────────────
     leverage: int = 4
+    leverage_min: int = 4   # -2027 y similares: el leverage baja hasta aquí; si no basta, se rechaza (LEVERAGE_MIN)
     leverage_env: int = 4
     leverage_required: bool = False
     high_price_threshold: float = 2.0
@@ -90,6 +91,7 @@ class Settings:
     assume_on_margin_error: bool = True
     margin_auto_reduce: bool = False
     max_price_age_s: float = 5.0
+    fast_signals: bool = True   # HFT: sin consultas previas a Binance cuando lo conocido ya basta (FAST_SIGNALS)
     signal_dedupe_ttl_s: float = 0.0
     signal_wait_timeout_s: float = 7.0
 
@@ -233,6 +235,7 @@ def load_settings() -> Settings:
         proxy_urls=proxies,
         rest_proxy_all=_env_bool("REST_PROXY_ALL", False),
         leverage=leverage,
+        leverage_min=max(1, min(125, _env_int("LEVERAGE_MIN", 4))),
         leverage_env=leverage,
         leverage_required=_env_bool("LEVERAGE_REQUIRED", False),
         high_price_threshold=_env_float("HIGH_PRICE_THRESHOLD", 2.0),
@@ -246,6 +249,7 @@ def load_settings() -> Settings:
         assume_on_margin_error=_env_bool("ASSUME_ON_MARGIN_ERROR", True),
         margin_auto_reduce=_env_bool("MARGIN_AUTO_REDUCE", False),
         max_price_age_s=_env_float("MAX_PRICE_AGE_S", 5.0),
+        fast_signals=_env_bool("FAST_SIGNALS", True),
         signal_dedupe_ttl_s=_env_float("SIGNAL_DEDUPE_TTL_S", 0.0),
         signal_wait_timeout_s=_env_float("SIGNAL_WAIT_TIMEOUT_S", 7.0),
         recv_window_ms=_env_int("RECV_WINDOW_MS", 5000),

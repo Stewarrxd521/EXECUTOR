@@ -156,6 +156,7 @@ class Balance:
 class AccountState:
     def __init__(self, hedge_hint: bool = False):
         self.positions: dict[tuple[str, str], Position] = {}
+        self._gone: dict[tuple[str, str], float] = {}  # posición cerrada por el user stream -> cuándo
         self.balances: dict[str, Balance] = {}
         self.leverage: dict[str, int] = {}
         self.margin_type: dict[str, str] = {}
@@ -228,6 +229,8 @@ class AccountState:
             for key, pos in self.positions.items():
                 if pos.update_ts > as_of:
                     fresh[key] = pos
+            for key in [k for k in fresh if self._gone.get(k, 0.0) > as_of and k not in self.positions]:
+                del fresh[key]  # se cerró mientras la respuesta viajaba
         self.positions = fresh
         self.last_sync = time.time()
         self._touch()
@@ -236,7 +239,8 @@ class AccountState:
         """Igual que el snapshot completo pero solo para ``symbol``."""
         symbol = symbol.upper()
         fresh = {k: v for k, v in self._parse_position_rows(
-            [r for r in rows if r.get("symbol") == symbol]).items()}
+            [r for r in rows if r.get("symbol") == symbol]).items()
+            if as_of is None or k in self.positions or self._gone.get(k, 0.0) <= as_of}
         for key in [k for k in self.positions if k[0] == symbol]:
             pos = self.positions[key]
             if as_of is not None and pos.update_ts > as_of and key not in fresh:
@@ -312,6 +316,7 @@ class AccountState:
             amt = safe_float(p.get("pa"))
             if amt == 0:
                 self.positions.pop(key, None)
+                self._gone[key] = time.time()  # un snapshot pedido antes no la resucita
             else:
                 pos = self.positions.get(key) or Position(sym, side, amt)
                 pos.amount = amt

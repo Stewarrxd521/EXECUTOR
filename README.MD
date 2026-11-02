@@ -41,6 +41,37 @@ Código en el paquete `executor/`:
 | `service.py` | Orquestación y comandos del dashboard |
 | `web/` | Servidor HTTP/WebSocket y dashboard |
 
+## Operaciones de milisegundos (latencia)
+
+El executor envía la orden en cuanto recibe la señal: dentro del proceso tarda ~1 ms (señal → orden enviada,
+medido con el simulador). Lo que domina en real es la red hasta Binance: cada consulta previa a la orden suma una
+ida y vuelta completa. Con `FAST_SIGNALS=true` (por defecto) no se hace ninguna cuando lo que ya se sabe basta:
+
+- **Apertura:** si la señal trae `price` y `quantity` (o `notional`) y no hay precio de mercado fresco, se usa el
+  de la señal en vez de consultar `ticker.price`.
+- **Cierre:** si la posición que el user stream ya informó cuadra con el libro de lotes y no hay nada pendiente de
+  confirmar, la orden sale sin releer la posición (con el user stream conectado y estable). Las órdenes de cierre
+  son `reduceOnly` y nunca piden más que el lote, así que no pueden cerrar de más. Si algo no cuadra, se relee.
+- Un `open` y su `close` que llegan en el mismo milisegundo se ejecutan en orden: el `close` espera a su `open`.
+
+Con 25 ms de ida y vuelta a Binance (medido con el simulador): apertura ~51 ms (antes ~101), cierre de un lote
+~15 ms (antes ~43). Compromiso del modo rápido: si en esos mismos milisegundos alguien cierra parte de la posición
+por fuera (ADL, otro bot, a mano) y el user stream aún no lo avisó, esa reducción no se reparte en proporción
+entre los lotes. `FAST_SIGNALS=false` relee siempre la posición antes de cerrar (+1 ida y vuelta).
+
+Para que en real las operaciones de milisegundos lleguen a tiempo:
+
+- **Región del servidor:** los servidores de Binance Futures están en Tokio (AWS ap-northeast-1). En Render, la
+  región más cercana es **Singapur** (~70 ms de ida y vuelta); desde Frankfurt son ~200–250 ms. Desde EE. UU.
+  Binance bloquea el acceso.
+- **Señales por WebSocket:** los bots envían por `/ws/signal` (conexión abierta) en vez de `POST /signal`, sin
+  el handshake TLS/HTTP de cada señal. [`executor_ws_signal.py`](executor_ws_signal.py) (cópialo junto al bot, usa
+  `websockets`) abre la conexión al arrancar, se reconecta sola y, si el WebSocket no está disponible, envía por
+  `POST /signal` con el mismo `signal_id` (nunca se ejecuta dos veces). `app.py` ya lo usa; `EXECUTOR_USE_WS=false`
+  vuelve a `POST`. Una `EXECUTOR_URL` con `/b/<bot>` funciona igual (`/b/<bot>/ws/signal`).
+- **Bots en la misma región** que el executor.
+- Esto no es HFT de colocación (microsegundos): para eso hace falta un servidor junto a Binance y conexión directa.
+
 ## Ancho de banda (Render)
 
 Render factura el tráfico **de salida**. En las conexiones que abre el executor (Binance, proxy, Telegram,
@@ -109,12 +140,16 @@ en español, la causa típica, la solución y la **corrección automática** que
 | -4014, -4029 tick | Redondea el precio al tick |
 | -4164 / -1013 notional mínimo | Sube la cantidad al mínimo exigido (y aprende el mínimo que indica Binance) |
 | -4061, -4060 positionSide | Detecta el modo real (Hedge/One-way) y reenvía |
-| -1106 reduceOnly en Hedge | Quita `reduceOnly` y reenvía |
-| -1006, -1007, 503 estado desconocido | Consulta `order.status` antes de reenviar: nunca duplica la orden |
+| -1106 reduceOnly en Hedge | Quita `reduceOnly` y reenvía (en One-way un cierre nunca va sin `reduceOnly`: se envía con su `positionSide`) |
+| -1006, -1007, -1000, 503 estado desconocido; -4116 id duplicado | Consulta la orden por su `clientOrderId` antes de reenviar: nunca la duplica. Un cierre no se reenvía: lo confirma su intento |
 | -1021 / -5028 reloj | Recalcula el desfase con los eventos del stream y reintenta |
-| -1003, 418, 429 rate limit | Pausa ese canal hasta que expire el ban; REST rota a otro proxy |
-| -4028, -4202, -4203 leverage | Baja por la escalera de leverage hasta uno aceptado |
-| -4131 PERCENT_PRICE en MARKET | Convierte a LIMIT IOC dentro de la banda |
+| -1003, -1015, 418, 429 rate limit | Pausa ese canal hasta que expire el ban; REST rota a otro proxy. Un **cierre** espera lo que pide Binance y se reenvía (aunque el ban dure minutos); una **apertura** se rechaza al momento (segundos tarde ya no es la señal del bot) |
+| -2027 posición máxima para el leverage (y -4028, -4202, -4203, -4403) | Baja el leverage un escalón cada vez (7 → 5 → 4) sin pasar de `LEVERAGE_MIN` y reenvía; solo entonces rechaza, diciendo por qué (en el mínimo, o Binance no dejó bajarlo). Las aperturas siguientes del símbolo usan ese leverage |
+| -4005 cantidad máxima | Divide la orden en partes |
+| -4131, -1013 PERCENT_PRICE en MARKET | Convierte a LIMIT IOC dentro de la banda (nunca cambia el stepSize) |
+| -2021 TP/SL ya cruzado | El de un `trade_id` cierra su lote a mercado (lo que iba a hacer); el de la posición entera se rechaza |
+| TP/SL: -1001, -1008, -1000, -4116 | Reintenta; si la respuesta se perdió, lo busca por su `clientAlgoId` antes de reenviar |
+| Orden dividida que falla a medias | Registra la parte ejecutada (nunca queda una posición sin trade) |
 | -2022, -2024 reduceOnly rechazado | Relee la posición; si ya está en 0 la da por cerrada |
 | -2019 margen insuficiente | Registra la posición como *asumida* (comportamiento anterior) o, con `MARGIN_AUTO_REDUCE=true`, reintenta con menos cantidad |
 | -2011, -2013, -4046, -4059 | Ya estaba hecho: no es un error real |
@@ -232,15 +267,19 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
     - Aun así, lo más seguro es un Render Disk (`DATA_DIR=/var/data`).
   - La cuenta debe estar en **Hedge mode** para que LONG y SHORT del mismo símbolo sean posiciones distintas. En
     One-way, el executor avisa al arrancar (log, dashboard y Telegram).
-  - **TP/SL:** el TP/SL que envía un `trade_id` (`tp`/`sl` en la apertura, u `open_tp`/`open_sl`):
-    - Si en la posición solo está su lote, cubre la cantidad de ese lote y al dispararse se descuenta de él. Antes
-      de cerrar ese `trade_id` por señal se cancela (para que no se dispare sobre otros bots justo después); si el
-      lote sigue abierto (cierre parcial o fallido), se vuelve a poner con lo que le queda.
-    - Si ya hay lotes de otros `trade_id` o cantidad abierta por fuera, cubre la posición entera, no es de ningún
-      `trade_id` (ningún cierre por `trade_id` lo cancela) y al dispararse se reparte entre todos. El executor lo
-      avisa en el detalle de la señal y en el dashboard. Binance admite un TP y un SL por lado: uno nuevo reemplaza
-      al anterior.
-    - Para que cada bot cierre solo lo suyo, lo más seguro es cerrar con `close` + `trade_id` (como app_25).
+  - **TP/SL por trade_id:** el TP/SL que envía un `trade_id` (`tp`/`sl` en la apertura, u `open_tp`/`open_sl`)
+    es solo suyo, aunque varios bots compartan par y lado:
+    - Se coloca con la cantidad de su lote y su lote en el `clientAlgoId` (`T5:kline-…` el TP, `S5:kline-…` el
+      SL). Binance admite varios TP/SL en la misma posición, cada uno con su cantidad.
+    - Uno nuevo del mismo `trade_id` reemplaza solo el suyo; `close_tp`/`close_sl` con `trade_id` cancela solo el
+      suyo.
+    - Al dispararse, su fill se descuenta de su lote. Si el lote queda en cero, se cancela también su otro TP/SL.
+    - Al cerrar ese `trade_id` por señal se cancela su TP/SL antes de enviar el cierre; si el lote sigue abierto
+      (cierre parcial o fallido), o se reduce por fuera, se vuelve a poner con la cantidad que le queda.
+    - Sin `trade_id` (dashboard o `open_tp` sin `trade_id`), el TP/SL cubre la posición entera y convive con los
+      de cada `trade_id`.
+    - Binance limita las órdenes condicionales abiertas por símbolo (normalmente 10): con muchos bots en el mismo
+      par, la que pase del límite se rechaza y se avisa en el detalle de la señal.
 - **Identidad de cada bot.** Si dos bots usan los mismos números de `trade_id` en el mismo símbolo (app.py numera
   1, 2, 3… en cada proceso), sus lotes se mezclarían. Para separarlos, cada bot se identifica de una de estas formas:
   - Sin tocar su código: su `EXECUTOR_URL` termina en `/b/<nombre>` (por ejemplo
@@ -340,6 +379,7 @@ ambos y las pruebas los ejecutan contra el executor.
 | `PROXY_URLS` | — | Proxies HTTP separados por coma para REST (rotación y baneo por IP). `FIXIE_URL` sigue aceptándose |
 | `REST_PROXY_ALL` | `false` | Usar los proxies para todo el REST. Por defecto: leverage y exchangeInfo por proxy; el resto directo, pasando a un proxy si Binance bloquea la IP (403/451/-2015) |
 | `LEVERAGE` / `DEFAULT_LEVERAGE` | `4` | Leverage de las señales (editable desde el dashboard) |
+| `LEVERAGE_MIN` | `4` | Mínimo al que se baja el leverage ante -2027; por debajo, la apertura se rechaza |
 | `HIGH_PRICE_THRESHOLD` / `HIGH_PRICE_LEVERAGE` | `2.0` / `20` | Leverage para símbolos con precio alto |
 | `HEDGE_MODE` | `false` | Solo pista inicial: el modo real se detecta por WebSocket |
 | `BLOCKED_SYMBOLS` | `BTCUSDT,ETHUSDT,BTCUSDC,ETHUSDC` | Símbolos que no se abren por señal |

@@ -453,6 +453,7 @@ async def test_outside_fill_while_another_open_holds_the_lock(service, fake):
 
 async def test_lagged_outside_fill_after_a_lot_close_is_charged_once(service, fake):
     t = service.trades
+    service.settings.fast_signals = False         # modo seguro: relee la posición antes de cerrar
     open_(t, 1, 0.01)
     await opened(t, fake, 0.01)
     open_(t, 2, 0.01)

@@ -373,25 +373,57 @@ class BinanceFuturesClient:
 # INTEGRACIÓN CON EL EXECUTOR (apertura/cierre reales en otra app de Render)
 # ─────────────────────────────────────────────────────────────────────────────
 
+try:
+    from executor_ws_signal import ExecutorSignalSocket       # noqa: E402
+except ImportError:                                           # sin el módulo: señales por POST /signal
+    ExecutorSignalSocket = None  # type: ignore
+
+EXECUTOR_USE_WS = os.getenv("EXECUTOR_USE_WS", "true").lower() == "true"
+_executor_socket = None
+_executor_socket_lock = threading.Lock()
+
+
+def _executor_ws():
+    """Conexión WebSocket persistente a /ws/signal (se abre una vez y se reconecta sola)."""
+    global _executor_socket
+    if not (EXECUTOR_URL and EXECUTOR_USE_WS and ExecutorSignalSocket):
+        return None
+    with _executor_socket_lock:
+        if _executor_socket is None:
+            _executor_socket = ExecutorSignalSocket(EXECUTOR_URL, EXECUTOR_SIGNAL_SECRET)
+        return _executor_socket
+
+
+def _executor_send_signal_post(payload: dict) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{EXECUTOR_URL}/signal",
+        data=body,
+        headers={
+            "Content-Type":     "application/json",
+            "X-Signal-Secret":  EXECUTOR_SIGNAL_SECRET,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        resp.read()
+
+
 def _executor_send_signal_sync(payload: dict) -> None:
-    """Envía una señal (open/close) al Executor. Falla en silencio (solo log)
-    si el Executor no está configurado o no responde — nunca debe tumbar
-    el bot principal."""
+    """Envía una señal (open/close) al Executor por WebSocket (/ws/signal); si no está disponible, por
+    POST /signal con el mismo signal_id (nunca se ejecuta dos veces). Falla en silencio (solo log): nunca
+    debe tumbar el bot principal."""
     if not EXECUTOR_URL:
         return
     try:
-        body = json.dumps(payload).encode("utf-8")
-        req  = urllib.request.Request(
-            f"{EXECUTOR_URL}/signal",
-            data=body,
-            headers={
-                "Content-Type":     "application/json",
-                "X-Signal-Secret":  EXECUTOR_SIGNAL_SECRET,
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            resp.read()
+        sock = _executor_ws()
+        if sock is not None:
+            reply = sock.send(payload)
+            if not reply.get("ok") and not reply.get("duplicate"):
+                print(f"[executor-signal] {payload.get('action')} {payload.get('symbol')}: "
+                      f"{reply.get('error') or reply.get('detail') or reply}", flush=True)
+            return
+        _executor_send_signal_post(payload)
     except Exception as exc:
         print(
             f"[executor-signal] error enviando {payload.get('action')} "
@@ -1229,6 +1261,7 @@ class TradingBot:
             self.log("[executor] EXECUTOR_URL no configurado — PnL real no disponible")
             return
         self.log(f"[executor] Polling de estado activo → {EXECUTOR_URL}")
+        _executor_ws()  # abre ya la conexión de señales (la primera orden no espera al handshake)
         while self.running:
             try:
                 data = await asyncio.to_thread(_executor_fetch_state_sync)

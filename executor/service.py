@@ -89,6 +89,7 @@ class ExecutorService:
         self.trades.grid_owner = self.grids.owns
         self.grids.trade_owner = lambda s, d: self.trades.get_trade(s, d) is not None
         self.user = UserDataStream(settings.stream_base_url, ws, clock, self._on_user_event, self._on_user_connect)
+        self.trades.user_conn = self.user.conn
         market.on_tick(self._on_market_tick)
         self.logs = LogBuffer()
         logging.getLogger().addHandler(self.logs)
@@ -305,7 +306,10 @@ class ExecutorService:
         while True:
             await asyncio.sleep(600)
             if self.core.exinfo.age_hours() >= self.settings.exchange_info_refresh_h:
-                await self.refresh_exchange_info("refresco programado")
+                try:
+                    await self.refresh_exchange_info("refresco programado")
+                except Exception as exc:  # un fallo (red, otra actualización en curso) no detiene el bucle
+                    log.warning("exchangeInfo: refresco programado fallido (%s); se reintenta luego", exc)
 
     async def _bootstrap_exinfo(self) -> None:
         """Genera el snapshot inicial, reintentando con espera creciente."""
@@ -369,6 +373,7 @@ class ExecutorService:
             self._balance_dirty = True
         elif kind == "ALGO_UPDATE":
             o = acct.apply_algo_update(evt)
+            self.trades.on_algo_update(o)
             if o.get("X") == "REJECTED" or o.get("rm"):
                 self.core.bus.emit("algo", f"{o.get('o')} {o.get('s')} rechazado: {o.get('rm', '')}", "error")
         elif kind == "ACCOUNT_CONFIG_UPDATE":

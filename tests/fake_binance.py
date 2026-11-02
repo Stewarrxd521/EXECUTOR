@@ -60,6 +60,8 @@ class FakeBinance:
         self.history: dict[int, dict] = {}       # órdenes con algo ejecutado (GET /fapi/v1/allOrders)
         self.user_fills: list[dict] = []         # cada fill (GET /fapi/v1/userTrades)
         self.all_orders_error = False
+        self.algo_fill_parts = 1                        # en cuántos trades se llena un TP/SL disparado
+        self.max_position_by_leverage: dict[int, float] = {}  # leverage -> notional máximo de la posición (-2027)
         self.leverage: dict[str, int] = {s: 20 for s in self.marks}
         self.wallet = 10_000.0
         self.seq = 1000
@@ -170,7 +172,8 @@ class FakeBinance:
         order["executedQty"] = float(order.get("executedQty", 0)) + qty
         self.history[order["orderId"]] = order  # GET /fapi/v1/allOrders
         order["avgPrice"] = price
-        order["status"] = "FILLED"
+        full = float(order["executedQty"]) >= float(order.get("origQty") or 0) - 1e-12
+        order["status"] = "FILLED" if full else "PARTIALLY_FILLED"
         event = self._otu(order, "TRADE", last_qty=qty, last_price=price, realized=realized)
         self.user_fills.append({"symbol": sym, "id": len(self.user_fills) + 1, "orderId": order["orderId"],
                                 "side": side, "positionSide": ps, "price": str(price), "qty": str(qty),
@@ -218,16 +221,22 @@ class FakeBinance:
             hit = (mark >= trig) if (a["type"] == "TAKE_PROFIT_MARKET") == long_close else (mark <= trig)
             if hit:
                 del self.algos[aid]
-                self.push({"e": "ALGO_UPDATE", "E": int(time.time() * 1000), "o": {"aid": aid, "caid": a["clientAlgoId"],
-                           "s": symbol, "X": "TRIGGERED", "o": a["type"], "S": a["side"], "ps": a["positionSide"],
-                           "tp": a["triggerPrice"], "q": a.get("quantity", "0")}})
                 pos = self.positions.get((symbol, a["positionSide"]), {"amt": 0.0})
                 qty = abs(pos["amt"]) if not a.get("quantity") else min(abs(pos["amt"]), float(a["quantity"]))
+                oid = self._next()
+                base = {"aid": aid, "caid": a["clientAlgoId"], "s": symbol, "o": a["type"], "S": a["side"],
+                        "ps": a["positionSide"], "tp": a["triggerPrice"], "q": a.get("quantity", "0")}
+                # Como Binance: TRIGGERED (con «ai», la orden creada) -> fill(s) -> FINISHED.
+                self.push({"e": "ALGO_UPDATE", "E": int(time.time() * 1000), "o": {**base, "X": "TRIGGERED", "ai": oid}})
                 if qty > 0:
                     order = {"symbol": symbol, "side": a["side"], "type": "MARKET", "origType": a["type"],
-                             "positionSide": a["positionSide"], "origQty": qty, "orderId": self._next(),
+                             "positionSide": a["positionSide"], "origQty": qty, "orderId": oid,
                              "clientOrderId": f"algo{aid}", "status": "NEW", "reduceOnly": True}
-                    self._apply_fill(order, mark, qty)
+                    parts = max(1, int(self.algo_fill_parts))
+                    piece = round(qty / parts, 10)
+                    for i in range(parts):
+                        self._apply_fill(order, mark, piece if i < parts - 1 else round(qty - piece * (parts - 1), 10))
+                self.push({"e": "ALGO_UPDATE", "E": int(time.time() * 1000), "o": {**base, "X": "FINISHED", "ai": oid}})
 
     # ── WS API ────────────────────────────────────────────────────────────
     async def _ws_api(self, request: web.Request) -> web.WebSocketResponse:
@@ -330,6 +339,11 @@ class FakeBinance:
         min_notional = float(RULES.get(sym, {}).get("min_notional", 5))
         if float(qty) * ref < min_notional and not p.get("reduceOnly") and not self._is_closing(p):
             raise _Err(-4164, f"Order's notional must be no smaller than {min_notional:g} (unless you choose reduce only).")
+        lev_cap = self.max_position_by_leverage.get(self.leverage.get(sym, 20))
+        if lev_cap is not None and not p.get("reduceOnly") and not self._is_closing(p):
+            held = abs(self.positions.get((sym, p.get("positionSide", "BOTH")), {"amt": 0.0})["amt"])
+            if (held + float(qty)) * ref > lev_cap:
+                raise _Err(-2027, "Exceeded the maximum allowable position at current leverage.")
         oid = self._next()
         order = {"orderId": oid, "clientOrderId": p.get("newClientOrderId", f"c{oid}"), "symbol": sym,
                  "side": p["side"], "type": p["type"], "positionSide": p.get("positionSide", "BOTH"),
