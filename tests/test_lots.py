@@ -676,3 +676,22 @@ async def test_fast_close_sends_the_order_without_reading_the_position_first(ser
     await wait_for(lambda: amt(fake) == 0.02)
     methods = [m for m, _ in fake.requests]
     assert methods.index("order.place") == 0     # ninguna consulta antes de la orden
+
+
+async def test_fast_open_does_not_ask_the_price_first(service, fake):
+    t = service.trades
+    service.core.market.marks.pop(SYM, None)     # sin precio de mercado fresco (símbolo fuera del stream)
+    fake.requests.clear()
+    open_(t, 1, 0.01)                            # la señal trae price y quantity
+    await opened(t, fake, 0.01)
+    methods = [m for m, _ in fake.requests]
+    assert "ticker.price" not in methods[:methods.index("order.place")]
+
+
+async def test_open_and_close_in_the_same_millisecond_run_in_order(service, fake):
+    t = service.trades
+    for tid in range(1, 6):
+        open_(t, tid, 0.01)
+        close(t, tid)                            # operación de milisegundos
+    await wait_for(lambda: amt(fake) == 0 and t.get_trade(SYM, "LONG") is None and not t.inflight(SYM))
+    assert sorted(r.paper_trade_id for r in t.closed) == [1, 2, 3, 4, 5]

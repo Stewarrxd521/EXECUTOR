@@ -1692,6 +1692,7 @@ class TradeManager:
                 self.core.bus.emit("open_failed", f"{symbol}: la orden no se ejecutó ({fill.status})", "error")
                 return None
             hedge = fill.position_side in ("LONG", "SHORT")
+            applied_lev = self.core.account.leverage.get(symbol) or applied_lev  # pudo bajar con -2027
             new = self.trades.get((symbol, direction)) is None
             trade = self._register_entry(symbol, direction, fill.avg_price or ref, fill.qty, applied_lev,
                                          paper_trade_id, fill.order_id, hedge, fill.step, source=source, bot=bot)
@@ -3087,14 +3088,24 @@ class TradeManager:
         if own and (trade is None or own not in trade.lots):
             raise BinanceAPIError(-1, f"el trade_id {own} no tiene cantidad en {symbol} {direction}",
                                   method="protect", transport="local")
-        if own:
-            result = await self.orders.place_protection(symbol, direction, kind, trigger, qty=trade.lots[own],
-                                                        client_prefix=prot_cid_prefix(kind, own))
-            trade.lot_prot.setdefault(own, {})[kind] = trigger
-        else:
-            qty = max(pos.qty if pos else 0.0, trade.ledger_qty if trade is not None else 0.0) or \
-                (trade.quantity if trade else 0.0)
-            result = await self.orders.place_protection(symbol, direction, kind, trigger, qty=qty or None)
+        try:
+            if own:
+                result = await self.orders.place_protection(symbol, direction, kind, trigger, qty=trade.lots[own],
+                                                            client_prefix=prot_cid_prefix(kind, own))
+                trade.lot_prot.setdefault(own, {})[kind] = trigger
+            else:
+                qty = max(pos.qty if pos else 0.0, trade.ledger_qty if trade is not None else 0.0) or \
+                    (trade.quantity if trade else 0.0)
+                result = await self.orders.place_protection(symbol, direction, kind, trigger, qty=qty or None)
+        except BinanceAPIError as err:
+            if ErrorDoctor.diagnose(err).action != Action.TRIGGER_CROSSED or trade is None:
+                raise
+            # -2021: el precio ya pasó el disparo. Lo que ese TP/SL iba a hacer se hace ya: cerrar a mercado
+            # su lote (o la posición, si no es de un trade_id).
+            log.warning("%s %s: el %s @ %g ya se cruzó: se cierra a mercado %s", symbol, direction, kind, trigger,
+                        f"el trade_id {own}" if own else "la posición")
+            self._spawn(self.close_trade(trade, kind, closed_by="protect", lot=own or 0))
+            return {"triggered_now": True}
         if trade is not None:
             if kind == "TP":
                 trade.tp_price = trigger

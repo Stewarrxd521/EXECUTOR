@@ -77,6 +77,7 @@ class Settings:
 
     # ── Riesgo / tamaño ───────────────────────────────────────────────────
     leverage: int = 4
+    leverage_min: int = 4   # -2027 y similares: el leverage baja hasta aquí; si no basta, se rechaza (LEVERAGE_MIN)
     leverage_env: int = 4
     leverage_required: bool = False
     high_price_threshold: float = 2.0
@@ -234,6 +235,7 @@ def load_settings() -> Settings:
         proxy_urls=proxies,
         rest_proxy_all=_env_bool("REST_PROXY_ALL", False),
         leverage=leverage,
+        leverage_min=max(1, min(125, _env_int("LEVERAGE_MIN", 4))),
         leverage_env=leverage,
         leverage_required=_env_bool("LEVERAGE_REQUIRED", False),
         high_price_threshold=_env_float("HIGH_PRICE_THRESHOLD", 2.0),

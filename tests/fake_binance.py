@@ -60,6 +60,7 @@ class FakeBinance:
         self.history: dict[int, dict] = {}       # órdenes con algo ejecutado (GET /fapi/v1/allOrders)
         self.user_fills: list[dict] = []         # cada fill (GET /fapi/v1/userTrades)
         self.all_orders_error = False
+        self.max_position_by_leverage: dict[int, float] = {}  # leverage -> notional máximo de la posición (-2027)
         self.leverage: dict[str, int] = {s: 20 for s in self.marks}
         self.wallet = 10_000.0
         self.seq = 1000
@@ -330,6 +331,11 @@ class FakeBinance:
         min_notional = float(RULES.get(sym, {}).get("min_notional", 5))
         if float(qty) * ref < min_notional and not p.get("reduceOnly") and not self._is_closing(p):
             raise _Err(-4164, f"Order's notional must be no smaller than {min_notional:g} (unless you choose reduce only).")
+        lev_cap = self.max_position_by_leverage.get(self.leverage.get(sym, 20))
+        if lev_cap is not None and not p.get("reduceOnly") and not self._is_closing(p):
+            held = abs(self.positions.get((sym, p.get("positionSide", "BOTH")), {"amt": 0.0})["amt"])
+            if (held + float(qty)) * ref > lev_cap:
+                raise _Err(-2027, "Exceeded the maximum allowable position at current leverage.")
         oid = self._next()
         order = {"orderId": oid, "clientOrderId": p.get("newClientOrderId", f"c{oid}"), "symbol": sym,
                  "side": p["side"], "type": p["type"], "positionSide": p.get("positionSide", "BOTH"),

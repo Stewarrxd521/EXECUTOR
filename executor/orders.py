@@ -131,7 +131,7 @@ class OrderExecutor:
         """
         notes: list[str] = []
         entry = None
-        fixes = notional_bumps = halvings = precision_rounds = 0
+        fixes = notional_bumps = halvings = precision_rounds = leverage_drops = waits = 0
         band_fixed = False
         qty = D(params["quantity"])
         price = D(params["price"]) if "price" in params else None
@@ -168,6 +168,26 @@ class OrderExecutor:
                 if action in (Action.RETRY, Action.RESYNC_TIME):
                     await asyncio.sleep(0.3 * fixes)
                     notes.append("reintento tras error transitorio")
+                    continue
+                if action == Action.WAIT and ctx.purpose == "close" and waits < 2:
+                    # Límite de peticiones: un cierre espera lo que pide Binance (máx. 15 s) y se reenvía; una
+                    # apertura no (unos segundos tarde ya no es la señal del bot): se rechaza al momento.
+                    waits += 1
+                    pause = min(15.0, max(0.5, err.retry_after_s or 1.0 * waits))
+                    await asyncio.sleep(pause + 0.05)
+                    notes.append(f"límite de peticiones: reenviada tras {pause:.1f} s")
+                    continue
+                if action == Action.LOWER_LEVERAGE and not ctx.reduce_only and leverage_drops < 6:
+                    # Posición máxima excedida para el leverage actual (-2027…): se baja un escalón (sin pasar
+                    # de LEVERAGE_MIN) y se reenvía; si ni con el mínimo cabe, se rechaza.
+                    leverage_drops += 1
+                    before = self.core.account.leverage.get(ctx.symbol) or self.core.settings.leverage
+                    lowered = await self.lower_leverage(ctx.symbol, before)
+                    if lowered is None:
+                        notes.append(f"ya en el leverage mínimo ({self.core.settings.leverage_min}x): se rechaza")
+                        raise
+                    notes.append(f"leverage bajado de {before}x a {lowered}x ({diag.info.name})")
+                    self.core.journal.mark_fixed(entry, notes[-1])
                     continue
                 if action == Action.NEW_CLIENT_ID:
                     params["newClientOrderId"] = new_client_id(params["newClientOrderId"].rsplit("-", 1)[0])
@@ -299,9 +319,22 @@ class OrderExecutor:
                 remaining -= part
         fill = FillResult(step=rules.qty_step(True))
         notional = 0.0
-        for part in chunks:
+        splits = 0
+        while chunks:
+            part = chunks.pop(0)
             params = self.build_params(ctx, part, prefix=prefix)
-            result, notes = await self.submit(ctx, params, where=f"{ctx.purpose}.market", owner=owner)
+            try:
+                result, notes = await self.submit(ctx, params, where=f"{ctx.purpose}.market", owner=owner)
+            except BinanceAPIError as err:
+                step = rules.qty_step(True)
+                half = floor_step(part / 2, step)
+                if ErrorDoctor.diagnose(err).action != Action.SPLIT_QTY or splits >= 6 or half <= 0:
+                    raise
+                # Cantidad mayor al máximo (-4005): se envía en dos partes.
+                splits += 1
+                chunks[:0] = [half, part - half]
+                fill.fixes.append(f"orden dividida en partes de {fmt(half)} (cantidad máxima)")
+                continue
             fill.fixes.extend(notes)
             if result.get("status") == "ALREADY_DONE":
                 fill.status = "ALREADY_DONE"
@@ -377,6 +410,23 @@ class OrderExecutor:
         results = await asyncio.gather(*jobs, return_exceptions=True)
         return sum(1 for r in results if r is True)
 
+    async def lower_leverage(self, symbol: str, current: int) -> Optional[int]:
+        """Baja el leverage del símbolo al siguiente escalón por debajo de ``current`` (nunca bajo
+        LEVERAGE_MIN). Devuelve el aplicado, o None si no se pudo bajar más."""
+        floor = max(1, min(self.core.settings.leverage_min, current))
+        for lv in [x for x in LEVERAGE_LADDER if floor <= x < current]:
+            try:
+                await self.core.rest.set_leverage(symbol, lv)
+            except BinanceAPIError as err:
+                diag, _ = self._record(err, "leverage", symbol)
+                if diag.action == Action.LOWER_LEVERAGE:
+                    continue
+                return None
+            self.core.account.leverage[symbol] = lv
+            log.warning("Leverage %s: bajado de %sx a %sx", symbol, current, lv)
+            return lv
+        return None
+
     # ── Leverage (único REST en el flujo de apertura, cacheado) ───────────
     async def ensure_leverage(self, symbol: str, target: int) -> int:
         rules = self.core.exinfo.get(symbol)
@@ -385,7 +435,8 @@ class OrderExecutor:
         current = self.core.account.leverage.get(symbol)
         if current == target:
             return target
-        ladder = [target] + [lv for lv in LEVERAGE_LADDER if lv < target]
+        floor = max(1, min(self.core.settings.leverage_min, target))
+        ladder = [target] + [lv for lv in LEVERAGE_LADDER if floor <= lv < target]
         for lv in ladder:
             if current == lv:
                 return lv
