@@ -239,7 +239,10 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
   - `close` **con `trade_id`** cierra solo el lote de ese `trade_id` (orden reduceOnly). La posición se cierra
     entera solo cuando lo que queda en Binance es justo ese lote. Si la posición tiene más (por ejemplo, otro bot
     abrió en el mismo símbolo por fuera), se cierra solo la cantidad de ese `trade_id`, aunque sea el último.
-  - `close` **sin `trade_id`** cierra la posición entera del símbolo (y de la dirección, si se indica).
+  - `close` **sin `trade_id`** cierra la posición entera del símbolo (y de la dirección, si se indica). Sin
+    dirección cierra los dos lados (LONG y SHORT), también lo abierto fuera del executor.
+  - Si otra orden (otro bot, a mano, un TP/SL) reduce la posición justo antes del `close` de un `trade_id` y
+    Binance rechaza el cierre (-2022), esa reducción se reparte primero y el `trade_id` cierra solo lo que le queda.
   - Un `trade_id` que no tiene cantidad en la posición nunca toca los lotes de otros ni lo abierto por fuera: el
     cierre queda en espera 30 s por si su apertura llega tarde. Solo una posición **sin ningún lote** (adoptada
     tras perder `trades.json`) la cierra el primer `trade_id` que lo pida, como antes.

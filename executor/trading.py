@@ -1470,6 +1470,11 @@ class TradeManager:
                     ok, detail = True, "la posición ya se cerró (otro cierre total llegó antes)"
                 if ok and not quantity and sig.trade_id:
                     self._note_closed(ref, trade.symbol, trade.direction)
+                if ok and not sig.trade_id and not direction and not quantity:
+                    # Sin trade_id ni dirección la orden es cerrar todo el símbolo: también el otro lado (LONG y
+                    # SHORT), tenga trade local o se abriera fuera del executor.
+                    ok = await self._close_rest_of_symbol(symbol, trade, reason, bot_pnl)
+                    detail = "cerrada" if ok else "cerrada solo en parte (ver pestaña Errores)"
         elif (sig.trade_id and (ref, symbol) in self._rejected_ids
               and not await self._untracked_position(symbol, direction)):
             ok = False
@@ -2474,6 +2479,11 @@ class TradeManager:
                                                bot_pnl=bot_pnl, closed_by=closed_by)
                             return True
                         break
+                    if not orphan and pos2.qty < trade.ledger_qty - tol:
+                        # Otra orden (otro bot, a mano, TP/SL) redujo la posición: su reducción se reparte
+                        # primero (espera su fill) y este trade_id cierra solo lo que le queda, nunca lo de otros.
+                        await self._reconcile_gap(trade, pos2.qty, tol)
+                        qty = min(qty, filled + trade.lots.get(lk, 0.0))
                     qty = min(qty, filled + pos2.qty)
                     continue
                 # Pudo ejecutarse sin respuesta: se confirma por clientOrderId antes de reenviar.
@@ -3332,6 +3342,18 @@ class TradeManager:
                 self._symbol_retryable[symbol] = True
             ok_any = ok_any or ok
         return ok_any
+
+    async def _close_rest_of_symbol(self, symbol: str, done: Trade, reason: str,
+                                    bot_pnl: Optional[float]) -> bool:
+        """Tras cerrar ``done``: las demás posiciones del símbolo (otro lado, con o sin trade local, sin grid)."""
+        ok = True
+        for other in [t for t in list(self.trades.values()) if t.symbol == symbol and t is not done]:
+            ok = await self.close_trade(other, reason, bot_pnl=bot_pnl, closed_by="signal") and ok
+        left = [p for p in self.core.account.positions_for(symbol)
+                if self.trades.get((p.symbol, p.direction)) is None and not self.grid_owner(p.symbol, p.direction)]
+        for pos in left:
+            ok = await self.close_symbol(symbol, pos.direction, reason, bot_pnl=bot_pnl, closed_by="signal") and ok
+        return ok
 
     async def close_all(self, reason: str, closed_by: str = "signal") -> list[Trade]:
         targets = list(self.trades.values())

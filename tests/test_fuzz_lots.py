@@ -71,7 +71,7 @@ LOST = "Timeout waiting for response from backend server."
 
 
 def seeds() -> list[int]:
-    raw = os.environ.get("FUZZ_SEEDS", "0-3")
+    raw = os.environ.get("FUZZ_SEEDS", "0-3,5,35,40")  # 5, 35, 40: regresiones (cierre tras -2022, close sin id ni dirección)
     out = []
     for part in raw.split(","):
         if "-" in part:

@@ -360,6 +360,11 @@ class FakeBinance:
             held = abs(self.positions.get((sym, p.get("positionSide", "BOTH")), {"amt": 0.0})["amt"])
             if (held + float(qty)) * ref > lev_cap:
                 raise _Err(-2027, "Exceeded the maximum allowable position at current leverage.")
+        if self.hedge and self._is_closing(p) and p["type"] == "MARKET":
+            # Como Binance en Hedge: cerrar más de lo que tiene la posición se rechaza (no la invierte).
+            held = abs(self.positions.get((sym, p.get("positionSide")), {"amt": 0.0})["amt"])
+            if float(qty) > held + 1e-12:
+                raise _Err(-2022, "ReduceOnly Order is rejected.")
         oid = self._next()
         order = {"orderId": oid, "clientOrderId": p.get("newClientOrderId", f"c{oid}"), "symbol": sym,
                  "side": p["side"], "type": p["type"], "positionSide": p.get("positionSide", "BOTH"),
