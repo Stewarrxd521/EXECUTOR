@@ -213,3 +213,34 @@ async def test_manual_open_after_a_previous_position_realizes_only_the_new_quant
     close(t, 1)
     await wait_for(lambda: amt(fake) == 0.03 and t.closed and not t.inflight(SYM))
     assert not t.closed[-1].order_assumed
+
+
+async def test_open_signal_tp_of_an_assumed_open_goes_to_binance(service, fake):
+    """El bot manda el TP en el propio `open` ("tp"/"sl"): con -2019 también se pone (antes se descartaba)."""
+    t = service.trades
+    fake.inject.append(MARGIN)
+    open_(t, 1, 0.01, tp=3100, sl=2900)
+    await wait_for(lambda: algos(fake, "T1") and algos(fake, "S1"))
+    trade = t.get_trade(SYM, "LONG")
+    assert trade.order_assumed and trade.lot_prot == {"1": {"TP": 3100.0, "SL": 2900.0}}
+    assert {a["quantity"] for a in algos(fake)} == {"0.01"}
+    await wait_for(lambda: t.signals(5, trade_id=1) and "colocado" in t.signals(5, trade_id=1)[0]["detail"])
+    assert "no colocado" not in t.signals(5, trade_id=1)[0]["detail"]
+    manual_open(fake, 0.01)                              # luego se abre a mano: ya estaba protegida
+    await wait_for(lambda: not trade.order_assumed)
+    fake.set_mark(SYM, 3100.0)
+    await wait_for(lambda: amt(fake) == 0 and t.get_trade(SYM, "LONG") is None and t.closed, timeout=10)
+    assert t.closed[-1].status == "TP"
+
+
+async def test_open_signal_tp_of_an_assumed_lot_in_a_real_position_is_kept_until_real(service, fake):
+    t = service.trades
+    open_(t, 1, 0.01)
+    trade = await opened(t, fake, 0.01)
+    fake.inject.append(MARGIN)
+    open_(t, 2, 0.02, tp=3100)
+    await wait_for(lambda: trade.lot_prot.get("2") == {"TP": 3100.0} and not t.inflight(SYM))
+    await wait_for(lambda: t.signals(5, trade_id=2) and "guardado" in t.signals(5, trade_id=2)[0]["detail"])
+    assert not algos(fake, "T2")                         # cerraría la cantidad del trade_id 1
+    manual_open(fake, 0.02)
+    await wait_for(lambda: [a["quantity"] for a in algos(fake, "T2")] == ["0.02"])

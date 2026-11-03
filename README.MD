@@ -166,7 +166,8 @@ en español, la causa típica, la solución y la **corrección automática** que
 > `mejor ask/bid` o `referencia`); el CSV del historial incluye `order_assumed` y `close_price_source`. Un lote
 > asumido dentro de una posición real usa su propia entrada, no la media de la posición.
 >
-> **TP/SL de una operación asumida.** Por seguridad, el `open_tp`/`open_sl` de un trade_id asumido también va a
+> **TP/SL de una operación asumida.** Por seguridad, el `tp`/`sl` que trae el propio `open` y el
+> `open_tp`/`open_sl` posterior de un trade_id asumido también van a
 > Binance como orden condicional (con el `clientAlgoId` de su trade_id y su cantidad asumida) cuando en ese lado
 > no hay nada real: sin posición, al dispararse no ejecuta nada; si la abres a mano, ya está protegida. Si en esa
 > posición hay cantidad real de otros trade_id, el TP/SL del asumido se guarda pero **no** se pone (al dispararse

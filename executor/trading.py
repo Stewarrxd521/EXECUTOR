@@ -1162,17 +1162,15 @@ class TradeManager:
             detail += f" — multiplicador x{factor:g}"
         if note:
             detail += f" — {note}"
-        protections = []
-        only_assumed = Trade.lot_key(sig.ref) in trade.assumed_lots and Trade.lot_key(sig.ref) not in trade.lots
+        protections, saved = [], []
         for kind, aliases in (("TP", _TP_ALIASES), ("SL", _SL_ALIASES)):
             trig = safe_float(_first(d, aliases)) if pending is None else 0.0
-            if trig > 0 and only_assumed:
-                detail += f" — {kind} no colocado: apertura asumida (sin orden real)"
-                continue
             if trig > 0:
+                # También en una apertura asumida (-2019): set_protection lo pone en Binance con la cantidad asumida
+                # si en ese lado no hay nada real, o lo guarda y lo pone cuando el lote tenga cantidad real.
                 try:
-                    await self.set_protection(symbol, trade.direction, kind, trig, lot=sig.ref)
-                    protections.append(kind)
+                    result = await self.set_protection(symbol, trade.direction, kind, trig, lot=sig.ref)
+                    (saved if isinstance(result, dict) and result.get("pending") else protections).append(kind)
                 except BinanceAPIError as err:
                     title = ErrorDoctor.diagnose(err).info.title
                     detail += f" — {kind} no colocado: {title}"
@@ -1183,6 +1181,9 @@ class TradeManager:
                                             f"{sig.trade_id}\n[{err.code}] {title}")
         if protections:
             detail += " — " + "/".join(protections) + " colocado(s)"
+        if saved:
+            detail += " — " + "/".join(saved) + " guardado(s): se pondrá(n) en Binance cuando el trade_id asumido " \
+                                                "tenga cantidad real"
         self._log_signal("open", symbol, direction, True, detail, sig, executor_trade_id=trade.id)
 
         if pending is not None and self.trades.get(trade.key) is trade:
