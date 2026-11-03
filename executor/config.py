@@ -92,6 +92,9 @@ class Settings:
     margin_auto_reduce: bool = False
     max_price_age_s: float = 5.0
     fast_signals: bool = True   # HFT: sin consultas previas a Binance cuando lo conocido ya basta (FAST_SIGNALS)
+    # El close de un trade_id en una posición compartida con otros relee la posición antes (+1 ida y vuelta): una
+    # reducción de fuera que aún no llegó se reparte primero (SHARED_CLOSE_CHECK). false: más rápido, con ese riesgo.
+    shared_close_check: bool = True
     signal_dedupe_ttl_s: float = 0.0
     signal_wait_timeout_s: float = 7.0
 
@@ -250,6 +253,7 @@ def load_settings() -> Settings:
         margin_auto_reduce=_env_bool("MARGIN_AUTO_REDUCE", False),
         max_price_age_s=_env_float("MAX_PRICE_AGE_S", 5.0),
         fast_signals=_env_bool("FAST_SIGNALS", True),
+        shared_close_check=_env_bool("SHARED_CLOSE_CHECK", True),
         signal_dedupe_ttl_s=_env_float("SIGNAL_DEDUPE_TTL_S", 0.0),
         signal_wait_timeout_s=_env_float("SIGNAL_WAIT_TIMEOUT_S", 7.0),
         recv_window_ms=_env_int("RECV_WINDOW_MS", 5000),

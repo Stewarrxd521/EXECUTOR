@@ -52,12 +52,16 @@ ida y vuelta completa. Con `FAST_SIGNALS=true` (por defecto) no se hace ninguna 
 - **Cierre:** si la posición que el user stream ya informó cuadra con el libro de lotes y no hay nada pendiente de
   confirmar, la orden sale sin releer la posición (con el user stream conectado y estable). Las órdenes de cierre
   son `reduceOnly` y nunca piden más que el lote, así que no pueden cerrar de más. Si algo no cuadra, se relee.
+  El `close` de un `trade_id` solo va sin releer si la posición es entera de ese `trade_id`; si la comparte con
+  otros (u otra cantidad sin dueño), se relee antes (+1 ida y vuelta) para que una reducción de fuera que aún no
+  llegó se reparta primero y el cierre nunca se lleve la parte de otro bot (`SHARED_CLOSE_CHECK`, activo por
+  defecto).
 - Un `open` y su `close` que llegan en el mismo milisegundo se ejecutan en orden: el `close` espera a su `open`.
 
 Con 25 ms de ida y vuelta a Binance (medido con el simulador): apertura ~51 ms (antes ~101), cierre de un lote
-~15 ms (antes ~43). Compromiso del modo rápido: si en esos mismos milisegundos alguien cierra parte de la posición
-por fuera (ADL, otro bot, a mano) y el user stream aún no lo avisó, esa reducción no se reparte en proporción
-entre los lotes. `FAST_SIGNALS=false` relee siempre la posición antes de cerrar (+1 ida y vuelta).
+~15 ms (antes ~43). En una posición compartida con otros `trade_id`, la orden de cierre de un lote llega a
+Binance ~42 ms después de la señal con `SHARED_CLOSE_CHECK=true` (relee la posición) y ~28 ms con `false`.
+`FAST_SIGNALS=false` relee siempre la posición antes de cerrar (+1 ida y vuelta).
 
 Para que en real las operaciones de milisegundos lleguen a tiempo:
 
@@ -161,6 +165,18 @@ en español, la causa típica, la solución y la **corrección automática** que
 > guardado: `price_source` en el tramo de apertura y `close_price_source` en el registro cerrado (`libro`,
 > `mejor ask/bid` o `referencia`); el CSV del historial incluye `order_assumed` y `close_price_source`. Un lote
 > asumido dentro de una posición real usa su propia entrada, no la media de la posición.
+>
+> **TP/SL de una operación asumida.** Por seguridad, el `open_tp`/`open_sl` de un trade_id asumido también va a
+> Binance como orden condicional (con el `clientAlgoId` de su trade_id y su cantidad asumida) cuando en ese lado
+> no hay nada real: sin posición, al dispararse no ejecuta nada; si la abres a mano, ya está protegida. Si en esa
+> posición hay cantidad real de otros trade_id, el TP/SL del asumido se guarda pero **no** se pone (al dispararse
+> cerraría la cantidad de los otros); se pone en cuanto ese lote tenga cantidad real.
+>
+> **Abrir a mano lo asumido.** Lo que se abre fuera del executor (a mano en Binance) en una posición con lotes
+> asumidos pasa a ser de esos lotes, del más antiguo al más nuevo y hasta su cantidad asumida: dejan de ser
+> asumidos, toman el precio real, su TP/SL se pone con la cantidad real y su `close` cierra de verdad solo esa
+> cantidad. Lo que exceda queda sin dueño, igual que lo que ya había en Binance antes de la asumida (eso no es
+> su apertura a mano). Si el evento no llegó (executor caído), en una posición solo asumida se detecta al cerrar.
 | -2011, -2013, -4046, -4059 | Ya estaba hecho: no es un error real |
 
 La pestaña **Errores** del dashboard muestra cada error con su explicación, si se autocorrigió y cómo, e incluye un
@@ -228,7 +244,10 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
   - `close` **con `trade_id`** cierra solo el lote de ese `trade_id` (orden reduceOnly). La posición se cierra
     entera solo cuando lo que queda en Binance es justo ese lote. Si la posición tiene más (por ejemplo, otro bot
     abrió en el mismo símbolo por fuera), se cierra solo la cantidad de ese `trade_id`, aunque sea el último.
-  - `close` **sin `trade_id`** cierra la posición entera del símbolo (y de la dirección, si se indica).
+  - `close` **sin `trade_id`** cierra la posición entera del símbolo (y de la dirección, si se indica). Sin
+    dirección cierra los dos lados (LONG y SHORT), también lo abierto fuera del executor.
+  - Si otra orden (otro bot, a mano, un TP/SL) reduce la posición justo antes del `close` de un `trade_id` y
+    Binance rechaza el cierre (-2022), esa reducción se reparte primero y el `trade_id` cierra solo lo que le queda.
   - Un `trade_id` que no tiene cantidad en la posición nunca toca los lotes de otros ni lo abierto por fuera: el
     cierre queda en espera 30 s por si su apertura llega tarde. Solo una posición **sin ningún lote** (adoptada
     tras perder `trades.json`) la cierra el primer `trade_id` que lo pida, como antes.
@@ -395,6 +414,8 @@ ambos y las pruebas los ejecutan contra el executor.
 | `MIN_NOTIONAL_USDT` / `NOTIONAL_SAFETY_BUFFER_PCT` | `5.1` / `2.0` | Notional mínimo y colchón |
 | `MAX_NOTIONAL_OVERSHOOT_X` | `4.0` | Tope al corregir precisión (no abrir algo desproporcionado) |
 | `DEFAULT_NOTIONAL_USDT` | `0` | Tamaño por defecto si la señal no trae cantidad (0 = rechazar) |
+| `FAST_SIGNALS` | `true` | Órdenes sin consultas previas a Binance cuando lo que ya se sabe basta (ver «Operaciones de milisegundos») |
+| `SHARED_CLOSE_CHECK` | `true` | El `close` de un `trade_id` en una posición compartida con otros relee la posición antes de enviar la orden (+1 ida y vuelta): una reducción de fuera que aún no llegó se reparte primero y el cierre nunca se lleva la parte de otro bot. `false`: sin relectura (más rápido, con ese riesgo) |
 | `ASSUME_ON_MARGIN_ERROR` | `true` | Con -2019 registrar la posición como asumida |
 | `MARGIN_AUTO_REDUCE` | `false` | Con -2019 reintentar con la mitad de cantidad |
 | `SIGNAL_DEDUPE_TTL_S` | `0` | Antiduplicado por contenido para `close`/TP/SL (nunca para `open`: los tramos se ejecutan todos). Las señales con `signal_id` nunca se repiten |
