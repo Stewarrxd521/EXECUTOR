@@ -52,12 +52,14 @@ ida y vuelta completa. Con `FAST_SIGNALS=true` (por defecto) no se hace ninguna 
 - **Cierre:** si la posición que el user stream ya informó cuadra con el libro de lotes y no hay nada pendiente de
   confirmar, la orden sale sin releer la posición (con el user stream conectado y estable). Las órdenes de cierre
   son `reduceOnly` y nunca piden más que el lote, así que no pueden cerrar de más. Si algo no cuadra, se relee.
+  El `close` de un `trade_id` solo va sin releer si la posición es entera de ese `trade_id`; si la comparte con
+  otros (u otra cantidad sin dueño), se relee antes (+1 ida y vuelta) para que una reducción de fuera que aún no
+  llegó se reparta primero y el cierre nunca se lleve la parte de otro bot.
 - Un `open` y su `close` que llegan en el mismo milisegundo se ejecutan en orden: el `close` espera a su `open`.
 
 Con 25 ms de ida y vuelta a Binance (medido con el simulador): apertura ~51 ms (antes ~101), cierre de un lote
-~15 ms (antes ~43). Compromiso del modo rápido: si en esos mismos milisegundos alguien cierra parte de la posición
-por fuera (ADL, otro bot, a mano) y el user stream aún no lo avisó, esa reducción no se reparte en proporción
-entre los lotes. `FAST_SIGNALS=false` relee siempre la posición antes de cerrar (+1 ida y vuelta).
+~15 ms (antes ~43) cuando la posición es solo de ese `trade_id`; compartida con otros, ~40 ms (relee la posición).
+`FAST_SIGNALS=false` relee siempre la posición antes de cerrar (+1 ida y vuelta).
 
 Para que en real las operaciones de milisegundos lleguen a tiempo:
 

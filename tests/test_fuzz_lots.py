@@ -71,7 +71,7 @@ LOST = "Timeout waiting for response from backend server."
 
 
 def seeds() -> list[int]:
-    raw = os.environ.get("FUZZ_SEEDS", "0-3,5,35,40")  # 5, 35, 40: regresiones (cierre tras -2022, close sin id ni dirección)
+    raw = os.environ.get("FUZZ_SEEDS", "0-3,5,6,16,35,40,42")  # 5-42: regresiones de reducciones externas y cierres
     out = []
     for part in raw.split(","):
         if "-" in part:
@@ -455,6 +455,18 @@ async def test_fuzz_lots(seed, stateless, fake, tmp_path, snapshot_file, monkeyp
                     return {}, 0.0, None
         return {(s, dd): amount}, amount, ("whole" if whole else "partial", amount, s, dd)
 
+    def sync_algo_owners():
+        """Like the executor: a TP/SL's owner is the trade_id in its clientAlgoId (also one the executor re-placed
+        with a new algoId, e.g. resized after another fill)."""
+        refs = {lk(*r): r for r in m.alive}
+        for aid, a in fake.algos.items():
+            if aid in m.algo_owner:
+                continue
+            parsed = trading_mod.parse_prot_cid(a.get("clientAlgoId", ""))
+            ref = refs.get(trading_mod.Trade.lot_key(parsed[1])) if parsed else None
+            if ref is not None:
+                m.algo_owner[aid] = ref
+
     def apply_outside_fills(fills, owners, assumed=None):
         """Outside / TP-SL fills of this step, in Binance order, applied to ``owners`` (dict). An outside open on
         a position with assumed lots goes to those lots first (oldest first, up to their assumed qty): they
@@ -590,6 +602,7 @@ async def test_fuzz_lots(seed, stateless, fake, tmp_path, snapshot_file, monkeyp
                           m.algo_owner else None, "sym": sym, "price": newp,
                           "algos": {k: [v["type"], v["positionSide"], v["triggerPrice"], v.get("quantity")]
                                     for k, v in fake.algos.items()}})
+            sync_algo_owners()
             fake.set_mark(sym, newp)
             errs = await settle()
             fills = fill_log[log0:]

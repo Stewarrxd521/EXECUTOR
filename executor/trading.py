@@ -2109,14 +2109,20 @@ class TradeManager:
         )
 
     # ── Cierre ────────────────────────────────────────────────────────────
-    async def _position_for_close(self, trade: Trade) -> tuple[Optional[Position], bool]:
+    async def _position_for_close(self, trade: Trade, lot: str = "") -> tuple[Optional[Position], bool]:
         """Posición para un cierre. Si la que ya se conoce por el user stream cuadra con el libro de lotes (y no
         hay nada pendiente de confirmar), se usa sin releerla: la orden sale una ida y vuelta antes. Las órdenes
         de cierre son reduceOnly y nunca piden más que el lote, así que no pueden cerrar de más; si algo no
-        cuadra, se relee de Binance como siempre."""
+        cuadra, se relee de Binance como siempre.
+
+        ``lot``: cierre de un trade_id. Solo sin releer si la posición es entera de ese lote: con otros dueños,
+        una reducción de fuera (otro bot, a mano, TP/SL) que aún no llegó por el user stream se repartiría
+        después y este cierre se llevaría la parte de ellos. Releerla ahora la reparte antes."""
         conn = self.user_conn
         stable = conn is not None and conn.connected and time.time() - conn.connected_since > 2.0
-        if self.settings.fast_signals and stable and not trade.order_assumed and not trade.rebuild:
+        tol0 = (safe_float(trade.step_size) or 0.0) / 2 or 1e-12
+        shared = bool(lot) and (trade.unassigned > tol0 or any(k != lot and v > tol0 for k, v in trade.lots.items()))
+        if self.settings.fast_signals and stable and not trade.order_assumed and not trade.rebuild and not shared:
             pos = self.core.account.position(trade.symbol, trade.direction)
             tol = (safe_float(trade.step_size) or 0.0) / 2 or 1e-12
             pending = any(k[0] == trade.key for k in self._lot_attempts) or self._anticipation(trade.key) is not None
@@ -2341,7 +2347,7 @@ class TradeManager:
             self._close_retryable[key] = True
             return False
         self._claim_cid_lot(trade, lot)
-        pos, known = await self._position_for_close(trade)
+        pos, known = await self._position_for_close(trade, lk)
         base = pos.qty if pos is not None else (0.0 if known or trade.order_assumed else trade.real_quantity)
         if not trade.order_assumed:
             await self._reconcile_gap(trade, base, tol)
@@ -2479,10 +2485,12 @@ class TradeManager:
                                                bot_pnl=bot_pnl, closed_by=closed_by)
                             return True
                         break
-                    if not orphan and pos2.qty < trade.ledger_qty - tol:
-                        # Otra orden (otro bot, a mano, TP/SL) redujo la posición: su reducción se reparte
-                        # primero (espera su fill) y este trade_id cierra solo lo que le queda, nunca lo de otros.
-                        await self._reconcile_gap(trade, pos2.qty, tol)
+                    if not orphan:
+                        # Otra orden (otro bot, a mano, TP/SL) redujo la posición: su reducción se reparte primero
+                        # (espera su fill si aún no llegó) y este trade_id cierra solo lo que le queda de su lote,
+                        # nunca lo de otros (su lote ya descuenta lo que este cierre llenó).
+                        if pos2.qty < trade.ledger_qty - tol:
+                            await self._reconcile_gap(trade, pos2.qty, tol)
                         qty = min(qty, filled + trade.lots.get(lk, 0.0))
                     qty = min(qty, filled + pos2.qty)
                     continue
