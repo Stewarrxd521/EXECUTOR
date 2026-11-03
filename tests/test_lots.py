@@ -3,6 +3,8 @@
 import asyncio
 import json
 
+import pytest
+
 from executor.service import ExecutorService
 from executor.trading import Trade, TradeManager
 from tests.conftest import make_settings, wait_for
@@ -665,6 +667,23 @@ async def test_lot_tp_fill_is_charged_to_its_lot_when_the_algo_event_comes_later
 
 
 async def test_fast_close_sends_the_order_without_reading_the_position_first(service, fake):
+    """Posición entera de ese trade_id: la orden sale sin releer la posición."""
+    t = service.trades
+    open_(t, 1, 0.01)
+    await opened(t, fake, 0.01)
+    await asyncio.sleep(2.1)                     # user stream estable
+    fake.requests.clear()
+    close(t, 1)
+    await wait_for(lambda: amt(fake) == 0)
+    methods = [m for m, _ in fake.requests]
+    assert methods.index("order.place") == 0     # ninguna consulta antes de la orden
+
+
+@pytest.mark.parametrize("check", [True, False], ids=["SHARED_CLOSE_CHECK", "sin_check"])
+async def test_shared_position_close_reads_the_position_first(service, fake, check):
+    """Posición compartida con otro trade_id: con SHARED_CLOSE_CHECK se relee antes de cerrar (una reducción de
+    fuera que aún no llegó se reparte primero); sin él, la orden sale sin consultar."""
+    service.settings.shared_close_check = check
     t = service.trades
     open_(t, 1, 0.01)
     await opened(t, fake, 0.01)
@@ -675,7 +694,7 @@ async def test_fast_close_sends_the_order_without_reading_the_position_first(ser
     close(t, 1)
     await wait_for(lambda: amt(fake) == 0.02)
     methods = [m for m, _ in fake.requests]
-    assert methods.index("order.place") == 0     # ninguna consulta antes de la orden
+    assert methods.index("order.place") == (1 if check else 0)
 
 
 async def test_fast_open_does_not_ask_the_price_first(service, fake):
