@@ -161,6 +161,17 @@ en español, la causa típica, la solución y la **corrección automática** que
 > guardado: `price_source` en el tramo de apertura y `close_price_source` en el registro cerrado (`libro`,
 > `mejor ask/bid` o `referencia`); el CSV del historial incluye `order_assumed` y `close_price_source`. Un lote
 > asumido dentro de una posición real usa su propia entrada, no la media de la posición.
+>
+> **TP/SL de una operación asumida.** Por seguridad, el `open_tp`/`open_sl` de un trade_id asumido también va a
+> Binance como orden condicional (con el `clientAlgoId` de su trade_id y su cantidad asumida) cuando en ese lado
+> no hay nada real: sin posición, al dispararse no ejecuta nada; si la abres a mano, ya está protegida. Si en esa
+> posición hay cantidad real de otros trade_id, el TP/SL del asumido se guarda pero **no** se pone (al dispararse
+> cerraría la cantidad de los otros); se pone en cuanto ese lote tenga cantidad real.
+>
+> **Abrir a mano lo asumido.** Lo que se abre fuera del executor (a mano en Binance) en una posición con lotes
+> asumidos pasa a ser de esos lotes, del más antiguo al más nuevo y hasta su cantidad asumida: dejan de ser
+> asumidos, toman el precio real, su TP/SL se pone con la cantidad real y su `close` cierra de verdad solo esa
+> cantidad. Lo que exceda queda sin dueño. Si el evento no llegó (executor caído), se detecta al cerrar.
 | -2011, -2013, -4046, -4059 | Ya estaba hecho: no es un error real |
 
 La pestaña **Errores** del dashboard muestra cada error con su explicación, si se autocorrigió y cómo, e incluye un

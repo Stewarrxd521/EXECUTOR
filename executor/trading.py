@@ -440,6 +440,12 @@ class Trade:
         return sum(safe_float(t["fill_price"]) * safe_float(t.get("qty")) for t in rows) / qty if qty > 0 \
             else self.entry_price
 
+    def assumed_entry(self) -> float:
+        """Entrada media de los tramos asumidos que siguen abiertos (0 si no hay)."""
+        rows = [t for t in self.tranches if t.get("assumed") and safe_float(t.get("fill_price")) > 0]
+        qty = sum(safe_float(t.get("qty")) for t in rows)
+        return sum(safe_float(t["fill_price"]) * safe_float(t.get("qty")) for t in rows) / qty if qty > 0 else 0.0
+
     def lots_view(self) -> list[list]:
         rows = [[k, v] for k, v in self.effective_lots().items()]
         rows += [[k, v] for k, v in self.assumed_lots.items() if v > 0 and k not in self.lots]
@@ -1562,10 +1568,12 @@ class TradeManager:
                                      "sin posición abierta (o LONG y SHORT simultáneas sin direction)", sig)
             return {"ok": False, "detail": entry["detail"]}
         try:
-            await self.set_protection(symbol, direction, kind, trigger, lot=sig.ref)
+            result = await self.set_protection(symbol, direction, kind, trigger, lot=sig.ref)
             self.status["signals_tp_set" if kind == "TP" else "signals_sl_set"] += 1
-            self._log_signal(sig.action, symbol, direction, True, f"trigger {trigger:g}", sig)
-            return {"ok": True, "detail": f"{kind} @ {trigger:g}"}
+            pending = isinstance(result, dict) and result.get("pending")
+            note = " (asumido: se pondrá en Binance al tener cantidad real)" if pending else ""
+            self._log_signal(sig.action, symbol, direction, True, f"trigger {trigger:g}{note}", sig)
+            return {"ok": True, "detail": f"{kind} @ {trigger:g}{note}", **({"pending": True} if pending else {})}
         except BinanceAPIError as err:
             self.status["signals_rejected"] += 1
             detail = ErrorDoctor.diagnose(err).summary()
@@ -1780,6 +1788,7 @@ class TradeManager:
             hedge = fill.position_side in ("LONG", "SHORT")
             applied_lev = self.core.account.leverage.get(symbol) or applied_lev  # pudo bajar con -2027
             new = self.trades.get((symbol, direction)) is None
+            was_assumed = not new and self.trades[(symbol, direction)].order_assumed
             trade = self._register_entry(symbol, direction, fill.avg_price or ref, fill.qty, applied_lev,
                                          paper_trade_id, fill.order_id, hedge, fill.step, source=source, bot=bot)
             owner["trade"] = trade  # sus fills atrasados (comisión) van a este trade, aunque ya se haya cerrado
@@ -1788,6 +1797,8 @@ class TradeManager:
             if new and trade is not None and prior is not None and hedge:
                 trade.credit("", prior.qty)
             self._credit_fills(trade, fill, lk)
+            if trade is not None and was_assumed and not trade.order_assumed:
+                self._assumed_got_real(trade, [lk])
             if trade is not None and bot and bot not in trade.named_bots:
                 trade.named_bots.append(bot)
             self.core.account.mark_updated(symbol, direction)
@@ -2172,6 +2183,8 @@ class TradeManager:
                          trade.symbol, trade.direction)
             else:
                 exit_px, trade.close_price_source = await self._assumed_exit_price(trade, trade.quantity, exit_px)
+                for lk in list(trade.lot_prot):
+                    self._drop_lot_protection(trade, lk)
             await self._settle_before_finalize(trade)
             if self.trades.get(key) is trade:
                 self._finalize(trade, reason, exit_px, bot_pnl=bot_pnl, closed_by=closed_by)
@@ -2339,6 +2352,10 @@ class TradeManager:
                     and all(safe_float(t.get("ts")) < since for t in rows):
                 lk = plain
 
+        if trade.order_assumed and pos is not None and pos.qty > tol:
+            # Se abrió en Binance (a mano) lo que era solo asumido: pasa a ser real y se cierra de verdad.
+            self._realize_assumed(trade, pos.qty, pos.entry_price or trade.entry_price, 0, whole=pos.qty)
+            base = pos.qty
         # 3) Parte asumida (-2019, sin orden real): se descarta sin enviar nada.
         lot_qty = trade.lots.get(lk, 0.0)
         assumed = trade.assumed_lots.get(lk, 0.0)
@@ -2359,9 +2376,10 @@ class TradeManager:
             else:
                 record = self._lot_trade(trade, lk, assumed, close_price)
                 record.order_assumed = True
+                trade.tranches = [t for t in trade.tranches if t not in record.tranches]
                 if trade.order_assumed:
                     trade.quantity = max(0.0, trade.quantity - assumed)
-                trade.tranches = [t for t in trade.tranches if t not in record.tranches]
+                    trade.entry_price = trade.assumed_entry() or trade.entry_price  # la de los lotes que quedan
                 record.close_price_source = exit_src
                 self._unmap_lot(trade, lk)
                 self._book_close(record, reason, exit_px, bot_pnl=bot_pnl, closed_by=closed_by)
@@ -2798,6 +2816,8 @@ class TradeManager:
                 ant["open"] -= use
                 qty -= use
             if qty > 0:
+                qty -= self._realize_assumed(trade, qty, upd.last_price, upd.trade_time)
+            if qty > 1e-12:
                 trade.credit("", qty)  # abierto por fuera: no es de ningún trade_id
             self.save()
             return
@@ -2867,6 +2887,91 @@ class TradeManager:
                 self._spawn(self._deferred_close(trade.symbol, trade.direction, tid, bot, {
                     "reason": "BOTCLOSE", "close_price": 0.0, "bot_pnl": None}, "corregido"))
 
+    def _realize_assumed(self, trade: Trade, qty: float, price: float, fill_ms: int,
+                         whole: float = 0.0) -> float:
+        """Cantidad abierta fuera del executor (a mano en Binance) con lotes asumidos (-2019) en esta posición:
+        se asigna a esos lotes por orden de llegada, hasta su cantidad asumida, y pasan a ser reales (con ese
+        precio); su TP/SL guardado se pone con la cantidad real. Devuelve lo asignado.
+
+        Trade solo asumido: pasa a ser real; ``whole`` es su posición real (lo que exceda a los lotes queda sin
+        dueño)."""
+        if qty <= 1e-12 or not trade.assumed_lots:
+            return 0.0
+        order: dict[str, float] = {}
+        for t in trade.tranches:
+            if t.get("assumed"):
+                k = Trade.lot_key(lot_ref(t.get("bot", ""), t.get("trade_id", 0)))
+                order.setdefault(k, safe_float(t.get("ts")))
+        lks = sorted(trade.assumed_lots, key=lambda k: order.get(k, 0.0))
+        was_assumed = trade.order_assumed
+        used, done = 0.0, []
+        for lk in lks:
+            q = min(qty - used, trade.assumed_lots.get(lk, 0.0))
+            if q <= 1e-12:
+                continue
+            left = trade.assumed_lots[lk] - q
+            if left > 1e-12:
+                trade.assumed_lots[lk] = float(D(fmt(left)))
+            else:
+                trade.assumed_lots.pop(lk)
+            trade.add_lot(lk, q)
+            self._realize_tranches(trade, lk, q, price, fill_ms)
+            used += q
+            done.append((lk, q))
+            if qty - used <= 1e-12:
+                break
+        if not done:
+            return 0.0
+        if was_assumed:
+            trade.order_assumed = False
+            trade.lot_tracked = True
+            if whole > used + 1e-12:
+                trade.credit("", whole - used)
+            trade.quantity = float(D(fmt(trade.ledger_qty)))
+            trade.entry_price = price or trade.entry_price
+        for lk, q in done:
+            log.warning("%s %s: el trade_id %s (asumido) se abrió en Binance: %s pasan a ser reales @ %s",
+                        trade.symbol, trade.direction, lk, fmt(q), price)
+            self.core.bus.emit("assumed_real", f"{trade.symbol} {trade.direction}: trade_id {lk} asumido ahora real "
+                               f"({fmt(q)})", "warning", symbol=trade.symbol)
+        self._assumed_got_real(trade, [lk for lk, _ in done])
+        return used
+
+    def _assumed_got_real(self, trade: Trade, real: list) -> None:
+        """Lotes asumidos que ahora tienen cantidad real (``real``): su TP/SL guardado se pone con esa cantidad.
+        El de un lote que sigue solo asumido (puesto con su cantidad asumida mientras no había nada real) se quita
+        de Binance, porque al dispararse cerraría la de otros trade_id; queda guardado para cuando sea real."""
+        for lk, prot in list(trade.lot_prot.items()):
+            if not prot:
+                continue
+            if lk in real and trade.lots.get(lk, 0.0) > 0:
+                self._spawn(self._restore_protection(trade, lk, dict(prot)))
+            elif trade.assumed_lots.get(lk, 0.0) > 0:
+                self._spawn(self._cancel_lot_protection(trade, lk))
+
+    @staticmethod
+    def _realize_tranches(trade: Trade, lk: str, qty: float, price: float, fill_ms: int) -> None:
+        """Los tramos asumidos de ``lk`` (por orden) pasan a reales por ``qty``; el asumido conserva su precio."""
+        left = qty
+        out = []
+        for t in trade.tranches:
+            if left > 1e-12 and t.get("assumed") and "trade_id" in t \
+                    and Trade.lot_key(lot_ref(t.get("bot", ""), t.get("trade_id", 0))) == lk:
+                take = min(left, safe_float(t.get("qty")))
+                real = {**t, "qty": take, "assumed": False, "assumed_price": t.get("fill_price"),
+                        "fill_price": price, "realized_manual": True}
+                if fill_ms:
+                    real["fill_ms"] = fill_ms
+                real.pop("price_source", None)
+                rest = safe_float(t.get("qty")) - take
+                if rest > 1e-12:
+                    out.append({**t, "qty": rest})
+                out.append(real)
+                left -= take
+                continue
+            out.append(t)
+        trade.tranches[:] = out
+
     def _lot_emptied(self, trade: Trade, lk: str) -> None:
         """Un lote quedó a cero por un fill de fuera (su TP/SL, ADL…): su close posterior no toca nada."""
         self._unmap_lot(trade, lk)
@@ -2897,7 +3002,9 @@ class TradeManager:
         if gap < 0:
             log.warning("%s %s: hay %s más en Binance que en el libro; queda sin dueño", trade.symbol,
                         trade.direction, -gap)
-            trade.credit("", -gap)
+            rest = -gap - self._realize_assumed(trade, -gap, trade.entry_price, read_ms)
+            if rest > 1e-12:
+                trade.credit("", rest)
             ant["open"] += -gap
             self.save()
             return
@@ -3244,7 +3351,8 @@ class TradeManager:
     # ── TP / SL ───────────────────────────────────────────────────────────
     async def _restore_protection(self, trade: Trade, lk: str, prot: dict) -> None:
         """Vuelve a poner el TP/SL de un lote que sigue abierto (cierre parcial o fallido), con lo que le queda."""
-        if not prot or self.trades.get(trade.key) is not trade or trade.lots.get(lk, 0.0) <= 0:
+        if not prot or self.trades.get(trade.key) is not trade or trade.lots.get(lk, 0.0) <= 0 \
+                and not (trade.order_assumed and trade.assumed_lots.get(lk, 0.0) > 0):
             return
         for kind, trigger in prot.items():
             if trigger <= 0:
@@ -3264,20 +3372,34 @@ class TradeManager:
         trade = self.get_trade(symbol, direction)
         pos = self.core.account.position(symbol, direction)
         own = Trade.lot_key(lot) if lot else ""
-        if own and (trade is None or own not in trade.lots):
+        if own and (trade is None or (own not in trade.lots and own not in trade.assumed_lots)):
             raise BinanceAPIError(-1, f"el trade_id {own} no tiene cantidad en {symbol} {direction}",
                                   method="protect", transport="local")
         try:
             if own:
                 async with self._prot_lock(trade, own):  # uno a la vez por lote: nunca dos TP del mismo lote
-                    if own not in trade.lots:
+                    real, virt = trade.lots.get(own, 0.0), trade.assumed_lots.get(own, 0.0)
+                    if real <= 0 and virt <= 0:
                         raise BinanceAPIError(-1, f"el trade_id {own} ya no tiene cantidad", method="protect",
                                               transport="local")
-                    result = await self.orders.place_protection(symbol, direction, kind, trigger,
-                                                                qty=trade.lots[own],
-                                                                client_prefix=prot_cid_prefix(kind, own))
+                    if real <= 0 and not trade.order_assumed:
+                        # Lote asumido dentro de una posición real de otros trade_id: un TP/SL con su cantidad
+                        # cerraría la de ellos si se dispara. Se guarda y se pone cuando tenga cantidad real
+                        # (p. ej. al abrirla a mano en Binance).
+                        trade.lot_prot.setdefault(own, {})[kind] = trigger
+                        self.save()
+                        log.warning("%s %s: %s del trade_id %s (asumido) guardado; se pondrá en Binance cuando "
+                                    "tenga cantidad real", symbol, direction, kind, own)
+                        self.core.bus.emit("protect", f"{kind} {symbol} {direction} @ {trigger:g} pendiente "
+                                           f"(trade_id {own} asumido)", "warning")
+                        return {"pending": True}
+                    # Lote real, o asumido sin posición real (solo asumidas): TP/SL condicional en Binance con su
+                    # cantidad. Si se abre a mano, ya está protegido; sin posición, al dispararse no ejecuta nada.
                     trade.lot_prot.setdefault(own, {})[kind] = trigger
-                    if own not in trade.lots:  # el lote se cerró mientras se colocaba
+                    result = await self.orders.place_protection(symbol, direction, kind, trigger,
+                                                                qty=real if real > 0 else virt,
+                                                                client_prefix=prot_cid_prefix(kind, own))
+                    if own not in trade.lots and own not in trade.assumed_lots:  # se cerró mientras se colocaba
                         await self.orders.cancel_protection(symbol, direction, {self._PROT_TYPES[kind]},
                                                             client_prefix=prot_cid_prefix(kind, own))
                         trade.lot_prot.pop(own, None)
@@ -3286,6 +3408,8 @@ class TradeManager:
                     (trade.quantity if trade else 0.0)
                 result = await self.orders.place_protection(symbol, direction, kind, trigger, qty=qty or None)
         except BinanceAPIError as err:
+            if own and trade is not None and own not in trade.lots and own in trade.assumed_lots:
+                self.save()  # TP/SL de un asumido: queda guardado y se pone al tener cantidad real
             if ErrorDoctor.diagnose(err).action != Action.TRIGGER_CROSSED or trade is None or not own \
                     or not close_if_crossed:
                 raise  # un TP/SL de la posición entera que ya cruzó no cierra los lotes de todos: se rechaza
@@ -3376,6 +3500,10 @@ class TradeManager:
                     trade.realized_exchange += upd.realized_pnl
                     if not trade.order_assumed:
                         self._apply_outside(trade, upd)
+                    elif (upd.side == "BUY") == (trade.direction == "LONG"):
+                        # Apertura a mano en Binance sobre lo que solo era asumido: pasa a ser real.
+                        self._realize_assumed(trade, upd.last_qty, upd.last_price, upd.trade_time, whole=upd.last_qty)
+                        self.save()
 
     def _settle_lot_attempt(self, record: Trade) -> None:
         """Llegó el fill de un cierre de lote que había fallado sin respuesta: se confirma ya."""
