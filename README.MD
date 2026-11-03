@@ -54,11 +54,13 @@ ida y vuelta completa. Con `FAST_SIGNALS=true` (por defecto) no se hace ninguna 
   son `reduceOnly` y nunca piden más que el lote, así que no pueden cerrar de más. Si algo no cuadra, se relee.
   El `close` de un `trade_id` solo va sin releer si la posición es entera de ese `trade_id`; si la comparte con
   otros (u otra cantidad sin dueño), se relee antes (+1 ida y vuelta) para que una reducción de fuera que aún no
-  llegó se reparta primero y el cierre nunca se lleve la parte de otro bot.
+  llegó se reparta primero y el cierre nunca se lleve la parte de otro bot (`SHARED_CLOSE_CHECK`, activo por
+  defecto).
 - Un `open` y su `close` que llegan en el mismo milisegundo se ejecutan en orden: el `close` espera a su `open`.
 
 Con 25 ms de ida y vuelta a Binance (medido con el simulador): apertura ~51 ms (antes ~101), cierre de un lote
-~15 ms (antes ~43) cuando la posición es solo de ese `trade_id`; compartida con otros, ~40 ms (relee la posición).
+~15 ms (antes ~43). En una posición compartida con otros `trade_id`, la orden de cierre de un lote llega a
+Binance ~42 ms después de la señal con `SHARED_CLOSE_CHECK=true` (relee la posición) y ~28 ms con `false`.
 `FAST_SIGNALS=false` relee siempre la posición antes de cerrar (+1 ida y vuelta).
 
 Para que en real las operaciones de milisegundos lleguen a tiempo:
@@ -411,6 +413,8 @@ ambos y las pruebas los ejecutan contra el executor.
 | `MIN_NOTIONAL_USDT` / `NOTIONAL_SAFETY_BUFFER_PCT` | `5.1` / `2.0` | Notional mínimo y colchón |
 | `MAX_NOTIONAL_OVERSHOOT_X` | `4.0` | Tope al corregir precisión (no abrir algo desproporcionado) |
 | `DEFAULT_NOTIONAL_USDT` | `0` | Tamaño por defecto si la señal no trae cantidad (0 = rechazar) |
+| `FAST_SIGNALS` | `true` | Órdenes sin consultas previas a Binance cuando lo que ya se sabe basta (ver «Operaciones de milisegundos») |
+| `SHARED_CLOSE_CHECK` | `true` | El `close` de un `trade_id` en una posición compartida con otros relee la posición antes de enviar la orden (+1 ida y vuelta): una reducción de fuera que aún no llegó se reparte primero y el cierre nunca se lleva la parte de otro bot. `false`: sin relectura (más rápido, con ese riesgo) |
 | `ASSUME_ON_MARGIN_ERROR` | `true` | Con -2019 registrar la posición como asumida |
 | `MARGIN_AUTO_REDUCE` | `false` | Con -2019 reintentar con la mitad de cantidad |
 | `SIGNAL_DEDUPE_TTL_S` | `0` | Antiduplicado por contenido para `close`/TP/SL (nunca para `open`: los tramos se ejecutan todos). Las señales con `signal_id` nunca se repiten |

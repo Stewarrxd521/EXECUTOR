@@ -2117,11 +2117,13 @@ class TradeManager:
 
         ``lot``: cierre de un trade_id. Solo sin releer si la posición es entera de ese lote: con otros dueños,
         una reducción de fuera (otro bot, a mano, TP/SL) que aún no llegó por el user stream se repartiría
-        después y este cierre se llevaría la parte de ellos. Releerla ahora la reparte antes."""
+        después y este cierre se llevaría la parte de ellos. Releerla ahora la reparte antes
+        (``SHARED_CLOSE_CHECK=false`` lo desactiva)."""
         conn = self.user_conn
         stable = conn is not None and conn.connected and time.time() - conn.connected_since > 2.0
         tol0 = (safe_float(trade.step_size) or 0.0) / 2 or 1e-12
-        shared = bool(lot) and (trade.unassigned > tol0 or any(k != lot and v > tol0 for k, v in trade.lots.items()))
+        shared = bool(lot) and self.settings.shared_close_check and \
+            (trade.unassigned > tol0 or any(k != lot and v > tol0 for k, v in trade.lots.items()))
         if self.settings.fast_signals and stable and not trade.order_assumed and not trade.rebuild and not shared:
             pos = self.core.account.position(trade.symbol, trade.direction)
             tol = (safe_float(trade.step_size) or 0.0) / 2 or 1e-12
