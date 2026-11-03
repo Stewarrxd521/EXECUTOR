@@ -455,8 +455,11 @@ async def test_fuzz_lots(seed, stateless, fake, tmp_path, snapshot_file, monkeyp
                     return {}, 0.0, None
         return {(s, dd): amount}, amount, ("whole" if whole else "partial", amount, s, dd)
 
-    def apply_outside_fills(fills, owners):
-        """Outside / TP-SL fills of this step, in Binance order, applied to ``owners`` (dict)."""
+    def apply_outside_fills(fills, owners, assumed=None):
+        """Outside / TP-SL fills of this step, in Binance order, applied to ``owners`` (dict). An outside open on
+        a position with assumed lots goes to those lots first (oldest first, up to their assumed qty): they
+        become real (``assumed``: the assumed dict to use, m.assumed by default)."""
+        assumed = m.assumed if assumed is None else assumed
         saved = m.owners
         m.owners = owners
         try:
@@ -469,8 +472,17 @@ async def test_fuzz_lots(seed, stateless, fake, tmp_path, snapshot_file, monkeyp
                     continue
                 opening = (f["side"] == "BUY") == (d == "LONG")
                 if opening:
-                    k = (*OUTSIDE, s, d)
-                    m.owners[k] = m.owners.get(k, 0.0) + f["qty"]
+                    left = f["qty"]
+                    for ak in list(assumed):
+                        if ak[2] != s or ak[3] != d or assumed[ak] <= 1e-12 or left <= 1e-12:
+                            continue
+                        q = min(left, assumed[ak])
+                        assumed[ak] -= q
+                        m.owners[ak] = m.owners.get(ak, 0.0) + q
+                        left -= q
+                    if left > 1e-12:
+                        k = (*OUTSIDE, s, d)
+                        m.owners[k] = m.owners.get(k, 0.0) + left
                     continue
                 first = None
                 pol = OUTSIDE_POLICY
@@ -713,19 +725,20 @@ async def test_fuzz_lots(seed, stateless, fake, tmp_path, snapshot_file, monkeyp
 
         # ── expectations: outside ops of the group happen first (dispatch order) ──
         sim = dict(owners_now)
+        sim_assumed = dict(m.assumed)
         sim_pos = dict(pos0)
         for op in ops:
             if op[0] == "outside":
                 _, s, d, r = op
                 apply_outside_fills([{"cid": "web", "sym": s, "ps": d, "side": "SELL" if d == "LONG" else "BUY",
-                                      "qty": r, "before": sim_pos[(s, d)]}], sim)
+                                      "qty": r, "before": sim_pos[(s, d)]}], sim, sim_assumed)
                 sim_pos[(s, d)] = max(0.0, sim_pos[(s, d)] - r)
                 expected_red[(s, d)] = expected_red.get((s, d), 0.0) + r
                 tol_mult[(s, d)] = tol_mult.get((s, d), 0) + 1
             elif op[0] == "outside_open":
                 _, s, d, q = op
                 apply_outside_fills([{"cid": "web", "sym": s, "ps": d, "side": "BUY" if d == "LONG" else "SELL",
-                                      "qty": q, "before": sim_pos[(s, d)]}], sim)
+                                      "qty": q, "before": sim_pos[(s, d)]}], sim, sim_assumed)
                 sim_pos[(s, d)] += q
                 expected_red[(s, d)] = expected_red.get((s, d), 0.0) - q
         close_expect = []
@@ -787,6 +800,7 @@ async def test_fuzz_lots(seed, stateless, fake, tmp_path, snapshot_file, monkeyp
         # ── model: replay Binance fills of this step in order (outside first-class) ──
         # opens of the executor: attribute by clientOrderId prefix X<tid>-
         open_ops = [op for op in ops if op[0] == "open"]
+        assumed_now = dict(m.assumed)
         for f in fills:
             cid = f["cid"]
             if cid.startswith("X"):
@@ -799,6 +813,8 @@ async def test_fuzz_lots(seed, stateless, fake, tmp_path, snapshot_file, monkeyp
         # first, so re-run in true order instead)
         if any(op[0] == "hooked" for op in ops) or open_ops:
             m.owners = dict(owners_now)
+            m.assumed.clear()
+            m.assumed.update(assumed_now)  # the outside opens of the first pass also realized assumed lots
             for f in fills:
                 cid = f["cid"]
                 if cid.startswith(("C", "K")):
