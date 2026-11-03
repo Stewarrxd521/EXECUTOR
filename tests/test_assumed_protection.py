@@ -186,3 +186,30 @@ async def test_partial_manual_open_realizes_the_oldest_assumed_lot_only(service,
     manual_open(fake, 0.02)
     await wait_for(lambda: lots(trade) == {"1": 0.01, "2": 0.02} and algos(fake, "T2"))
     assert [a["quantity"] for a in algos(fake, "T2")] == ["0.02"]
+
+
+async def test_position_opened_before_the_assumed_one_is_not_its_manual_open(service, fake):
+    """Lo que ya había en Binance (otro bot, a mano) antes de la asumida no la vuelve real."""
+    t = service.trades
+    manual_open(fake, 0.03)
+    await wait_for(lambda: amt(fake) == 0.03)
+    await asyncio.sleep(0.2)
+    trade = await assumed_trade(t, fake, 1, 0.01)
+    assert trade.order_assumed and trade.assumed_base == 0.03
+    close(t, 1)
+    await wait_for(lambda: t.closed and t.get_trade(SYM, "LONG") is None)
+    assert amt(fake) == 0.03 and t.closed[-1].order_assumed     # la posición de antes no se toca
+
+
+async def test_manual_open_after_a_previous_position_realizes_only_the_new_quantity(service, fake):
+    t = service.trades
+    manual_open(fake, 0.03)
+    await wait_for(lambda: amt(fake) == 0.03)
+    await asyncio.sleep(0.2)
+    trade = await assumed_trade(t, fake, 1, 0.01)
+    manual_open(fake, 0.01)
+    await wait_for(lambda: not trade.order_assumed)
+    assert lots(trade) == {"1": 0.01} and abs(trade.unassigned - 0.03) < 1e-12
+    close(t, 1)
+    await wait_for(lambda: amt(fake) == 0.03 and t.closed and not t.inflight(SYM))
+    assert not t.closed[-1].order_assumed

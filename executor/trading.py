@@ -273,6 +273,7 @@ class Trade:
     has_bot_pnl: bool = False
     signal_close_price: float = 0.0
     close_price_source: str = ""  # cierre sin orden real (asumida): "libro", "mejor ask/bid" o "referencia"
+    assumed_base: float = 0.0     # posición real (de otros, sin trade) que ya había al registrarse solo asumida
     closed_by: str = ""
     # Multiplicador: cantidad que pidió el bot y factor medio aplicado (real ≈ bot × factor).
     bot_quantity: float = 0.0
@@ -1774,6 +1775,9 @@ class TradeManager:
                                                  "MARGIN_INSUFFICIENT", self.core.account.is_hedge, rules.step_size,
                                                  assumed=True, source=source, bot=bot)
                     if trade is not None:
+                        if trade.order_assumed and not any(t.get("assumed") for t in trade.tranches):
+                            # Lo que ya había en Binance en ese lado no es la apertura a mano de esta asumida.
+                            trade.assumed_base = prior.qty if prior is not None else 0.0
                         trade.tranches.append({**tranche, "qty": float(qty), "fill_price": px, "assumed": True,
                                                "price_source": px_src})
                         if source == "signal":
@@ -2365,9 +2369,11 @@ class TradeManager:
                     and all(safe_float(t.get("ts")) < since for t in rows):
                 lk = plain
 
-        if trade.order_assumed and pos is not None and pos.qty > tol:
-            # Se abrió en Binance (a mano) lo que era solo asumido: pasa a ser real y se cierra de verdad.
-            self._realize_assumed(trade, pos.qty, pos.entry_price or trade.entry_price, 0, whole=pos.qty)
+        if trade.order_assumed and pos is not None and pos.qty - trade.assumed_base > tol:
+            # Se abrió en Binance (a mano) lo que era solo asumido: pasa a ser real y se cierra de verdad. Lo que ya
+            # había antes de la asumida (assumed_base) no es de ella: queda sin dueño.
+            self._realize_assumed(trade, pos.qty - trade.assumed_base, pos.entry_price or trade.entry_price, 0,
+                                  whole=pos.qty)
             base = pos.qty
         # 3) Parte asumida (-2019, sin orden real): se descarta sin enviar nada.
         lot_qty = trade.lots.get(lk, 0.0)
@@ -2835,7 +2841,7 @@ class TradeManager:
                 use = min(ant["open"], qty)
                 ant["open"] -= use
                 qty -= use
-            if qty > 0:
+            if qty > 0 and self._opened_after_assumed(trade, upd.trade_time):
                 qty -= self._realize_assumed(trade, qty, upd.last_price, upd.trade_time)
             if qty > 1e-12:
                 trade.credit("", qty)  # abierto por fuera: no es de ningún trade_id
@@ -2906,6 +2912,13 @@ class TradeManager:
                             trade.direction, k, trade.lots[k])
                 self._spawn(self._deferred_close(trade.symbol, trade.direction, tid, bot, {
                     "reason": "BOTCLOSE", "close_price": 0.0, "bot_pnl": None}, "corregido"))
+
+    @staticmethod
+    def _opened_after_assumed(trade: Trade, fill_ms: int) -> bool:
+        """El fill de fuera es posterior a la primera apertura asumida que sigue abierta (no la cantidad de otro
+        que ya estaba antes)."""
+        ts = [safe_float(t.get("ts")) for t in trade.tranches if t.get("assumed")]
+        return bool(ts) and (not fill_ms or fill_ms >= min(ts) * 1000 - 1000)
 
     def _realize_assumed(self, trade: Trade, qty: float, price: float, fill_ms: int,
                          whole: float = 0.0) -> float:
@@ -3022,9 +3035,7 @@ class TradeManager:
         if gap < 0:
             log.warning("%s %s: hay %s más en Binance que en el libro; queda sin dueño", trade.symbol,
                         trade.direction, -gap)
-            rest = -gap - self._realize_assumed(trade, -gap, trade.entry_price, read_ms)
-            if rest > 1e-12:
-                trade.credit("", rest)
+            trade.credit("", -gap)  # sin su fill no se sabe si se abrió antes o después de las asumidas
             ant["open"] += -gap
             self.save()
             return
@@ -3533,8 +3544,12 @@ class TradeManager:
                     if not trade.order_assumed:
                         self._apply_outside(trade, upd)
                     elif (upd.side == "BUY") == (trade.direction == "LONG"):
-                        # Apertura a mano en Binance sobre lo que solo era asumido: pasa a ser real.
-                        self._realize_assumed(trade, upd.last_qty, upd.last_price, upd.trade_time, whole=upd.last_qty)
+                        # Apertura a mano en Binance sobre lo que solo era asumido: pasa a ser real (lo que ya
+                        # había antes, assumed_base, sigue sin ser de ella).
+                        if not self._opened_after_assumed(trade, upd.trade_time) or self._realize_assumed(
+                                trade, upd.last_qty, upd.last_price, upd.trade_time,
+                                whole=upd.last_qty + trade.assumed_base) <= 0:
+                            trade.assumed_base += upd.last_qty  # anterior a las asumidas: no es de ellas
                         self.save()
 
     def _settle_lot_attempt(self, record: Trade) -> None:

@@ -175,7 +175,8 @@ en español, la causa típica, la solución y la **corrección automática** que
 > **Abrir a mano lo asumido.** Lo que se abre fuera del executor (a mano en Binance) en una posición con lotes
 > asumidos pasa a ser de esos lotes, del más antiguo al más nuevo y hasta su cantidad asumida: dejan de ser
 > asumidos, toman el precio real, su TP/SL se pone con la cantidad real y su `close` cierra de verdad solo esa
-> cantidad. Lo que exceda queda sin dueño. Si el evento no llegó (executor caído), se detecta al cerrar.
+> cantidad. Lo que exceda queda sin dueño, igual que lo que ya había en Binance antes de la asumida (eso no es
+> su apertura a mano). Si el evento no llegó (executor caído), en una posición solo asumida se detecta al cerrar.
 | -2011, -2013, -4046, -4059 | Ya estaba hecho: no es un error real |
 
 La pestaña **Errores** del dashboard muestra cada error con su explicación, si se autocorrigió y cómo, e incluye un
