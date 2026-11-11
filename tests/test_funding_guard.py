@@ -234,3 +234,17 @@ async def test_disabled_guard_does_nothing(service, fake, guard):
     at = await schedule(service, fake, 0.005)
     held = await charge_at(fake, at)
     assert held["SHORT"] == 0 and fake.funding_paid[SYM] > 0
+
+
+async def test_bot_open_on_the_hedge_side_keeps_its_lot_when_the_hedge_closes(service, fake, guard):
+    """Un bot abre SHORT mientras la cobertura SHORT está abierta: al cerrarla solo sale el lote de la cobertura."""
+    t = service.trades
+    open_(t, 1, 0.01)
+    await opened(t, fake, 0.01)
+    at = await schedule(service, fake, 0.005)
+    await wait_for(lambda: amt(fake, "SHORT") == 0.01, timeout=10)
+    open_(t, 2, 0.02, direction="SHORT")
+    await wait_for(lambda: amt(fake, "SHORT") == 0.03)
+    await charge_at(fake, at)
+    await wait_for(lambda: amt(fake, "SHORT") == 0.02 and records(t), timeout=10)
+    assert lots(t.get_trade(SYM, "SHORT")) == {"2": 0.02} and amt(fake) == 0.01
