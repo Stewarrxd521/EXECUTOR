@@ -43,6 +43,7 @@ from .errors import Action, BinanceAPIError, ErrorDoctor
 from .orders import OrderContext, OrderExecutor
 from .precision import D, fmt, parse_bool, safe_float
 from .storage import JsonStore
+from .tasks import spawn
 
 log = logging.getLogger("executor.trading")
 
@@ -94,6 +95,9 @@ def _split_ref(ref: Any) -> tuple[int, str]:
         return int(float(tid or 0)), bot
     except (TypeError, ValueError, OverflowError):
         return 0, bot
+
+
+FUNDING_BOT = "funding"   # «bot» dueño de las coberturas de funding (executor/funding.py): lote «funding:<tid>»
 
 
 def lot_ref(bot: str, trade_id: Any) -> Any:
@@ -799,17 +803,21 @@ class TradeManager:
                 t.update_unrealized(price)
 
     def stats(self) -> dict:
-        wins = sum(1 for t in self.closed if t.pnl_usdt > 0)
-        total = len(self.closed)
-        wins_tp = sum(1 for t in self.closed if t.status == "TP")
+        # Las coberturas de funding no son operaciones de los bots: no cuentan para sus aciertos, sí para el PnL.
+        hedges = [t for t in self.closed if t.bot == FUNDING_BOT]
+        own = [t for t in self.closed if t.bot != FUNDING_BOT]
+        wins = sum(1 for t in own if t.pnl_usdt > 0)
+        total = len(own)
+        wins_tp = sum(1 for t in own if t.status == "TP")
         return {
+            "funding_hedges": len(hedges), "funding_hedge_pnl": sum(t.pnl_usdt for t in hedges),
             "wins": wins, "losses": total - wins,
             "win_rate": (wins / total * 100) if total else None,
             "wins_tp": wins_tp, "losses_tp": total - wins_tp,
             "win_rate_tp": (wins_tp / total * 100) if total else None,
             "realized_pnl": self.realized_total, "unrealized_pnl": self.unrealized_pnl,
             "fees": sum(t.fees_usdt for t in self.closed),
-            "closed_count": total, "open_count": len(self.trades),
+            "closed_count": len(self.closed), "open_count": len(self.trades),
         }
 
     def inflight(self, symbol: Optional[str] = None) -> int:
@@ -1685,7 +1693,11 @@ class TradeManager:
                          notional: float = 0.0, paper_trade_id: int = 0, source: str = "signal",
                          leverage: Optional[int] = None, level: float = 0.0,
                          signal_id: str = "", multiplier: float = 1.0, bot_quantity: float = 0.0,
-                         bot: str = "") -> Optional[Trade]:
+                         bot: str = "", exact_qty: bool = False, allow_assumed: bool = True) -> Optional[Trade]:
+        """Abre (o amplía) con una orden de mercado.
+
+        ``exact_qty``: se envía exactamente ``quantity`` (sin subirla al notional mínimo ni tocar el leverage);
+        si Binance no la acepta, no se abre. ``allow_assumed=False``: un -2019 no se registra como asumida."""
         symbol, direction = symbol.upper(), direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
         async with self._lock(symbol):
@@ -1710,9 +1722,14 @@ class TradeManager:
                 desired = quantity * (signal_price if signal_price > 0 else ref)
             else:
                 desired = self.settings.default_notional_usdt
-            target_lev = leverage or self.leverage_for_price(ref)
-            applied_lev = await self.orders.ensure_leverage(symbol, target_lev)
-            confirmed = self.core.account.leverage.get(symbol) == applied_lev
+            if exact_qty:
+                # El leverage del símbolo no se toca (es el de la posición que ya existe).
+                target_lev = applied_lev = self.core.account.leverage.get(symbol) or leverage or self.settings.leverage
+                confirmed = True
+            else:
+                target_lev = leverage or self.leverage_for_price(ref)
+                applied_lev = await self.orders.ensure_leverage(symbol, target_lev)
+                confirmed = self.core.account.leverage.get(symbol) == applied_lev
             if not confirmed:
                 msg = (f"{symbol}: no se pudo confirmar el leverage {applied_lev}x en Binance "
                        f"(¿PROXY_URLS/FIXIE_URL configurado?)")
@@ -1721,10 +1738,15 @@ class TradeManager:
                     return None
                 log.warning("%s; se abre con el leverage que ya tenga el símbolo", msg)
 
-            qty = rules.qty_for_notional(desired, ref, market=True, buffer_pct=self.settings.notional_buffer_pct,
-                                         min_notional_floor=self.settings.min_notional_usdt)
+            if exact_qty:
+                qty = rules.round_qty(D(fmt(quantity)), True, "nearest")
+                if qty <= 0:
+                    return None
+            else:
+                qty = rules.qty_for_notional(desired, ref, market=True, buffer_pct=self.settings.notional_buffer_pct,
+                                             min_notional_floor=self.settings.min_notional_usdt)
             ctx = OrderContext(symbol, side, direction, "open", rules, market=True,
-                               desired_notional=desired, ref_price=ref)
+                               desired_notional=desired, ref_price=ref, exact=exact_qty)
             log.info("Apertura %s %s: qty=%s (≈%.2f USDT, ref=%s, lev=%sx)", direction, symbol, fmt(qty),
                      float(qty) * ref, ref, applied_lev)
             existing = self.trades.get((symbol, direction))
@@ -1768,7 +1790,7 @@ class TradeManager:
                 if diag.action == Action.CHECK_STATUS:
                     self._unknown_open[(symbol, direction)] = time.time()
                     self._unknown_owner[(symbol, direction)] = owner  # sus clientOrderIds se consultan después
-                if diag.info.code == -2019 and self.settings.assume_on_margin_error:
+                if diag.info.code == -2019 and self.settings.assume_on_margin_error and allow_assumed:
                     px, px_src = await self.assumed_fill_price(symbol, side, float(qty), ref)
                     log.warning("[ASUMIDA] %s %s: margen insuficiente, se registra como abierta a %s (%s)",
                                 direction, symbol, px, px_src)
@@ -3586,7 +3608,7 @@ class TradeManager:
     def _schedule_external_check(self, trade: Trade) -> None:
         if trade.key not in self._pending_external:
             self._pending_external.add(trade.key)
-            asyncio.create_task(self._confirm_external_close(trade))
+            spawn(self._confirm_external_close(trade))
 
     async def _confirm_external_close(self, trade: Trade) -> None:
         try:

@@ -28,6 +28,11 @@ LEVERAGE_LADDER = [125, 100, 75, 50, 25, 20, 15, 10, 8, 5, 4, 3, 2, 1]
 _MIN_NOTIONAL_RE = re.compile(r"no smaller than\s+([\d.]+)", re.I)
 
 
+# Correcciones que cambian la cantidad o el leverage de una orden (no se aplican a una orden «exacta»).
+_SIZE_FIXES = frozenset({Action.LOWER_LEVERAGE, Action.FIX_PRECISION, Action.RAISE_NOTIONAL, Action.RAISE_QTY,
+                         Action.REDUCE_SIZE})
+
+
 @dataclass
 class OrderContext:
     symbol: str
@@ -39,6 +44,9 @@ class OrderContext:
     reduce_only: bool = False
     desired_notional: float = 0.0
     ref_price: float = 0.0
+    # Cantidad exacta (cobertura de funding): nunca se sube, baja ni se cambia el leverage para que entre; si
+    # Binance no la acepta tal cual, la orden se rechaza.
+    exact: bool = False
 
 
 @dataclass
@@ -151,6 +159,9 @@ class OrderExecutor:
                     raise
                 action = diag.action
                 rules = ctx.rules
+                if ctx.exact and action in _SIZE_FIXES:
+                    notes.append("cantidad exacta: no se ajusta")
+                    raise
 
                 if action == Action.CHECK_STATUS:
                     await asyncio.sleep(1.0)  # dar tiempo a que el motor registre la orden

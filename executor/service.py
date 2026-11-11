@@ -16,6 +16,7 @@ from .config import Settings
 from .core import Core
 from .errors import BinanceAPIError, ErrorDoctor, ErrorJournal
 from .exchange_info import ExchangeInfo, apply_brackets, parse_exchange_info
+from .funding import FundingGuard
 from .grid import GridManager
 from .multiplier import Multiplier
 from .notifier import EventBus, TelegramNotifier
@@ -88,6 +89,7 @@ class ExecutorService:
         self.trades.multiplier = self.multiplier
         self.trades.grid_owner = self.grids.owns
         self.grids.trade_owner = lambda s, d: self.trades.get_trade(s, d) is not None
+        self.funding = FundingGuard(self.core, self.trades, self.grids.owns)
         self.user = UserDataStream(settings.stream_base_url, ws, clock, self._on_user_event, self._on_user_connect)
         self.trades.user_conn = self.user.conn
         market.on_tick(self._on_market_tick)
@@ -151,6 +153,7 @@ class ExecutorService:
                 self._spawn(self.seed_open_orders())
             self._spawn(self._balance_loop())
             self._spawn(self._verify_loop())
+            self._spawn(self.funding.run())
         else:
             log.critical("BINANCE_API_KEY / BINANCE_API_SECRET no configuradas: solo datos de mercado y dashboard")
             self.trades.ready.set()
@@ -208,6 +211,7 @@ class ExecutorService:
             log.error("%d señal(es) seguían ejecutándose al apagar", pending)
         for t in self._tasks:
             t.cancel()
+        await self.funding.stop()
         self.trades.store.save_now()
         self.grids.store.save_now()
         self.multiplier.store.save_now()
@@ -355,6 +359,7 @@ class ExecutorService:
         kind = evt.get("e")
         acct = self.core.account
         if kind == "ACCOUNT_UPDATE":
+            self.funding.on_account_update(evt)
             keys = acct.apply_account_update(evt)
             self.trades.on_positions_changed(keys)
             self._balance_dirty = True
@@ -403,9 +408,10 @@ class ExecutorService:
 
     def _want_market(self) -> set[str]:
         """Registra en el stream de mercado qué símbolos hacen falta y con qué frecuencia."""
-        grids = {b.symbol for b in self.grids.active_bots()}
+        # Precio cada segundo: grids y símbolos a punto de cobrar funding (su tasa final se decide ahí).
+        fast = {b.symbol for b in self.grids.active_bots()} | self.funding.fast_symbols()
         needed = self.needed_symbols()
-        self.core.market.want(needed - grids, fast_symbols=grids, ticker_symbols=self.watch)
+        self.core.market.want(needed - fast, fast_symbols=fast, ticker_symbols=self.watch)
         return needed
 
     async def _history_loop(self) -> None:
@@ -673,6 +679,7 @@ class ExecutorService:
             "trading_enabled": trades.trading_enabled,
             "leverage": self.settings.leverage,
             "multiplier": self.multiplier.view(),
+            "funding": self.funding.view(),
             "settings": self.settings.public_view(),
             "positions": self.positions_view(),
             "orders": self.orders_view(),

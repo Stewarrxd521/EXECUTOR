@@ -36,6 +36,7 @@ from .errors import BinanceAPIError, ErrorDoctor
 from .orders import OrderContext, OrderExecutor
 from .precision import D, ceil_step, decimals_of, floor_step, fmt, parse_bool, safe_float
 from .storage import JsonStore
+from .tasks import spawn
 
 log = logging.getLogger("executor.grid")
 
@@ -441,7 +442,7 @@ class GridManager:
         if cfg.trigger_price > 0:
             log.info("Grid %s: esperando trigger %s", bot.id, cfg.trigger_price)
             return bot
-        asyncio.create_task(self.start(bot))
+        spawn(self.start(bot))
         return bot
 
     async def start(self, bot: GridBot) -> None:
@@ -514,7 +515,7 @@ class GridManager:
                 bot.last_error = f"celda {cell.index}: {diag.info.title}"
                 self.save()
                 if cell.retries <= 5 and diag.retryable:
-                    asyncio.create_task(self._retry_cell(bot, cell, 3.0 * cell.retries))
+                    spawn(self._retry_cell(bot, cell, 3.0 * cell.retries))
                 return
         cell.order_id = int(result.get("orderId") or 0)
         cell.client_id = params.get("newClientOrderId", client_id)
@@ -672,10 +673,10 @@ class GridManager:
             cell.client_id = upd.client_id
             self._index(bot, cell)
         if upd.status == "FILLED":
-            asyncio.create_task(self._handle_fill(bot, cell, upd))
+            spawn(self._handle_fill(bot, cell, upd))
         elif upd.status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH") and bot.id not in self._cancelling:
             if bot.status == "RUNNING":
-                asyncio.create_task(self._handle_external_cancel(bot, cell, upd))
+                spawn(self._handle_external_cancel(bot, cell, upd))
         return True
 
     async def _handle_external_cancel(self, bot: GridBot, cell: GridCell, upd: OrderUpdate) -> None:
@@ -687,7 +688,7 @@ class GridManager:
             self._by_order.pop(cell.order_id, None)
             self._by_client.pop(cell.client_id, None)
             cell.order_id, cell.client_id = 0, ""
-        asyncio.create_task(self._retry_cell(bot, cell, 2.0))
+        spawn(self._retry_cell(bot, cell, 2.0))
 
     async def _handle_fill(self, bot: GridBot, cell: GridCell, upd: OrderUpdate) -> None:
         async with self._lock(bot.id):
@@ -713,7 +714,7 @@ class GridManager:
                 hit = price >= cfg.trigger_price if bot.trigger_above else price <= cfg.trigger_price
                 if hit:
                     log.info("Grid %s: trigger %s alcanzado (precio %s)", bot.id, cfg.trigger_price, price)
-                    asyncio.create_task(self.start(bot))
+                    spawn(self.start(bot))
                 continue
             if bot.status != "RUNNING":
                 continue
@@ -730,7 +731,7 @@ class GridManager:
             if reason:
                 log.warning("Grid %s %s: %s alcanzado (precio %s)", bot.id, bot.symbol, reason, price)
                 self._auto_stopping.add(bot.id)
-                asyncio.create_task(self._auto_stop(bot, reason))
+                spawn(self._auto_stop(bot, reason))
 
     async def _auto_stop(self, bot: GridBot, reason: str) -> None:
         try:

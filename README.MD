@@ -357,6 +357,55 @@ del dashboard y los bots Grid no se multiplican.
 La configuración elegida en el dashboard se guarda en `DATA_DIR/multiplier.json`; en Render (disco efímero) conviene
 fijarla también con las variables `MULTIPLIER_*` para que sobreviva a un redeploy.
 
+## Protección de funding
+
+Cuando el funding es alto, o se cobra muy seguido (cada 4 h o cada hora), puede comerse la ganancia de una
+posición. El funding se cobra sobre la posición que hay **en el instante del cobro**, y en modo Hedge un LONG y un
+SHORT del mismo símbolo y la misma cantidad se compensan: lo que paga uno lo cobra el otro. El executor lo
+aprovecha (`executor/funding.py`), con cada símbolo que tenga posición real:
+
+1. **Antes del cobro** (`FUNDING_HEDGE_LEAD_MS`, 1 s por defecto) mira el funding que se va a cobrar. Si la
+   posición neta (LONG − SHORT) lo **paga** y llega al umbral, abre en el lado contrario exactamente esa cantidad
+   neta.
+2. **Mantiene la cobertura** hasta que Binance avisa del cobro por el user stream (`ACCOUNT_UPDATE` con motivo
+   `FUNDING_FEE`) y, como pronto, `FUNDING_HEDGE_LAG_MS` (0,5 s) después de la hora.
+3. **Cierra la cobertura.** Se repite en cada cobro mientras la posición siga abierta.
+
+- **Umbral:** `|funding| ≥ 0.3 %` (`FUNDING_HEDGE_MIN_RATE_PCT`). Si el símbolo cobra cada hora o menos
+  (`FUNDING_HEDGE_FREQ_HOURS`), el umbral baja a `0.15 %` (`FUNDING_HEDGE_FREQ_RATE_PCT`). El intervalo de cada
+  símbolo se lee de Binance (`fundingInfo`) y se confirma con los cobros observados.
+- **Solo cuando la posición paga.** Un funding a favor (la posición lo cobra) no se toca
+  (`FUNDING_HEDGE_ONLY_PAYING=false` cubre también ese caso).
+- **Por qué no se cierra siempre a los 0,5 s:** Binance no garantiza el instante exacto del cobro; su ayuda
+  indica que puede desviarse unos segundos de la hora. Cerrar la cobertura antes de que cobre dejaría la posición
+  pagando el funding entero. Por eso se espera el aviso de cobro; si no llega, se cierra a los
+  `FUNDING_HEDGE_MAX_HOLD_MS` (20 s). Mientras está cubierta, la posición no gana ni pierde con el precio.
+- **Coste:** abrir y cerrar la cobertura son dos órdenes de mercado: dos comisiones taker (≈0,05 % cada una en
+  la tarifa base de Binance) más el spread, es decir ≈0,1 % del valor de la posición. Por debajo de ese funding no
+  compensa cubrir; por eso los umbrales no bajan de ahí.
+- **No toca a los bots.** La cobertura es un lote propio del libro (`funding:<hora del cobro>`): se abre y se
+  cierra con las mismas órdenes por lote que los `trade_id`, así que nunca cierra cantidad de un bot. Queda en el
+  historial (motivo `FUNDING`) con su PnL y comisiones, y no cuenta en los aciertos/fallos de los bots
+  (`stats.funding_hedges`, `stats.funding_hedge_pnl`).
+- **Exacta:** la orden de cobertura nunca se agranda para llegar al mínimo de Binance ni cambia el leverage del
+  símbolo. Si la posición es menor que la orden mínima del símbolo, o no hay margen (-2019), no se cubre y se
+  avisa (dashboard y Telegram).
+- **Requisitos:** cuenta en modo Hedge; los símbolos con un grid activo no se cubren.
+- **Reinicios:** una cobertura que quedó abierta (reinicio a mitad de un cobro, cierre que falló) se cierra sola.
+- **Estado:** `GET /api/state` → `funding` muestra, por símbolo, el próximo cobro, la tasa, el umbral y si se
+  cubrirá (y por qué no), además de las últimas coberturas. Cada paso sale en los eventos del dashboard.
+
+| Variable | Por defecto | Para qué |
+| --- | --- | --- |
+| `FUNDING_HEDGE` | `true` | Activa la protección de funding |
+| `FUNDING_HEDGE_MIN_RATE_PCT` | `0.3` | `|funding|` en % desde el que se cubre |
+| `FUNDING_HEDGE_FREQ_HOURS` | `1` | Cobros «seguidos»: intervalo de cobro ≤ estas horas (`0` lo desactiva) |
+| `FUNDING_HEDGE_FREQ_RATE_PCT` | `0.15` | Umbral en % para los cobros seguidos |
+| `FUNDING_HEDGE_LEAD_MS` | `1000` | La cobertura se abre estos ms antes del cobro (mínimo 200) |
+| `FUNDING_HEDGE_LAG_MS` | `500` | Se cierra como pronto estos ms después de la hora de cobro |
+| `FUNDING_HEDGE_MAX_HOLD_MS` | `20000` | Sin aviso de cobro de Binance, se cierra estos ms después de la hora |
+| `FUNDING_HEDGE_ONLY_PAYING` | `true` | Solo cuando la posición paga el funding |
+
 ## API HTTP y cliente (`executor_client.py`)
 
 Todo lo que hace el dashboard se puede hacer con peticiones HTTP simples. La referencia completa (rutas, parámetros,
@@ -454,6 +503,7 @@ ambos y las pruebas los ejecutan contra el executor.
 ```bash
 pip install -r requirements-dev.txt
 pytest
+ruff check .        # análisis estático (configurado en pyproject.toml)
 ```
 
 Las pruebas de integración levantan un Binance simulado (`tests/fake_binance.py`) con WS API, streams y REST mínimo,

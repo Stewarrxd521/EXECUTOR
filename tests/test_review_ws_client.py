@@ -1,7 +1,6 @@
 """Reproducciones de la revisión adversarial (ronda 6): lo que no debe volver a pasar."""
 import asyncio
 from executor_ws_signal import ExecutorSignalSocket
-from tests.conftest import wait_for
 from tests.test_api import SECRET
 from tests.test_lots import SYM, amt
 
