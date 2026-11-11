@@ -61,6 +61,11 @@ class FakeBinance:
         self.user_fills: list[dict] = []         # cada fill (GET /fapi/v1/userTrades)
         self.all_orders_error = False
         self.algo_fill_parts = 1
+        # Funding por símbolo: (tasa, hora del próximo cobro en ms). Sin entrada: 0.01 % dentro de 1 h.
+        self.funding: dict[str, tuple[float, int]] = {}
+        self.funding_intervals: dict[str, int] = {}   # horas entre cobros (GET /fapi/v1/fundingInfo)
+        self.funding_paid: dict[str, float] = {}      # funding neto pagado por símbolo (USDT; negativo = cobrado)
+        self.funding_event_symbol = True              # el aviso FUNDING_FEE trae el símbolo (campo S)
         self.book: dict[str, dict] = {}  # libro explícito por símbolo: {"bids": [[px, qty]...], "asks": [...]}
         self.slippage_pct = 0.0          # % al que se llena una orden de mercado respecto del mark
         self.market_reply_new = False    # la respuesta de una MARKET llega como NEW sin avgPrice                        # en cuántos trades se llena un TP/SL disparado
@@ -96,6 +101,7 @@ class FakeBinance:
         app.router.add_get("/fapi/v1/userTrades", self._rest_user_trades)
         app.router.add_get("/fapi/v1/exchangeInfo", self._rest_exinfo)
         app.router.add_get("/fapi/v1/leverageBracket", self._rest_brackets)
+        app.router.add_get("/fapi/v1/fundingInfo", self._rest_funding_info)
         app.router.add_get("/fapi/v1/positionSide/dual", self._rest_position_mode)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
@@ -424,8 +430,9 @@ class FakeBinance:
             await ws.send_str(text)
 
         def mark_item(s: str, p: float, now: int) -> dict:
-            return {"e": "markPriceUpdate", "E": now, "s": s, "p": str(p), "i": str(p), "r": "0.0001",
-                    "T": now + 3600_000}
+            rate, next_ms = self.funding.get(s, (0.0001, now + 3600_000))
+            return {"e": "markPriceUpdate", "E": now, "s": s, "p": str(p), "i": str(p), "r": str(rate),
+                    "T": next_ms}
 
         def tick_item(s: str, p: float, now: int) -> dict:
             return {"e": "24hrMiniTicker", "E": now, "s": s, "c": str(p), "o": str(p * 0.97), "h": str(p * 1.05),
@@ -515,6 +522,31 @@ class FakeBinance:
     async def _rest_exinfo(self, request: web.Request) -> web.Response:
         self.rest_calls.append("exchangeInfo")
         return web.json_response(exchange_info_payload())
+
+    async def _rest_funding_info(self, request: web.Request) -> web.Response:
+        return web.json_response([{"symbol": s, "adjustedFundingRateCap": "0.02", "adjustedFundingRateFloor": "-0.02",
+                                   "fundingIntervalHours": h} for s, h in self.funding_intervals.items()])
+
+    def charge_funding(self, symbol: str, next_ms: int = 0) -> float:
+        """Cobra el funding de ``symbol`` como Binance: cada posición paga ``cantidad × mark × tasa`` (el LONG
+        paga con tasa positiva; el SHORT cobra). Devuelve el neto pagado por la cuenta y avisa por el user
+        stream (``ACCOUNT_UPDATE`` con motivo ``FUNDING_FEE``). ``next_ms``: hora del siguiente cobro."""
+        rate, at = self.funding.get(symbol, (0.0001, 0))
+        mark = self.marks[symbol]
+        paid = 0.0
+        for (sym, _), pos in self.positions.items():
+            if sym == symbol and pos["amt"]:
+                paid += pos["amt"] * mark * rate
+        self.wallet -= paid
+        self.funding_paid[symbol] = self.funding_paid.get(symbol, 0.0) + paid
+        self.funding[symbol] = (rate, next_ms or at + 3600_000)
+        now = int(time.time() * 1000)
+        a = {"m": "FUNDING_FEE", "B": [{"a": "USDT", "wb": str(self.wallet), "cw": str(self.wallet),
+                                        "bc": str(-paid)}], "P": []}
+        if self.funding_event_symbol:
+            a["S"] = symbol
+        self.push({"e": "ACCOUNT_UPDATE", "E": now, "T": now, "a": a})
+        return paid
 
     async def _rest_brackets(self, request: web.Request) -> web.Response:
         self.rest_calls.append("leverageBracket")

@@ -98,6 +98,16 @@ class Settings:
     signal_dedupe_ttl_s: float = 0.0
     signal_wait_timeout_s: float = 7.0
 
+    # ── Protección de funding (executor/funding.py) ───────────────────────
+    funding_hedge: bool = True              # cubrir la posición durante el cobro de un funding caro (FUNDING_HEDGE)
+    funding_hedge_min_rate_pct: float = 0.3   # |funding| desde el que se cubre, en % (FUNDING_HEDGE_MIN_RATE_PCT)
+    funding_hedge_freq_hours: float = 1.0     # funding «seguido»: intervalo de cobro ≤ estas horas…
+    funding_hedge_freq_rate_pct: float = 0.15  # …se cubre desde este |funding| en % (más bajo: se paga más veces)
+    funding_hedge_lead_ms: int = 1000       # la cobertura se abre estos ms antes del cobro
+    funding_hedge_lag_ms: int = 500         # y se cierra como pronto estos ms después del cobro
+    funding_hedge_max_hold_ms: int = 20000  # sin aviso de cobro de Binance, se cierra estos ms después de la hora
+    funding_hedge_only_paying: bool = True  # solo cuando la posición PAGA el funding (si lo cobra, no se toca)
+
     # ── Infra ─────────────────────────────────────────────────────────────
     recv_window_ms: int = 5000
     balance_poll_s: int = 60
@@ -190,6 +200,7 @@ class Settings:
             "keepalive": bool(self.keepalive_url and self.keepalive_s),
             "assume_on_margin_error": self.assume_on_margin_error,
             "margin_auto_reduce": self.margin_auto_reduce,
+            "funding_hedge": self.funding_hedge,
             "telegram": bool(self.telegram_bot_token and self.telegram_chat_id),
         }
 
@@ -256,6 +267,14 @@ def load_settings() -> Settings:
         shared_close_check=_env_bool("SHARED_CLOSE_CHECK", True),
         signal_dedupe_ttl_s=_env_float("SIGNAL_DEDUPE_TTL_S", 0.0),
         signal_wait_timeout_s=_env_float("SIGNAL_WAIT_TIMEOUT_S", 7.0),
+        funding_hedge=_env_bool("FUNDING_HEDGE", True),
+        funding_hedge_min_rate_pct=max(0.0, _env_float("FUNDING_HEDGE_MIN_RATE_PCT", 0.3)),
+        funding_hedge_freq_hours=max(0.0, _env_float("FUNDING_HEDGE_FREQ_HOURS", 1.0)),
+        funding_hedge_freq_rate_pct=max(0.0, _env_float("FUNDING_HEDGE_FREQ_RATE_PCT", 0.15)),
+        funding_hedge_lead_ms=max(200, _env_int("FUNDING_HEDGE_LEAD_MS", 1000)),
+        funding_hedge_lag_ms=max(100, _env_int("FUNDING_HEDGE_LAG_MS", 500)),
+        funding_hedge_max_hold_ms=max(500, _env_int("FUNDING_HEDGE_MAX_HOLD_MS", 20000)),
+        funding_hedge_only_paying=_env_bool("FUNDING_HEDGE_ONLY_PAYING", True),
         recv_window_ms=_env_int("RECV_WINDOW_MS", 5000),
         balance_poll_s=max(10, _env_int("BALANCE_POLL_S", 60)),
         market_streams="full" if _env("MARKET_STREAMS", "lite").lower() == "full" else "lite",

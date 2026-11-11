@@ -553,6 +553,13 @@ class RestClient:
     async def exchange_info(self) -> dict:
         return await self.request("GET", "/fapi/v1/exchangeInfo", route="proxy" if self.proxies else "direct", timeout=20)
 
+    async def funding_info(self) -> list:
+        """Símbolos con intervalo o topes de funding distintos del estándar (público). Los que no salen cobran
+        cada 8 h."""
+        data = await self.request("GET", "/fapi/v1/fundingInfo", route="proxy" if self.proxies else "direct",
+                                  timeout=15)
+        return data if isinstance(data, list) else []
+
     async def leverage_brackets(self) -> list:
         data = await self.request("GET", "/fapi/v1/leverageBracket", {}, signed=True, timeout=20)
         return data if isinstance(data, list) else []

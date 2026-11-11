@@ -1685,7 +1685,11 @@ class TradeManager:
                          notional: float = 0.0, paper_trade_id: int = 0, source: str = "signal",
                          leverage: Optional[int] = None, level: float = 0.0,
                          signal_id: str = "", multiplier: float = 1.0, bot_quantity: float = 0.0,
-                         bot: str = "") -> Optional[Trade]:
+                         bot: str = "", exact_qty: bool = False, allow_assumed: bool = True) -> Optional[Trade]:
+        """Abre (o amplía) con una orden de mercado.
+
+        ``exact_qty``: se envía exactamente ``quantity`` (sin subirla al notional mínimo ni tocar el leverage);
+        si Binance no la acepta, no se abre. ``allow_assumed=False``: un -2019 no se registra como asumida."""
         symbol, direction = symbol.upper(), direction.upper()
         side = "BUY" if direction == "LONG" else "SELL"
         async with self._lock(symbol):
@@ -1710,9 +1714,14 @@ class TradeManager:
                 desired = quantity * (signal_price if signal_price > 0 else ref)
             else:
                 desired = self.settings.default_notional_usdt
-            target_lev = leverage or self.leverage_for_price(ref)
-            applied_lev = await self.orders.ensure_leverage(symbol, target_lev)
-            confirmed = self.core.account.leverage.get(symbol) == applied_lev
+            if exact_qty:
+                # El leverage del símbolo no se toca (es el de la posición que ya existe).
+                target_lev = applied_lev = self.core.account.leverage.get(symbol) or leverage or self.settings.leverage
+                confirmed = True
+            else:
+                target_lev = leverage or self.leverage_for_price(ref)
+                applied_lev = await self.orders.ensure_leverage(symbol, target_lev)
+                confirmed = self.core.account.leverage.get(symbol) == applied_lev
             if not confirmed:
                 msg = (f"{symbol}: no se pudo confirmar el leverage {applied_lev}x en Binance "
                        f"(¿PROXY_URLS/FIXIE_URL configurado?)")
@@ -1721,10 +1730,15 @@ class TradeManager:
                     return None
                 log.warning("%s; se abre con el leverage que ya tenga el símbolo", msg)
 
-            qty = rules.qty_for_notional(desired, ref, market=True, buffer_pct=self.settings.notional_buffer_pct,
-                                         min_notional_floor=self.settings.min_notional_usdt)
+            if exact_qty:
+                qty = rules.round_qty(D(fmt(quantity)), True, "nearest")
+                if qty <= 0:
+                    return None
+            else:
+                qty = rules.qty_for_notional(desired, ref, market=True, buffer_pct=self.settings.notional_buffer_pct,
+                                             min_notional_floor=self.settings.min_notional_usdt)
             ctx = OrderContext(symbol, side, direction, "open", rules, market=True,
-                               desired_notional=desired, ref_price=ref)
+                               desired_notional=desired, ref_price=ref, exact=exact_qty)
             log.info("Apertura %s %s: qty=%s (≈%.2f USDT, ref=%s, lev=%sx)", direction, symbol, fmt(qty),
                      float(qty) * ref, ref, applied_lev)
             existing = self.trades.get((symbol, direction))
@@ -1768,7 +1782,7 @@ class TradeManager:
                 if diag.action == Action.CHECK_STATUS:
                     self._unknown_open[(symbol, direction)] = time.time()
                     self._unknown_owner[(symbol, direction)] = owner  # sus clientOrderIds se consultan después
-                if diag.info.code == -2019 and self.settings.assume_on_margin_error:
+                if diag.info.code == -2019 and self.settings.assume_on_margin_error and allow_assumed:
                     px, px_src = await self.assumed_fill_price(symbol, side, float(qty), ref)
                     log.warning("[ASUMIDA] %s %s: margen insuficiente, se registra como abierta a %s (%s)",
                                 direction, symbol, px, px_src)
