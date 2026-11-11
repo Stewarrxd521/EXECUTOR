@@ -4,7 +4,6 @@ Every test here FAILS on the current code and describes a real defect."""
 
 import asyncio
 import time
-from decimal import Decimal
 
 import pytest
 

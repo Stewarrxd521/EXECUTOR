@@ -1,0 +1,17 @@
+# Análisis estático del executor:  ruff check .
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# Scripts anteriores al paquete executor/ (se conservan tal cual).
+extend-exclude = ["app.py", "WS.py", "binance_api_mejorado.py"]
+
+[tool.ruff.lint]
+# F: errores de pyflakes · E9: sintaxis · B: fallos habituales · PLE: errores de pylint
+# RUF006: tareas de asyncio sin referencia (el recolector de basura puede cortarlas a mitad)
+select = ["F", "E9", "B", "PLE", "RUF006"]
+ignore = [
+    "B905",  # zip() sin strict=: las listas emparejadas tienen la misma longitud por construcción
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F841", "B007", "B023", "RUF006"]

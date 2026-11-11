@@ -29,11 +29,12 @@ from typing import Callable, Optional
 from .core import Core
 from .errors import BinanceAPIError
 from .precision import fmt, safe_float
-from .trading import Trade, TradeManager, lot_ref
+from .tasks import spawn
+from .trading import FUNDING_BOT, Trade, TradeManager, lot_ref
 
 log = logging.getLogger("executor.funding")
 
-BOT = "funding"                 # «bot» dueño de los lotes de cobertura: su lote es «funding:<tid>»
+BOT = FUNDING_BOT               # «bot» dueño de los lotes de cobertura: su lote es «funding:<tid>»
 ARM_MS = 30_000                 # un cobro se prepara cuando falta este tiempo
 MIN_LEAD_MS = 150               # con menos margen que este ya no se abre (la orden no llegaría antes del cobro)
 FEE_SETTLE_MS = 300             # tras el aviso de cobro de ESTE símbolo se espera esto antes de cerrar
@@ -106,7 +107,7 @@ class FundingGuard:
 
     # ── Tareas ────────────────────────────────────────────────────────────
     def _spawn(self, coro) -> asyncio.Task:
-        task = asyncio.create_task(coro)
+        task = spawn(coro)   # su error queda en el log
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task

@@ -38,6 +38,7 @@ import aiohttp
 
 from .binance_api import BinanceWsApi, ServerClock
 from .precision import safe_float
+from .tasks import spawn
 
 log = logging.getLogger("executor.streams")
 
@@ -148,7 +149,7 @@ class StreamConnection:
                     self.consecutive_failures = 0
                     log.info("Stream %s conectado", self.name)
                     if self._on_connect is not None:
-                        asyncio.create_task(self._on_connect())
+                        spawn(self._on_connect())
                     delay = 1.0
                     while not self._stop:
                         msg = await ws.receive(timeout=self._idle_timeout)

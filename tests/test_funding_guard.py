@@ -61,6 +61,9 @@ async def test_expensive_funding_is_hedged_and_nets_to_zero(service, fake, guard
     assert amt(fake) == 0.01 and lots(trade) == {"1": 0.01}       # la posición del bot, intacta
     rec = records(t)[-1]
     assert (rec.direction, rec.quantity, rec.status, rec.closed_by) == ("SHORT", 0.01, "FUNDING", "funding")
+    stats = t.stats()                                             # no cuenta como operación perdida del bot
+    assert (stats["funding_hedges"], stats["wins"], stats["losses"]) == (1, 0, 0)
+    assert abs(stats["funding_hedge_pnl"] - rec.pnl_usdt) < 1e-12
     done = guard.recent[-1]
     assert done.state == "cerrada" and done.opened_ms < at        # abierta antes del cobro
     assert at - done.opened_ms <= service.settings.funding_hedge_lead_ms + 100

@@ -2,7 +2,6 @@
 import asyncio
 import time
 
-import pytest
 
 from executor.account import AccountState
 from executor.service import ExecutorService

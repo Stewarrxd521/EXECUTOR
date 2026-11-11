@@ -43,6 +43,7 @@ from .errors import Action, BinanceAPIError, ErrorDoctor
 from .orders import OrderContext, OrderExecutor
 from .precision import D, fmt, parse_bool, safe_float
 from .storage import JsonStore
+from .tasks import spawn
 
 log = logging.getLogger("executor.trading")
 
@@ -94,6 +95,9 @@ def _split_ref(ref: Any) -> tuple[int, str]:
         return int(float(tid or 0)), bot
     except (TypeError, ValueError, OverflowError):
         return 0, bot
+
+
+FUNDING_BOT = "funding"   # «bot» dueño de las coberturas de funding (executor/funding.py): lote «funding:<tid>»
 
 
 def lot_ref(bot: str, trade_id: Any) -> Any:
@@ -799,17 +803,21 @@ class TradeManager:
                 t.update_unrealized(price)
 
     def stats(self) -> dict:
-        wins = sum(1 for t in self.closed if t.pnl_usdt > 0)
-        total = len(self.closed)
-        wins_tp = sum(1 for t in self.closed if t.status == "TP")
+        # Las coberturas de funding no son operaciones de los bots: no cuentan para sus aciertos, sí para el PnL.
+        hedges = [t for t in self.closed if t.bot == FUNDING_BOT]
+        own = [t for t in self.closed if t.bot != FUNDING_BOT]
+        wins = sum(1 for t in own if t.pnl_usdt > 0)
+        total = len(own)
+        wins_tp = sum(1 for t in own if t.status == "TP")
         return {
+            "funding_hedges": len(hedges), "funding_hedge_pnl": sum(t.pnl_usdt for t in hedges),
             "wins": wins, "losses": total - wins,
             "win_rate": (wins / total * 100) if total else None,
             "wins_tp": wins_tp, "losses_tp": total - wins_tp,
             "win_rate_tp": (wins_tp / total * 100) if total else None,
             "realized_pnl": self.realized_total, "unrealized_pnl": self.unrealized_pnl,
             "fees": sum(t.fees_usdt for t in self.closed),
-            "closed_count": total, "open_count": len(self.trades),
+            "closed_count": len(self.closed), "open_count": len(self.trades),
         }
 
     def inflight(self, symbol: Optional[str] = None) -> int:
@@ -3600,7 +3608,7 @@ class TradeManager:
     def _schedule_external_check(self, trade: Trade) -> None:
         if trade.key not in self._pending_external:
             self._pending_external.add(trade.key)
-            asyncio.create_task(self._confirm_external_close(trade))
+            spawn(self._confirm_external_close(trade))
 
     async def _confirm_external_close(self, trade: Trade) -> None:
         try:
