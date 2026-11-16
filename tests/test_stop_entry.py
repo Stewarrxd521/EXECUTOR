@@ -76,3 +76,53 @@ async def test_open_stop_no_toca_la_posicion_contraria_del_mismo_par(service, fa
     short = service.trades.get_trade("ETHUSDT", "SHORT")
     assert short.quantity == pytest.approx(0.1) and short.lots.get("ratio_rev:42") == pytest.approx(0.1)
     assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == pytest.approx(-0.1)
+
+
+async def test_un_sl_de_la_posicion_del_mismo_lado_no_quita_la_entrada_stop(service, fake):
+    service.trades.handle_signal({"action": "open", "trade_id": 50, "symbol": "ETHUSDT", "direction": "SHORT",
+                                  "price": 3000, "quantity": 0.01})
+    await wait_for(lambda: service.core.account.position("ETHUSDT", "SHORT") is not None)
+    _open_stop(service, trigger_price=2800)
+    await wait_for(lambda: len(service.trades.pending_stops()) == 1 and len(fake.algos) == 1)
+    service.trades.handle_signal({"action": "open_sl", "symbol": "ETHUSDT", "direction": "SHORT",
+                                  "trigger_price": 3100})                   # SL de la posición entera
+    await wait_for(lambda: len(fake.algos) == 2)
+    assert {a["type"] for a in fake.algos.values()} == {"STOP_MARKET"}
+    assert any(a["clientAlgoId"].startswith("E42") for a in fake.algos.values())   # la entrada sigue
+
+
+async def test_si_binance_no_confirma_la_cancelacion_la_entrada_sigue_registrada(service, fake):
+    _open_stop(service)
+    await wait_for(lambda: len(service.trades.pending_stops()) == 1)
+
+    async def falla(*a, **k):
+        return False
+    real = service.trades.orders.cancel_algo
+    service.trades.orders.cancel_algo = falla
+    _, body = await service.trades.submit_signal({"action": "cancel_stop", "trade_id": 42, "bot": "ratio_rev",
+                                                  "symbol": "ETHUSDT"}, wait=True)
+    assert body["ok"] is False and len(service.trades.pending_stops()) == 1 and len(fake.algos) == 1
+    service.trades.orders.cancel_algo = real
+    fake.set_mark("ETHUSDT", 2899)                                         # si se dispara, se atribuye igual
+    await wait_for(lambda: service.trades.get_trade("ETHUSDT", "SHORT") is not None)
+    assert service.trades.get_trade("ETHUSDT", "SHORT").lots.get("ratio_rev:42") == pytest.approx(0.02)
+
+
+async def test_close_all_justo_despues_de_open_stop_no_deja_entradas(service, fake):
+    _open_stop(service)
+    _, body = await service.trades.submit_signal({"action": "close_all"}, wait=True)
+    assert body["ok"]
+    await wait_for(lambda: not fake.algos and not service.trades.pending_stops())
+
+
+async def test_close_con_lote_abierto_y_entrada_pendiente_cierra_las_dos(service, fake):
+    service.trades.handle_signal({"action": "open", "trade_id": 42, "bot": "ratio_rev", "symbol": "ETHUSDT",
+                                  "direction": "SHORT", "price": 3000, "quantity": 0.01})
+    await wait_for(lambda: service.core.account.position("ETHUSDT", "SHORT") is not None)
+    _open_stop(service, trigger_price=2800)
+    await wait_for(lambda: len(service.trades.pending_stops()) == 1)
+    service.trades.handle_signal({"action": "close", "trade_id": 42, "bot": "ratio_rev", "symbol": "ETHUSDT",
+                                  "direction": "SHORT", "reason": "MANUAL"})
+    await wait_for(lambda: service.trades.get_trade("ETHUSDT", "SHORT") is None)
+    await wait_for(lambda: not fake.algos and not service.trades.pending_stops())
+    assert fake.positions[("ETHUSDT", "SHORT")]["amt"] == 0
