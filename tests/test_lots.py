@@ -585,12 +585,12 @@ async def test_each_trade_id_has_its_own_tp_on_a_shared_position(service, fake):
     open_(t, 2, 0.01, tp=3200, sl=2900, bot="app25")
     trade = await opened(t, fake, 0.03)
     await wait_for(lambda: len(fake.algos) == 3)
-    assert algos(fake) == [("STOP_MARKET", "S2:app25", 0.01), ("TAKE_PROFIT_MARKET", "T1:kline", 0.02),
-                           ("TAKE_PROFIT_MARKET", "T2:app25", 0.01)]
+    assert algos(fake) == [("STOP_MARKET", "S2:app25", 0.01), ("TAKE_PROFIT", "T1:kline", 0.02),
+                           ("TAKE_PROFIT", "T2:app25", 0.01)]
     fake.set_mark(SYM, 3100.0)                   # solo el TP de kline: cierra su 0.02
     await wait_for(lambda: amt(fake) == 0.01)
     await wait_for(lambda: lots(trade) == {"app25:2": 0.01})
-    assert algos(fake) == [("STOP_MARKET", "S2:app25", 0.01), ("TAKE_PROFIT_MARKET", "T2:app25", 0.01)]
+    assert algos(fake) == [("STOP_MARKET", "S2:app25", 0.01), ("TAKE_PROFIT", "T2:app25", 0.01)]
     fake.set_mark(SYM, 3200.0)                   # el TP de app25 cierra lo suyo; su SL se cancela
     await wait_for(lambda: amt(fake) == 0 and t.get_trade(SYM, "LONG") is None)
     await wait_for(lambda: not fake.algos)
@@ -607,7 +607,7 @@ async def test_a_new_tp_replaces_only_that_trade_ids_tp(service, fake):
     await wait_for(lambda: sorted(float(a["triggerPrice"]) for a in fake.algos.values()) == [3150.0, 3200.0])
     close(t, 2)                                  # cerrar el trade_id 2 cancela solo su TP
     await wait_for(lambda: amt(fake) == 0.02)
-    await wait_for(lambda: algos(fake) == [("TAKE_PROFIT_MARKET", "T1", 0.02)])
+    await wait_for(lambda: algos(fake) == [("TAKE_PROFIT", "T1", 0.02)])
     assert lots(trade) == {"1": 0.02}
     t.handle_signal({"action": "close_tp", "trade_id": 1, "symbol": SYM, "direction": "LONG"})
     await wait_for(lambda: not fake.algos)
@@ -621,7 +621,7 @@ async def test_lot_tp_follows_its_lot_after_a_partial_close(service, fake):
     await opened(t, fake, 0.03)
     close(t, 1, quantity=0.01)
     await wait_for(lambda: amt(fake) == 0.02)
-    await wait_for(lambda: algos(fake) == [("TAKE_PROFIT_MARKET", "T1", 0.01)])
+    await wait_for(lambda: algos(fake) == [("TAKE_PROFIT", "T1", 0.01)])
     fake.set_mark(SYM, 3100.0)
     await wait_for(lambda: amt(fake) == 0.01)
     await asyncio.sleep(0.5)

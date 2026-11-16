@@ -90,6 +90,12 @@ class Settings:
     blocked_symbols: set[str] = field(default_factory=set)
     assume_on_margin_error: bool = True
     margin_auto_reduce: bool = False
+    # TP como orden límite (TAKE_PROFIT con precio = disparo): sale al precio del TP o mejor, sin deslizamiento.
+    tp_limit: bool = True
+    # Precio que dispara los TP/SL: CONTRACT_PRICE (último precio, como los bots) o MARK_PRICE.
+    protection_working_type: str = "CONTRACT_PRICE"
+    # Entrada stop límite (open_stop con limit_price) disparada y sin llenarse: se cancela tras estos segundos.
+    stop_limit_timeout_s: float = 60.0
     max_price_age_s: float = 5.0
     fast_signals: bool = True   # HFT: sin consultas previas a Binance cuando lo conocido ya basta (FAST_SIGNALS)
     # El close de un trade_id en una posición compartida con otros relee la posición antes (+1 ida y vuelta): una
@@ -200,6 +206,8 @@ class Settings:
             "keepalive": bool(self.keepalive_url and self.keepalive_s),
             "assume_on_margin_error": self.assume_on_margin_error,
             "margin_auto_reduce": self.margin_auto_reduce,
+            "tp_limit": self.tp_limit,
+            "protection_working_type": self.protection_working_type,
             "funding_hedge": self.funding_hedge,
             "telegram": bool(self.telegram_bot_token and self.telegram_chat_id),
         }
@@ -262,6 +270,11 @@ def load_settings() -> Settings:
         blocked_symbols={s.upper() for s in _env_list("BLOCKED_SYMBOLS", "BTCUSDT,ETHUSDT,BTCUSDC,ETHUSDC")},
         assume_on_margin_error=_env_bool("ASSUME_ON_MARGIN_ERROR", True),
         margin_auto_reduce=_env_bool("MARGIN_AUTO_REDUCE", False),
+        tp_limit=_env_bool("TP_LIMIT", True),
+        protection_working_type=(os.environ.get("PROTECTION_WORKING_TYPE", "CONTRACT_PRICE").strip().upper()
+                                 if os.environ.get("PROTECTION_WORKING_TYPE", "").strip().upper()
+                                 in ("CONTRACT_PRICE", "MARK_PRICE") else "CONTRACT_PRICE"),
+        stop_limit_timeout_s=_env_float("STOP_LIMIT_TIMEOUT_S", 60.0),
         max_price_age_s=_env_float("MAX_PRICE_AGE_S", 5.0),
         fast_signals=_env_bool("FAST_SIGNALS", True),
         shared_close_check=_env_bool("SHARED_CLOSE_CHECK", True),

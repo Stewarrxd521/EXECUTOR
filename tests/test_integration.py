@@ -94,7 +94,7 @@ async def test_tp_by_algo_order_closes_trade_externally(service, fake):
     fake.set_mark("ETHUSDT", 3301)
     await wait_for(lambda: service.trades.get_trade("ETHUSDT", "LONG") is None)
     assert service.trades.closed[-1].status == "TP"
-    assert trade.close_price == pytest.approx(3301)
+    assert trade.close_price == pytest.approx(3300)   # TP límite: sale al precio del TP, no al del disparo
 
 
 async def test_neutral_grid_cycles(service, fake):

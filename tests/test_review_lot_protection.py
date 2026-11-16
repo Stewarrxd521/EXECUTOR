@@ -32,7 +32,7 @@ async def test_tp_fill_in_two_trades_does_not_touch_other_lot(service, fake):
     await wait_for(lambda: amt(fake) == 0.04)
     await asyncio.sleep(0.8)
     assert lots(trade) == {"app25:2": 0.04}
-    assert algos(fake) == [("TAKE_PROFIT_MARKET", "T2:app25", 0.04)]
+    assert algos(fake) == [("TAKE_PROFIT", "T2:app25", 0.04)]
 
 
 async def test_tp_fill_in_two_trades_then_bot_close_hits_other_bot(service, fake):
