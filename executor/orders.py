@@ -22,7 +22,9 @@ from .exchange_info import SymbolRules
 from .precision import D, floor_step, fmt, safe_float
 
 log = logging.getLogger("executor.orders")
-_LOT_ALGO_RE = re.compile(r"[TS]\d+(?::[a-z0-9_.-]+)?")  # clientAlgoId del TP/SL de un trade_id (T5:kline-…)
+_LOT_ALGO_RE = re.compile(r"[TS]\d+(?::[a-z0-9_.-]+)?")
+# clientAlgoId de una ENTRADA stop pendiente de un trade_id (open_stop, E5:kline-…): no es un TP/SL.
+_STOP_ENTRY_RE = re.compile(r"E\d+(?::[a-z0-9_.-]+)?")  # clientAlgoId del TP/SL de un trade_id (T5:kline-…)
 
 LEVERAGE_LADDER = [125, 100, 75, 50, 25, 20, 15, 10, 8, 5, 4, 3, 2, 1]
 _MIN_NOTIONAL_RE = re.compile(r"no smaller than\s+([\d.]+)", re.I)
@@ -494,6 +496,8 @@ class OrderExecutor:
         out = []
         for o in self.core.account.algos_for(symbol, ps, types):
             head = (o.client_id or "").rsplit("-", 1)[0]
+            if _STOP_ENTRY_RE.fullmatch(head):
+                continue  # entrada stop (abre): poner o quitar un TP/SL nunca la toca
             if client_prefix is not None and head != client_prefix:
                 continue
             if shared_only and _LOT_ALGO_RE.fullmatch(head):

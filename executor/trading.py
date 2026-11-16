@@ -605,6 +605,7 @@ class TradeManager:
         # Entradas STOP_MARKET pendientes por señal (open_stop): lote -> datos; y orderId disparado -> lote.
         self._stops: dict[str, dict] = {}
         self._stop_orders: dict[int, str] = {}
+        self._stops_gone: dict[str, tuple[dict, float]] = {}  # cancelada hace poco: por si se disparó a la vez
         self.adopted = False                          # ya se adoptaron las posiciones sin trade (1.ª lectura)
         self._bot_first_seen: dict[str, float] = {}   # bot -> primera vez que se identificó (lotes de antes, sin nombre)
         self._cid_final: OrderedDict = OrderedDict()   # clientOrderId propio -> (llenado, precio medio) ya definitivo
@@ -1056,6 +1057,7 @@ class TradeManager:
             # En One-way una entrada contraria netearía (cerraría) la otra posición del par.
             return self._reject(sig, "open_stop necesita la cuenta en modo Hedge", 200)
         task = self._spawn(self._signal_open_stop(sig, trigger, quantity))
+        self._track(self._open_tasks, symbol, direction, task)   # close / close_all esperan a que se coloque
         return 200, {"ok": True, "action": "open_stop", "symbol": symbol, "direction": direction,
                      "trigger_price": trigger}, task
 
@@ -1065,7 +1067,10 @@ class TradeManager:
         await self._await_ready(symbol)
         old = self._stops.get(lk)
         if old is not None:
-            await self._cancel_stop(old, "reemplazada")
+            gone = await self._cancel_stop(old, "reemplazada")
+            if gone != "cancelled":
+                return self._stop_failed(sig, "no se pudo quitar la entrada stop anterior de este trade_id ("
+                                         + ("ya se disparó" if gone == "triggered" else "Binance no lo confirmó") + ")")
         factor = self.multiplier.effective() if self.multiplier is not None else 1.0
         rules = self.core.exinfo.get(symbol, trigger)
         lev = int(safe_float(d.get("leverage")))
@@ -1118,40 +1123,75 @@ class TradeManager:
         return 200, {"ok": True, "action": "cancel_stop", "symbol": stop["symbol"], "found": True}, task
 
     async def _signal_cancel_stop(self, sig: Signal, stop: dict, why: str = "cancel_stop") -> dict:
-        ok = await self._cancel_stop(stop, why)
-        detail = "entrada stop cancelada" if ok else "la entrada stop ya se había disparado"
+        result = await self._cancel_stop(stop, why)
+        if result == "failed":
+            self.status["signals_rejected"] += 1
+            detail = "Binance no confirmó la cancelación: la entrada stop sigue activa (se reintenta con otro cancel)"
+            self._log_signal(sig.action, stop["symbol"], stop["direction"], False, detail, sig)
+            self.core.bus.emit("signal_failed", f"Entrada stop {stop['symbol']} (trade_id {stop['trade_id']}) "
+                               "sin cancelar", "error", symbol=stop["symbol"])
+            return {"ok": False, "detail": detail}
+        detail = "entrada stop cancelada" if result == "cancelled" else "la entrada stop ya se había disparado"
         self._log_signal(sig.action, stop["symbol"], stop["direction"], True, detail, sig)
         return {"ok": True, "detail": detail}
 
-    async def _cancel_stop(self, stop: dict, why: str) -> bool:
-        """Quita de Binance la entrada stop si aún no se disparó. False si ya se disparó (sigue su curso)."""
+    async def _cancel_stop(self, stop: dict, why: str) -> str:
+        """Quita de Binance la entrada stop si aún no se disparó: «cancelled», «triggered» (ya se disparó: sigue su
+        curso) o «failed» (Binance no lo confirmó: se sigue guardando, activa, para volver a intentarlo)."""
         if self._stop_filled_any(stop) or any(lk == stop["lk"] for lk in self._stop_orders.values()):
-            return False
-        self._stops.pop(stop["lk"], None)
-        self.save()
+            return "triggered"
         aid = stop.get("algo_id")
         if not aid:
             o = next((o for o in self.core.account.algos_for(stop["symbol"]) if o.client_id == stop["caid"]), None)
             aid = o.id if o is not None else None
-        if aid:
-            await self.orders.cancel_algo(aid, stop["symbol"])
+        if aid and not await self.orders.cancel_algo(aid, stop["symbol"]):
+            log.warning("Entrada stop %s %s (trade_id %s): Binance no confirmó la cancelación (%s); sigue activa",
+                        stop["direction"], stop["symbol"], stop["trade_id"], why)
+            return "failed"
+        if self._stop_filled_any(stop) or any(lk == stop["lk"] for lk in self._stop_orders.values()):
+            return "triggered"  # se disparó mientras se cancelaba
+        self._stops.pop(stop["lk"], None)
+        # Unos minutos más localizable: si Binance la disparó justo antes de cancelarla, su fill se atribuye igual.
+        now = time.time()
+        self._stops_gone = {k: v for k, v in self._stops_gone.items() if now - v[1] < 300}
+        self._stops_gone[stop["lk"]] = (stop, now)
+        self.save()
         log.info("Entrada stop %s %s (trade_id %s) cancelada: %s", stop["direction"], stop["symbol"],
                  stop["trade_id"], why)
-        return True
+        return "cancelled"
 
     @staticmethod
     def _stop_filled_any(stop: dict) -> bool:
         return float(stop.get("filled") or 0.0) > 0
 
-    def _stop_by_caid(self, caid: str) -> Optional[dict]:
-        return next((st for st in self._stops.values() if st.get("caid") == caid), None) if caid else None
+    def _stop_by_caid(self, caid: str, revive: bool = False) -> Optional[dict]:
+        if not caid:
+            return None
+        st = next((st for st in self._stops.values() if st.get("caid") == caid), None)
+        if st is None:
+            gone = next((v[0] for v in self._stops_gone.values() if v[0].get("caid") == caid), None)
+            if gone is not None and (not revive or self._revive_stop(gone)):
+                st = gone
+        return st
+
+    def _revive_stop(self, stop: dict) -> bool:
+        """Una entrada stop que se dio por cancelada se disparó (cancel y disparo a la vez): vuelve a seguirse."""
+        if stop["lk"] in self._stops:
+            return False
+        self._stops_gone.pop(stop["lk"], None)
+        self._stops[stop["lk"]] = stop
+        log.warning("Entrada stop %s %s (trade_id %s): se disparó a la vez que se cancelaba; se registra su fill",
+                    stop["direction"], stop["symbol"], stop["trade_id"])
+        return True
 
     def _on_stop_algo(self, o: dict) -> bool:
         """ALGO_UPDATE de una entrada stop propia: su disparo («ai» = la orden que crea) o su fin."""
-        stop = self._stop_by_caid(o.get("caid", ""))
+        status = o.get("X")
+        stop = self._stop_by_caid(o.get("caid", ""), revive=status in ("TRIGGERED", "TRIGGERING", "FINISHED"))
         if stop is None:
             return False
-        status = o.get("X")
+        if status == "CANCELED" and stop["lk"] not in self._stops:
+            return True  # el aviso de la cancelación que pidió el executor
         if o.get("ai") and status in ("TRIGGERED", "TRIGGERING", "FINISHED"):
             self._stop_orders[int(safe_float(o["ai"]))] = stop["lk"]
         elif status in ("CANCELED", "EXPIRED", "REJECTED") and not self._stop_filled_any(stop):
@@ -1170,11 +1210,14 @@ class TradeManager:
             return lk
         if upd.orig_type != "STOP_MARKET" or upd.reduce_only or upd.order_id in self._fired_orders:
             return None
-        cands = [st for st in self._stops.values() if st["symbol"] == upd.symbol
+        pool = list(self._stops.values()) + [v[0] for v in self._stops_gone.values()]
+        cands = [st for st in pool if st["symbol"] == upd.symbol
                  and upd.position_side == st["direction"]
                  and upd.side == ("BUY" if st["direction"] == "LONG" else "SELL")]
         if len(cands) != 1:
             return None
+        if cands[0]["lk"] not in self._stops:
+            self._revive_stop(cands[0])
         self._stop_orders[upd.order_id] = cands[0]["lk"]
         return cands[0]["lk"]
 
@@ -1554,11 +1597,17 @@ class TradeManager:
         d = sig.data
         if not sig.symbol and not sig.trade_id:
             return self._reject(sig, "falta symbol o trade_id")
-        stop = self._stops.get(Trade.lot_key(sig.ref)) if sig.trade_id else None
+        lk = Trade.lot_key(sig.ref)
+        stop = self._stops.get(lk) if sig.trade_id else None
         if stop is not None and not self._stop_filled_any(stop):
-            # Cierre de un trade_id que solo es una entrada stop sin disparar: se quita de Binance.
-            task = self._spawn(self._signal_cancel_stop(sig, stop, why=f"close {d.get('reason') or ''}".strip()))
-            return 200, {"ok": True, "action": "close", "symbol": sig.symbol, "stop_cancelled": True}, task
+            # El trade_id tiene una entrada stop sin disparar: se quita de Binance. Si además ya tiene
+            # posición (otro tramo), esa se cierra con el close normal de abajo.
+            why = f"close {d.get('reason') or ''}".strip()
+            has_lot = any(lk in t.lots or lk in t.assumed_lots for t in self.trades.values())
+            if not has_lot and not self._pending_tasks(self._open_tasks, sig.symbol, sig.direction or None):
+                task = self._spawn(self._signal_cancel_stop(sig, stop, why=why))
+                return 200, {"ok": True, "action": "close", "symbol": sig.symbol, "stop_cancelled": True}, task
+            self._spawn(self._cancel_stop(stop, why))
         reason = str(d.get("reason") or "MAIN_BOT").upper()
         close_price = safe_float(d.get("close_price")) or safe_float(d.get("price"))
         quantity = safe_float(_first(d, ("quantity", "qty")))
