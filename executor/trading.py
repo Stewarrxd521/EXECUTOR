@@ -1149,10 +1149,14 @@ class TradeManager:
     async def _cancel_stop(self, stop: dict, why: str) -> str:
         """Quita de Binance la entrada stop si aún no se disparó: «cancelled», «triggered» (ya se disparó: sigue su
         curso) o «failed» (Binance no lo confirmó: se sigue guardando, activa, para volver a intentarlo)."""
-        if stop.get("limit") and not self._stop_filled_any(stop) and self._stop_resting(stop):
-            # Stop límite ya disparada y sin llenar: su LIMIT sigue en el libro; se cancela esa.
+        if stop.get("limit") and self._stop_resting(stop):
+            # Stop límite ya disparada con su LIMIT aún en el libro (sin llenar o en parte): se cancela esa. Lo
+            # ya ejecutado queda abierto con su TP/SL.
+            filled = self._stop_filled_any(stop)
             await self._finish_stop_limit(stop, why)
-            return "cancelled" if stop["lk"] not in self._stops else "failed"
+            if stop["lk"] in self._stops:
+                return "failed"
+            return "triggered" if filled or self._stop_filled_any(stop) else "cancelled"
         if self._stop_filled_any(stop) or any(lk == stop["lk"] for lk in self._stop_orders.values()):
             return "triggered"
         aid = stop.get("algo_id")
@@ -1887,9 +1891,11 @@ class TradeManager:
     async def _signal_close_all(self, sig: Signal, prior_opens: Optional[list] = None) -> dict:
         await self._await_ready()
         await self._wait_tasks(prior_opens or [])  # no espera (ni cierra) aperturas recibidas después
-        closed = await self.close_all("CLOSE_ALL")
+        # Primero las entradas stop (también lo que quede en el libro de una stop límite): que nada vuelva a abrir
+        # mientras se cierra. Lo que ya entró se cierra abajo con el resto.
         for stop in list(self._stops.values()):
             await self._cancel_stop(stop, "close_all")
+        closed = await self.close_all("CLOSE_ALL")
         self.status["signals_close"] += len(closed)
         detail = f"{len(closed)} posición(es) cerradas"
         self._log_signal("close_all", "", "", True, detail, sig)
@@ -3448,12 +3454,21 @@ class TradeManager:
         ps = self.orders.position_side(direction)
         ids = [o.id for o in self.core.account.orders_for(symbol)
                if o.id in self._fired_orders and o.position_side == ps
-               and (lk is None or _split_ref(self._fired_orders[o.id][0])[0] == _split_ref(lk)[0])]
+               and (lk is None or self._same_lot(self._fired_orders[o.id][0], lk))]
         n = 0
         for oid in ids:
             if await self.orders.cancel(symbol, order_id=oid):
                 n += 1
         return n
+
+    @staticmethod
+    def _same_lot(cid_lk: str, lk: str) -> bool:
+        """¿El lote de un clientAlgoId (con el bot quizá recortado) es ``lk``? trade_id y bot, no solo el número."""
+        if cid_lk == lk:
+            return True
+        tid, bot = _split_ref(lk)
+        t2, short = _split_ref(cid_lk)
+        return t2 == tid and bool(bot) and cid_bot(bot, tid) == short
 
     def _prot_lock(self, trade: Trade, lk: str) -> asyncio.Lock:
         return self._prot_locks.setdefault((trade.key, lk), asyncio.Lock())

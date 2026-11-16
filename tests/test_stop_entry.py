@@ -197,3 +197,27 @@ async def test_close_de_respaldo_tras_el_tp_no_toca_el_lote_de_otro(service, fak
     await asyncio.sleep(0.3)
     assert fake.positions[("ETHUSDT", "LONG")]["amt"] == pytest.approx(0.01)     # el lote 2 sigue entero
     assert service.trades.get_trade("ETHUSDT", "LONG").lots.get("b:2") == pytest.approx(0.01)
+
+
+async def test_cancel_stop_de_una_stop_limite_llenada_en_parte_quita_el_resto_y_protege_lo_llenado(service, fake):
+    service.settings.stop_limit_timeout_s = 60
+    _open_stop(service, limit_price=2897.1)
+    await wait_for(lambda: len(service.trades.pending_stops()) == 1)
+    fake.set_mark("ETHUSDT", 2880)                                         # hueco: la LIMIT queda en el libro
+    await wait_for(lambda: len(fake.orders) == 1)
+    o = next(iter(fake.orders.values()))
+    fake._apply_fill(o, 2897.1, 0.005)                                     # se llena en parte
+    await wait_for(lambda: service.trades.get_trade("ETHUSDT", "SHORT") is not None)
+    _, body = await service.trades.submit_signal({"action": "cancel_stop", "trade_id": 42, "bot": "ratio_rev",
+                                                  "symbol": "ETHUSDT", "direction": "SHORT"}, wait=True)
+    assert body["ok"]
+    await wait_for(lambda: not fake.orders and not service.trades.pending_stops())
+    trade = service.trades.get_trade("ETHUSDT", "SHORT")
+    assert trade.lots.get("ratio_rev:42") == pytest.approx(0.005)
+    await wait_for(lambda: len(service.core.account.algos_for("ETHUSDT", "SHORT")) == 2)   # su TP y SL
+
+
+async def test_cancelar_el_tp_disparado_de_un_lote_no_toca_el_de_otro_bot_con_el_mismo_numero(service, fake):
+    t = service.trades
+    t._fired_orders.update({901: ("alpha:42", 1), 902: ("beta:42", 2)})
+    assert t._same_lot("alpha:42", "alpha:42") and not t._same_lot("beta:42", "alpha:42")
