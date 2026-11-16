@@ -223,7 +223,18 @@ mensaje `{"secret": "..."}`; cada mensaje recibe respuesta y puede llevar `id`).
 {"action": "open_sl", "symbol": "SOLUSDT", "direction": "LONG", "trigger_price": 140}
 {"action": "close_tp", "symbol": "SOLUSDT"}
 {"action": "close_sl", "symbol": "SOLUSDT"}
+{"action": "open_stop", "trade_id": 124, "symbol": "SOLUSDT", "direction": "SHORT", "trigger_price": 145, "quantity": 5, "tp": 143.5, "sl": 147}
+{"action": "cancel_stop", "trade_id": 124, "symbol": "SOLUSDT"}
 ```
+
+- **Entrada stop pendiente (`open_stop`)**: deja en Binance una **entrada** `STOP_MARKET` (Algo Order, por último
+  precio: `workingType=CONTRACT_PRICE`) de `quantity` en `trigger_price`, con el `trade_id` en el `clientAlgoId`
+  (`E124` / `E124:bot`). Al dispararse, su fill abre (o amplía) la posición con el lote de ese `trade_id`, y al
+  llenarse del todo se le ponen `tp` y `sl` (los del lote, como en una apertura). Después se cierra con un `close`
+  normal de ese `trade_id`. Pensada para la venganza del bot de ratio: contraria y puesta en el SL de la otra
+  posición, para que entre sin esperar al bot. Solo en **modo Hedge** (en One-way netearía la otra posición).
+  Un `open_stop` del mismo `trade_id` reemplaza el anterior; `cancel_stop`, un `close` de ese `trade_id` antes de
+  que se dispare, o `close_all`, la quitan. Las pendientes se guardan en `trades.json`. Se aplica el multiplicador.
 
 - Tamaño de apertura: `quantity`/`qty` (con `price` define el notional deseado, como antes), o `notional`/`usdt`, o
   `margin`. Si llegan `quantity` y `notional`, manda `quantity × price` (se avisa si difieren). Sin ninguno se

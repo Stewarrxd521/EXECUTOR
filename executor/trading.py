@@ -7,6 +7,9 @@ Contrato con los bots ya desplegados (``ExecutorBridge``)::
     POST /signal  {"action": "close", "trade_id", "symbol", "direction", "reason", "close_price",
                    "pnl"?, "quantity"?}
     POST /signal  {"action": "close_all" | "open_tp" | "open_sl" | "close_tp" | "close_sl", ...}
+    POST /signal  {"action": "open_stop", "trade_id", "symbol", "direction", "trigger_price", "quantity",
+                   "tp"?, "sl"?, "leverage"?}   entrada STOP_MARKET pendiente en Binance (p. ej. la venganza)
+    POST /signal  {"action": "cancel_stop", "trade_id", "symbol"}   la quita si aún no se disparó
 
 Garantías para los bots:
 
@@ -38,7 +41,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
 from .account import OrderUpdate, Position
-from .core import Core, utc_now_str
+from .core import Core, new_client_id, utc_now_str
 from .errors import Action, BinanceAPIError, ErrorDoctor
 from .orders import OrderContext, OrderExecutor
 from .precision import D, fmt, parse_bool, safe_float
@@ -150,6 +153,11 @@ def parse_prot_cid(cid: str) -> Optional[tuple[str, Any]]:
     if not m:
         return None
     return ("TP" if m.group(1) == "T" else "SL"), lot_ref(m.group(3) or "", int(m.group(2)))
+
+
+def stop_cid_prefix(lot: Any) -> str:
+    """Prefijo del clientAlgoId de la entrada stop pendiente de un trade_id: «E5:kline»."""
+    return "E" + lot_cid_prefix("X", lot)[1:]
 
 
 def parse_lot_cid(cid: str) -> Optional[tuple[str, Any]]:
@@ -594,6 +602,9 @@ class TradeManager:
         self._fired_orders: dict[int, tuple] = {}      # orderId de la orden de un TP/SL disparado -> (lote, algoId)
         self._fired_done: OrderedDict = OrderedDict()  # algoId ya atribuido (su FINISHED no se cuenta otra vez)
         self._prot_locks: dict[tuple, asyncio.Lock] = {}  # (posición, lote): poner/quitar su TP/SL, de uno en uno
+        # Entradas STOP_MARKET pendientes por señal (open_stop): lote -> datos; y orderId disparado -> lote.
+        self._stops: dict[str, dict] = {}
+        self._stop_orders: dict[int, str] = {}
         self.adopted = False                          # ya se adoptaron las posiciones sin trade (1.ª lectura)
         self._bot_first_seen: dict[str, float] = {}   # bot -> primera vez que se identificó (lotes de antes, sin nombre)
         self._cid_final: OrderedDict = OrderedDict()   # clientOrderId propio -> (llenado, precio medio) ya definitivo
@@ -628,6 +639,7 @@ class TradeManager:
                  "record": a["record"].to_dict()}
                 for (key, slot), a in self._lot_attempts.items() if not a.get("active")],
             "bots_seen": self._bot_first_seen,
+            "stop_entries": list(self._stops.values()),
             "detached_lot_closes": [
                 {"key": list(a["key"]), "lot": a["lot"], "args": a["args"], "entry": a["entry"], "ts": a["ts"],
                  "orphan": a.get("orphan", False), "cids": self._attempt_cids(a), "record": a["record"].to_dict()}
@@ -699,6 +711,9 @@ class TradeManager:
             except (KeyError, TypeError, ValueError, IndexError):
                 log.warning("Cierre pendiente guardado ilegible; se ignora: %s", str(raw)[:200])
         self._bot_first_seen = {str(k): float(v) for k, v in (data.get("bots_seen") or {}).items()}
+        for raw in data.get("stop_entries", []) or []:
+            if isinstance(raw, dict) and raw.get("lk") and raw.get("symbol"):
+                self._stops[str(raw["lk"])] = raw
         self.realized_total = float(data.get("realized_total", sum(t.pnl_usdt for t in self.closed)))
         if self.trades or self.closed:
             log.info("Estado restaurado: %d abiertas, %d cerradas", len(self.trades), len(self.closed))
@@ -1004,6 +1019,7 @@ class TradeManager:
             "open": self._accept_open, "close": self._accept_close, "close_all": self._accept_close_all,
             "open_tp": self._accept_protect, "open_sl": self._accept_protect,
             "close_tp": self._accept_unprotect, "close_sl": self._accept_unprotect,
+            "open_stop": self._accept_open_stop, "cancel_stop": self._accept_cancel_stop,
         }.get(action)
         if handler is None:
             return self._reject(sig, f"acción desconocida (unknown action): {action or '(vacía)'}")
@@ -1012,6 +1028,204 @@ class TradeManager:
             self._dedupe[sig.dedupe_key] = time.time()
         body.setdefault("signal_id", sig.signal_id)
         return status, body, task
+
+    # ── open_stop / cancel_stop: entrada STOP_MARKET pendiente en Binance ───────
+    def _accept_open_stop(self, sig: Signal):
+        d, symbol, direction = sig.data, sig.symbol, sig.direction
+        trigger = safe_float(d.get("trigger_price")) or safe_float(d.get("price"))
+        quantity = safe_float(_first(d, ("quantity", "qty")))
+        notional = safe_float(_first(d, ("notional", "usdt")))
+        if not symbol or direction not in ("LONG", "SHORT") or not sig.trade_id:
+            return self._reject(sig, "open_stop: faltan symbol, direction (LONG/SHORT) o trade_id")
+        if trigger <= 0:
+            return self._reject(sig, "open_stop: trigger_price inválido")
+        if quantity <= 0 and notional > 0:
+            quantity = notional / trigger
+        if quantity <= 0:
+            return self._reject(sig, "open_stop: falta quantity (o notional)")
+        if symbol in self.settings.blocked_symbols:
+            return self._reject(sig, f"{symbol} está bloqueado (BLOCKED_SYMBOLS)", 200)
+        if not self.trading_enabled:
+            return self._reject(sig, "trading pausado desde el dashboard", 200)
+        ok, why = self.core.exinfo.tradable(symbol)
+        if not ok:
+            return self._reject(sig, why, 200)
+        if self.grid_owner(symbol, direction):
+            return self._reject(sig, f"{symbol} {direction} está gestionado por un bot Grid", 200)
+        if not self.core.account.is_hedge:
+            # En One-way una entrada contraria netearía (cerraría) la otra posición del par.
+            return self._reject(sig, "open_stop necesita la cuenta en modo Hedge", 200)
+        task = self._spawn(self._signal_open_stop(sig, trigger, quantity))
+        return 200, {"ok": True, "action": "open_stop", "symbol": symbol, "direction": direction,
+                     "trigger_price": trigger}, task
+
+    async def _signal_open_stop(self, sig: Signal, trigger: float, quantity: float) -> dict:
+        d, symbol, direction = sig.data, sig.symbol, sig.direction
+        lk = Trade.lot_key(sig.ref)
+        await self._await_ready(symbol)
+        old = self._stops.get(lk)
+        if old is not None:
+            await self._cancel_stop(old, "reemplazada")
+        factor = self.multiplier.effective() if self.multiplier is not None else 1.0
+        rules = self.core.exinfo.get(symbol, trigger)
+        lev = int(safe_float(d.get("leverage")))
+        lev = lev if 1 <= lev <= 125 else self.leverage_for_price(trigger)
+        qty = rules.round_qty(quantity * factor, market=True, mode="nearest")
+        if qty <= 0:
+            return self._stop_failed(sig, "cantidad 0 tras redondear al step")
+        params = {
+            "symbol": symbol, "side": "BUY" if direction == "LONG" else "SELL", "type": "STOP_MARKET",
+            "triggerPrice": fmt(rules.round_price(trigger, "nearest")), "quantity": fmt(qty),
+            # Por último precio operado (como el bot que la pide), no por mark price.
+            "workingType": "CONTRACT_PRICE", "positionSide": self.orders.position_side(direction),
+            "clientAlgoId": new_client_id(stop_cid_prefix(sig.ref)),
+        }
+        try:
+            await self.orders.ensure_leverage(symbol, lev)
+            result = await self.core.ws.place_algo(**params)
+            self.core.account.register_algo_result(result)
+        except BinanceAPIError as err:
+            diag, _ = self.orders._record(err, "open_stop", symbol)
+            return self._stop_failed(sig, diag.summary())
+        stop = {"lk": lk, "ref": sig.ref, "trade_id": sig.trade_id, "bot": sig.bot, "symbol": symbol,
+                "direction": direction, "trigger": float(params["triggerPrice"]), "qty": float(qty),
+                "tp": safe_float(_first(d, _TP_ALIASES)), "sl": safe_float(_first(d, _SL_ALIASES)),
+                "leverage": lev, "algo_id": (result or {}).get("algoId"), "caid": params["clientAlgoId"],
+                "signal_id": sig.signal_id, "ts": time.time(), "filled": 0.0}
+        self._stops[lk] = stop
+        self.save()
+        detail = f"STOP {direction} {symbol} {fmt(qty)} @ {params['triggerPrice']}" + \
+                 "".join(f" · {k.upper()} {stop[k]:g}" for k in ("tp", "sl") if stop[k] > 0)
+        self.core.bus.emit("order", f"Entrada stop pendiente: {detail}", "info", symbol=symbol)
+        self._log_signal("open_stop", symbol, direction, True, detail, sig)
+        return {"ok": True, "detail": detail}
+
+    def _stop_failed(self, sig: Signal, why: str) -> dict:
+        self.status["signals_rejected"] += 1
+        self._log_signal("open_stop", sig.symbol, sig.direction, False, why, sig)
+        self.core.bus.emit("signal_failed", f"Entrada stop NO colocada: {sig.direction} {sig.symbol} "
+                           f"trade_id {sig.trade_id} — {why}", "error", symbol=sig.symbol)
+        self.core.telegram.send(f"⚠️ <b>Entrada stop no colocada</b> {sig.direction} <code>{sig.symbol}</code> "
+                                f"trade_id {sig.trade_id}\n{why}")
+        return {"ok": False, "detail": why}
+
+    def _accept_cancel_stop(self, sig: Signal):
+        stop = self._stops.get(Trade.lot_key(sig.ref))
+        if stop is None:
+            self._log_signal("cancel_stop", sig.symbol, sig.direction, True, "no había entrada stop pendiente", sig)
+            return 200, {"ok": True, "action": "cancel_stop", "symbol": sig.symbol, "found": False}, None
+        task = self._spawn(self._signal_cancel_stop(sig, stop))
+        return 200, {"ok": True, "action": "cancel_stop", "symbol": stop["symbol"], "found": True}, task
+
+    async def _signal_cancel_stop(self, sig: Signal, stop: dict, why: str = "cancel_stop") -> dict:
+        ok = await self._cancel_stop(stop, why)
+        detail = "entrada stop cancelada" if ok else "la entrada stop ya se había disparado"
+        self._log_signal(sig.action, stop["symbol"], stop["direction"], True, detail, sig)
+        return {"ok": True, "detail": detail}
+
+    async def _cancel_stop(self, stop: dict, why: str) -> bool:
+        """Quita de Binance la entrada stop si aún no se disparó. False si ya se disparó (sigue su curso)."""
+        if self._stop_filled_any(stop) or any(lk == stop["lk"] for lk in self._stop_orders.values()):
+            return False
+        self._stops.pop(stop["lk"], None)
+        self.save()
+        aid = stop.get("algo_id")
+        if not aid:
+            o = next((o for o in self.core.account.algos_for(stop["symbol"]) if o.client_id == stop["caid"]), None)
+            aid = o.id if o is not None else None
+        if aid:
+            await self.orders.cancel_algo(aid, stop["symbol"])
+        log.info("Entrada stop %s %s (trade_id %s) cancelada: %s", stop["direction"], stop["symbol"],
+                 stop["trade_id"], why)
+        return True
+
+    @staticmethod
+    def _stop_filled_any(stop: dict) -> bool:
+        return float(stop.get("filled") or 0.0) > 0
+
+    def _stop_by_caid(self, caid: str) -> Optional[dict]:
+        return next((st for st in self._stops.values() if st.get("caid") == caid), None) if caid else None
+
+    def _on_stop_algo(self, o: dict) -> bool:
+        """ALGO_UPDATE de una entrada stop propia: su disparo («ai» = la orden que crea) o su fin."""
+        stop = self._stop_by_caid(o.get("caid", ""))
+        if stop is None:
+            return False
+        status = o.get("X")
+        if o.get("ai") and status in ("TRIGGERED", "TRIGGERING", "FINISHED"):
+            self._stop_orders[int(safe_float(o["ai"]))] = stop["lk"]
+        elif status in ("CANCELED", "EXPIRED", "REJECTED") and not self._stop_filled_any(stop):
+            self._stops.pop(stop["lk"], None)
+            self.save()
+            if status != "CANCELED":
+                self.core.bus.emit("algo", f"Entrada stop {stop['symbol']} {stop['direction']} {status}: "
+                                           f"{o.get('rm', '')}", "error", symbol=stop["symbol"])
+        return True
+
+    def _stop_order_lot(self, upd: OrderUpdate) -> Optional[str]:
+        """Lote de la entrada stop que generó esta orden: por el «ai» del ALGO_UPDATE o, si el fill llegó antes,
+        por tipo (STOP_MARKET que abre), símbolo y lado, con una sola entrada stop candidata."""
+        lk = self._stop_orders.get(upd.order_id)
+        if lk is not None:
+            return lk
+        if upd.orig_type != "STOP_MARKET" or upd.reduce_only or upd.order_id in self._fired_orders:
+            return None
+        cands = [st for st in self._stops.values() if st["symbol"] == upd.symbol
+                 and upd.position_side == st["direction"]
+                 and upd.side == ("BUY" if st["direction"] == "LONG" else "SELL")]
+        if len(cands) != 1:
+            return None
+        self._stop_orders[upd.order_id] = cands[0]["lk"]
+        return cands[0]["lk"]
+
+    def _on_stop_fill(self, lk: str, upd: OrderUpdate) -> None:
+        """Fill de una entrada stop: abre (o amplía) la posición con el lote de su trade_id y, al llenarse
+        del todo, le pone su TP/SL."""
+        stop = self._stops.get(lk)
+        if stop is None:
+            return
+        rules = self.core.exinfo.get(upd.symbol, upd.last_price)
+        trade = self._register_entry(upd.symbol, stop["direction"], upd.last_price, upd.last_qty,
+                                     int(stop.get("leverage") or 1), stop["trade_id"], upd.order_id,
+                                     upd.position_side in ("LONG", "SHORT"), rules.step_size,
+                                     source="signal", bot=stop.get("bot", ""))
+        stop["filled"] = upd.cum_qty
+        if trade is not None:
+            trade.last_fill_ts = time.time()
+            self._apply_fill(trade, upd.client_id or f"stop{upd.order_id}", lk, +1, upd.cum_qty)
+            trade.fees_usdt += upd.fee_usdt
+            self._note_real_price(trade, upd)
+        if upd.status != "FILLED":
+            self.save()
+            return
+        self._stops.pop(lk, None)
+        self._stop_orders.pop(upd.order_id, None)
+        self.status["signals_open"] += 1
+        self.save()
+        if trade is not None:
+            self._announce_open(trade)
+        self._log_signal("open_stop", upd.symbol, stop["direction"], True,
+                         f"entrada stop ejecutada: {fmt(upd.cum_qty)} @ {upd.avg_price or upd.last_price:g}",
+                         trade_id=stop["trade_id"], **({"bot": stop["bot"]} if stop.get("bot") else {}))
+        if trade is not None and (stop.get("tp", 0) > 0 or stop.get("sl", 0) > 0):
+            self._spawn(self._arm_stop_protection(stop))
+
+    async def _arm_stop_protection(self, stop: dict) -> None:
+        for kind in ("TP", "SL"):
+            trig = float(stop.get(kind.lower()) or 0.0)
+            if trig <= 0:
+                continue
+            try:
+                await self.set_protection(stop["symbol"], stop["direction"], kind, trig, lot=stop["ref"])
+            except BinanceAPIError as err:
+                title = ErrorDoctor.diagnose(err).info.title
+                self.core.bus.emit("protect_failed", f"{stop['symbol']}: {kind} de la entrada stop (trade_id "
+                                   f"{stop['trade_id']}) no colocado ({title})", "error", symbol=stop["symbol"])
+                self.core.telegram.send(f"⚠️ <b>{kind} no colocado</b> <code>{stop['symbol']}</code> trade_id "
+                                        f"{stop['trade_id']} (entrada stop)\n[{err.code}] {title}")
+
+    def pending_stops(self) -> list[dict]:
+        return [dict(st) for st in self._stops.values()]
 
     # ── open ──────────────────────────────────────────────────────────────
     def _accept_open(self, sig: Signal):
@@ -1340,6 +1554,11 @@ class TradeManager:
         d = sig.data
         if not sig.symbol and not sig.trade_id:
             return self._reject(sig, "falta symbol o trade_id")
+        stop = self._stops.get(Trade.lot_key(sig.ref)) if sig.trade_id else None
+        if stop is not None and not self._stop_filled_any(stop):
+            # Cierre de un trade_id que solo es una entrada stop sin disparar: se quita de Binance.
+            task = self._spawn(self._signal_cancel_stop(sig, stop, why=f"close {d.get('reason') or ''}".strip()))
+            return 200, {"ok": True, "action": "close", "symbol": sig.symbol, "stop_cancelled": True}, task
         reason = str(d.get("reason") or "MAIN_BOT").upper()
         close_price = safe_float(d.get("close_price")) or safe_float(d.get("price"))
         quantity = safe_float(_first(d, ("quantity", "qty")))
@@ -1555,6 +1774,8 @@ class TradeManager:
         await self._await_ready()
         await self._wait_tasks(prior_opens or [])  # no espera (ni cierra) aperturas recibidas después
         closed = await self.close_all("CLOSE_ALL")
+        for stop in list(self._stops.values()):
+            await self._cancel_stop(stop, "close_all")
         self.status["signals_close"] += len(closed)
         detail = f"{len(closed)} posición(es) cerradas"
         self._log_signal("close_all", "", "", True, detail, sig)
@@ -3138,6 +3359,8 @@ class TradeManager:
 
     def on_algo_update(self, o: dict) -> None:
         """ALGO_UPDATE: el TP/SL de un trade_id se disparó; los fills de su orden se descontarán de ese lote."""
+        if self._on_stop_algo(o):
+            return
         if o.get("X") not in ("TRIGGERED", "TRIGGERING", "FINISHED"):
             return
         parsed = parse_prot_cid(o.get("caid", ""))
@@ -3506,6 +3729,12 @@ class TradeManager:
             self._cid_final[upd.client_id] = (upd.cum_qty, upd.avg_price or upd.last_price)
             while len(self._cid_final) > 5000:
                 self._cid_final.popitem(last=False)
+        if owner is None:
+            lk = self._stop_order_lot(upd)
+            if lk is not None:
+                if upd.is_fill:
+                    self._on_stop_fill(lk, upd)
+                return
         if upd.is_fill:
             if upd.realized_pnl or upd.reduce_only or upd.orig_type in ("TAKE_PROFIT_MARKET", "STOP_MARKET",
                                                                          "TAKE_PROFIT", "STOP", "LIQUIDATION"):
