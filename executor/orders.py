@@ -24,6 +24,8 @@ from .precision import D, floor_step, fmt, safe_float
 log = logging.getLogger("executor.orders")
 _LOT_ALGO_RE = re.compile(r"[TS]\d+(?::[a-z0-9_.-]+)?")
 # clientAlgoId de una ENTRADA stop pendiente de un trade_id (open_stop, E5:kline-…): no es un TP/SL.
+# Tipos de cada TP/SL: a mercado y su versión límite (un TP/SL nuevo reemplaza el anterior de cualquiera de los dos).
+PROTECTION_TYPES = {"TP": frozenset({"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}), "SL": frozenset({"STOP_MARKET", "STOP"})}
 _STOP_ENTRY_RE = re.compile(r"E\d+(?::[a-z0-9_.-]+)?")  # clientAlgoId del TP/SL de un trade_id (T5:kline-…)
 
 LEVERAGE_LADDER = [125, 100, 75, 50, 25, 20, 15, 10, 8, 5, 4, 3, 2, 1]
@@ -510,18 +512,26 @@ class OrderExecutor:
         """TP/SL con ``qty`` (o la posición entera). ``client_prefix``: el del trade_id que lo pide (``T5:kline``):
         solo reemplaza el suyo, y cada trade_id del mismo lado tiene el suyo; sin él, reemplaza el de la posición."""
         kind = kind.upper()
-        order_type = "TAKE_PROFIT_MARKET" if kind == "TP" else "STOP_MARKET"
+        settings = self.core.settings
+        # TP límite (TAKE_PROFIT con precio = disparo): al tocarse queda una LIMIT al precio del TP, que se
+        # llena a ese precio o mejor. Necesita cantidad: sin ella (posición entera) va a mercado.
+        limit_tp = kind == "TP" and bool(getattr(settings, "tp_limit", False)) and bool(qty and qty > 0)
+        order_type = ("TAKE_PROFIT" if limit_tp else "TAKE_PROFIT_MARKET") if kind == "TP" else "STOP_MARKET"
         rules = self.core.exinfo.get(symbol, trigger)
         ps = self.position_side(direction)
         side = "SELL" if direction == "LONG" else "BUY"
         trig = rules.round_price(trigger, "nearest")
-        for o in self.protection_targets(symbol, direction, {order_type}, client_prefix=client_prefix,
+        for o in self.protection_targets(symbol, direction, PROTECTION_TYPES[kind], client_prefix=client_prefix,
                                          shared_only=client_prefix is None):
             await self.cancel_algo(o.id, symbol)
         params = {
             "symbol": symbol, "side": side, "type": order_type, "triggerPrice": fmt(trig),
-            "workingType": "MARK_PRICE", "positionSide": ps, "clientAlgoId": new_client_id(client_prefix or kind),
+            "workingType": getattr(settings, "protection_working_type", "MARK_PRICE") or "MARK_PRICE",
+            "positionSide": ps, "clientAlgoId": new_client_id(client_prefix or kind),
         }
+        if limit_tp:
+            params["price"] = fmt(trig)
+            params["timeInForce"] = "GTC"
         if qty and qty > 0:
             params["quantity"] = fmt(rules.round_qty(qty, market=True, mode="nearest"))
             if ps == "BOTH":
@@ -576,6 +586,8 @@ class OrderExecutor:
                 if diag.action == Action.FIX_PRICE_TICK:
                     rules = self.core.exinfo.learn_coarser_tick(symbol, rules)
                     params["triggerPrice"] = fmt(rules.round_price(trig))
+                    if "price" in params:
+                        params["price"] = params["triggerPrice"]
                     notes.append(f"trigger redondeado a tick {fmt(rules.tick_size)}")
                     continue
                 if diag.action == Action.USE_QUANTITY and params.get("closePosition"):

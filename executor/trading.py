@@ -43,7 +43,7 @@ from typing import Any, Callable, Optional
 from .account import OrderUpdate, Position
 from .core import Core, new_client_id, utc_now_str
 from .errors import Action, BinanceAPIError, ErrorDoctor
-from .orders import OrderContext, OrderExecutor
+from .orders import PROTECTION_TYPES, OrderContext, OrderExecutor
 from .precision import D, fmt, parse_bool, safe_float
 from .storage import JsonStore
 from .tasks import spawn
@@ -1044,6 +1044,10 @@ class TradeManager:
             quantity = notional / trigger
         if quantity <= 0:
             return self._reject(sig, "open_stop: falta quantity (o notional)")
+        limit = safe_float(d.get("limit_price"))
+        if limit < 0 or (limit > 0 and (limit > trigger if direction == "SHORT" else limit < trigger)):
+            return self._reject(sig, "open_stop: limit_price debe quedar igual o peor que el trigger_price "
+                                     "(por debajo en SHORT, por encima en LONG)")
         if symbol in self.settings.blocked_symbols:
             return self._reject(sig, f"{symbol} está bloqueado (BLOCKED_SYMBOLS)", 200)
         if not self.trading_enabled:
@@ -1085,6 +1089,12 @@ class TradeManager:
             "workingType": "CONTRACT_PRICE", "positionSide": self.orders.position_side(direction),
             "clientAlgoId": new_client_id(stop_cid_prefix(sig.ref)),
         }
+        limit = safe_float(d.get("limit_price"))
+        if limit > 0:
+            # Stop límite: al dispararse entra con una LIMIT a ese precio tope (nunca peor), no a mercado.
+            params["type"] = "STOP"
+            params["price"] = fmt(rules.round_price(limit, "down" if direction == "SHORT" else "up"))
+            params["timeInForce"] = "GTC"
         try:
             await self.orders.ensure_leverage(symbol, lev)
             result = await self.core.ws.place_algo(**params)
@@ -1096,6 +1106,7 @@ class TradeManager:
                 "direction": direction, "trigger": float(params["triggerPrice"]), "qty": float(qty),
                 "tp": safe_float(_first(d, _TP_ALIASES)), "sl": safe_float(_first(d, _SL_ALIASES)),
                 "leverage": lev, "algo_id": (result or {}).get("algoId"), "caid": params["clientAlgoId"],
+                "limit": float(params.get("price") or 0.0),
                 "signal_id": sig.signal_id, "ts": time.time(), "filled": 0.0}
         self._stops[lk] = stop
         self.save()
@@ -1138,6 +1149,10 @@ class TradeManager:
     async def _cancel_stop(self, stop: dict, why: str) -> str:
         """Quita de Binance la entrada stop si aún no se disparó: «cancelled», «triggered» (ya se disparó: sigue su
         curso) o «failed» (Binance no lo confirmó: se sigue guardando, activa, para volver a intentarlo)."""
+        if stop.get("limit") and not self._stop_filled_any(stop) and self._stop_resting(stop):
+            # Stop límite ya disparada y sin llenar: su LIMIT sigue en el libro; se cancela esa.
+            await self._finish_stop_limit(stop, why)
+            return "cancelled" if stop["lk"] not in self._stops else "failed"
         if self._stop_filled_any(stop) or any(lk == stop["lk"] for lk in self._stop_orders.values()):
             return "triggered"
         aid = stop.get("algo_id")
@@ -1193,7 +1208,10 @@ class TradeManager:
         if status == "CANCELED" and stop["lk"] not in self._stops:
             return True  # el aviso de la cancelación que pidió el executor
         if o.get("ai") and status in ("TRIGGERED", "TRIGGERING", "FINISHED"):
+            first = int(safe_float(o["ai"])) not in self._stop_orders
             self._stop_orders[int(safe_float(o["ai"]))] = stop["lk"]
+            if first and stop.get("limit"):
+                self._spawn(self._stop_limit_timeout(stop))
         elif status in ("CANCELED", "EXPIRED", "REJECTED") and not self._stop_filled_any(stop):
             self._stops.pop(stop["lk"], None)
             self.save()
@@ -1208,7 +1226,7 @@ class TradeManager:
         lk = self._stop_orders.get(upd.order_id)
         if lk is not None:
             return lk
-        if upd.orig_type != "STOP_MARKET" or upd.reduce_only or upd.order_id in self._fired_orders:
+        if upd.orig_type not in ("STOP_MARKET", "STOP") or upd.reduce_only or upd.order_id in self._fired_orders:
             return None
         pool = list(self._stops.values()) + [v[0] for v in self._stops_gone.values()]
         cands = [st for st in pool if st["symbol"] == upd.symbol
@@ -1238,20 +1256,65 @@ class TradeManager:
             self._apply_fill(trade, upd.client_id or f"stop{upd.order_id}", lk, +1, upd.cum_qty)
             trade.fees_usdt += upd.fee_usdt
             self._note_real_price(trade, upd)
+        stop["avg"] = upd.avg_price or upd.last_price
         if upd.status != "FILLED":
             self.save()
             return
+        self._stop_done(stop)
+
+    def _stop_done(self, stop: dict) -> None:
+        """La entrada stop terminó con algo ejecutado (del todo, o en parte y el resto cancelado): se anuncia
+        y se le pone su TP/SL con la cantidad de su lote."""
+        lk = stop["lk"]
         self._stops.pop(lk, None)
-        self._stop_orders.pop(upd.order_id, None)
+        for oid in [k for k, v in self._stop_orders.items() if v == lk]:
+            self._stop_orders.pop(oid, None)
         self.status["signals_open"] += 1
         self.save()
+        trade = next((t for t in self.trades.values() if lk in t.lots or lk in t.assumed_lots), None)
         if trade is not None:
             self._announce_open(trade)
-        self._log_signal("open_stop", upd.symbol, stop["direction"], True,
-                         f"entrada stop ejecutada: {fmt(upd.cum_qty)} @ {upd.avg_price or upd.last_price:g}",
+        self._log_signal("open_stop", stop["symbol"], stop["direction"], True,
+                         f"entrada stop ejecutada: {fmt(stop['filled'])} @ {float(stop.get('avg') or 0):g}",
                          trade_id=stop["trade_id"], **({"bot": stop["bot"]} if stop.get("bot") else {}))
         if trade is not None and (stop.get("tp", 0) > 0 or stop.get("sl", 0) > 0):
             self._spawn(self._arm_stop_protection(stop))
+
+    def _stop_resting(self, stop: dict) -> list[int]:
+        """Órdenes LIMIT que dejó en el libro una stop límite disparada (aún abiertas)."""
+        open_ids = {o.id for o in self.core.account.orders_for(stop["symbol"])}
+        return [oid for oid, lk in self._stop_orders.items() if lk == stop["lk"] and oid in open_ids]
+
+    async def _stop_limit_timeout(self, stop: dict) -> None:
+        await asyncio.sleep(max(0.0, float(self.settings.stop_limit_timeout_s)))
+        if self._stops.get(stop["lk"]) is stop:
+            await self._finish_stop_limit(stop, f"sin llenarse en {self.settings.stop_limit_timeout_s:g}s")
+
+    async def _finish_stop_limit(self, stop: dict, why: str) -> None:
+        """Stop límite disparada que no se llenó (del todo): se cancela lo que queda en el libro. Lo ejecutado
+        queda abierto con su TP/SL; si no se ejecutó nada, la entrada se da por terminada."""
+        for oid in self._stop_resting(stop):
+            if not await self.orders.cancel(stop["symbol"], order_id=oid):
+                log.warning("Entrada stop límite %s %s (trade_id %s): Binance no confirmó la cancelación de la "
+                            "orden %s", stop["direction"], stop["symbol"], stop["trade_id"], oid)
+                return
+        if self._stops.get(stop["lk"]) is not stop:
+            return  # se llenó mientras se cancelaba
+        if self._stop_filled_any(stop):
+            log.info("Entrada stop límite %s %s (trade_id %s): llenada en parte (%s), resto cancelado: %s",
+                     stop["direction"], stop["symbol"], stop["trade_id"], fmt(stop["filled"]), why)
+            self._stop_done(stop)
+            return
+        self._stops.pop(stop["lk"], None)
+        for oid in [k for k, v in self._stop_orders.items() if v == stop["lk"]]:
+            self._stop_orders.pop(oid, None)
+        self.save()
+        detail = f"entrada stop límite no ejecutada ({why}): el precio pasó el tope {stop['limit']:g}"
+        log.info("Entrada stop %s %s (trade_id %s): %s", stop["direction"], stop["symbol"], stop["trade_id"], detail)
+        self.core.bus.emit("order", f"{stop['symbol']} {stop['direction']}: {detail}", "warning",
+                           symbol=stop["symbol"])
+        self._log_signal("open_stop", stop["symbol"], stop["direction"], False, detail,
+                         trade_id=stop["trade_id"], **({"bot": stop["bot"]} if stop.get("bot") else {}))
 
     async def _arm_stop_protection(self, stop: dict) -> None:
         for kind in ("TP", "SL"):
@@ -1599,6 +1662,8 @@ class TradeManager:
             return self._reject(sig, "falta symbol o trade_id")
         lk = Trade.lot_key(sig.ref)
         stop = self._stops.get(lk) if sig.trade_id else None
+        if stop is not None and self._stop_filled_any(stop) and stop.get("limit"):
+            self._spawn(self._finish_stop_limit(stop, "close"))   # lo que queda en el libro no debe entrar ya
         if stop is not None and not self._stop_filled_any(stop):
             # El trade_id tiene una entrada stop sin disparar: se quita de Binance. Si además ya tiene
             # posición (otro tramo), esa se cierra con el close normal de abajo.
@@ -1868,23 +1933,22 @@ class TradeManager:
     def _accept_unprotect(self, sig: Signal):
         if not sig.symbol:
             return self._reject(sig, f"{sig.action}: falta symbol")
-        order_type = "TAKE_PROFIT_MARKET" if sig.action == "close_tp" else "STOP_MARKET"
-        task = self._spawn(self._signal_unprotect(sig, order_type))
+        task = self._spawn(self._signal_unprotect(sig, "TP" if sig.action == "close_tp" else "SL"))
         return 200, {"ok": True, "action": sig.action, "symbol": sig.symbol}, task
 
-    async def _signal_unprotect(self, sig: Signal, order_type: str) -> dict:
+    async def _signal_unprotect(self, sig: Signal, kind: str) -> dict:
         await self._await_ready(sig.symbol or None)
         trade = self._resolve_trade(sig.trade_id, sig.symbol, sig.direction or None, sig.ref) if sig.trade_id else None
         if trade is not None:
             # Con trade_id: solo el TP/SL de ese trade_id (los de otros bots del mismo par siguen).
-            kind = "TP" if order_type == "TAKE_PROFIT_MARKET" else "SL"
             lk = Trade.lot_key(sig.ref)
-            n = await self.orders.cancel_protection(trade.symbol, trade.direction, {order_type},
+            n = await self.orders.cancel_protection(trade.symbol, trade.direction, self._PROT_TYPES[kind],
                                                     client_prefix=prot_cid_prefix(kind, lk))
             trade.lot_prot.get(lk, {}).pop(kind, None)
         else:
             # Sin trade_id: solo el de la posición entera; los TP/SL de cada trade_id siguen.
-            n = await self.orders.cancel_protection(sig.symbol, sig.direction or None, {order_type}, shared_only=True)
+            n = await self.orders.cancel_protection(sig.symbol, sig.direction or None, self._PROT_TYPES[kind],
+                                                    shared_only=True)
         self.status["signals_tp_closed" if sig.action == "close_tp" else "signals_sl_closed"] += 1
         self._log_signal(sig.action, sig.symbol, sig.direction, True, f"{n} orden(es) canceladas", sig)
         label = "TP" if sig.action == "close_tp" else "SL"
@@ -2740,6 +2804,7 @@ class TradeManager:
         if full:
             qty = base
             await self.orders.cancel_protection(trade.symbol, trade.direction)
+            await self._cancel_fired_orders(trade.symbol, trade.direction)   # TP límite ya disparado y sin llenar
         own_prot = {} if orphan else self._lot_protections(trade, lk)
         if own_prot and not full:
             # Su TP/SL (con la cantidad de su lote) se cancela ANTES de cerrarlo: si se disparara justo después,
@@ -3366,16 +3431,29 @@ class TradeManager:
     def _owned_cids(self, owner: Any) -> list[str]:
         return [cid for cid, o in list(self.orders.client_owner.items()) if o is owner]
 
-    _PROT_TYPES = {"TP": "TAKE_PROFIT_MARKET", "SL": "STOP_MARKET"}
+    _PROT_TYPES = PROTECTION_TYPES
 
     def _lot_protections(self, trade: Trade, lk: str) -> dict:
         """{"TP": precio, "SL": precio} del trade_id: lo que hay en Binance con su clientAlgoId (y lo guardado)."""
         out = dict(trade.lot_prot.get(lk, {}))
         for kind, otype in self._PROT_TYPES.items():
-            for o in self.orders.protection_targets(trade.symbol, trade.direction, {otype},
+            for o in self.orders.protection_targets(trade.symbol, trade.direction, otype,
                                                     client_prefix=prot_cid_prefix(kind, lk)):
                 out[kind] = o.trigger_price or out.get(kind, 0.0)
         return out
+
+    async def _cancel_fired_orders(self, symbol: str, direction: str, lk: Optional[str] = None) -> int:
+        """Cancela la orden LÍMITE que dejó en el libro un TP límite ya disparado (de ``lk`` o de todo el lado):
+        si el lote se cierra por otro lado, esa orden no debe quedar viva cerrando cantidad de otros."""
+        ps = self.orders.position_side(direction)
+        ids = [o.id for o in self.core.account.orders_for(symbol)
+               if o.id in self._fired_orders and o.position_side == ps
+               and (lk is None or _split_ref(self._fired_orders[o.id][0])[0] == _split_ref(lk)[0])]
+        n = 0
+        for oid in ids:
+            if await self.orders.cancel(symbol, order_id=oid):
+                n += 1
+        return n
 
     def _prot_lock(self, trade: Trade, lk: str) -> asyncio.Lock:
         return self._prot_locks.setdefault((trade.key, lk), asyncio.Lock())
@@ -3384,8 +3462,9 @@ class TradeManager:
         n = 0
         async with self._prot_lock(trade, lk):
             for kind, otype in self._PROT_TYPES.items():
-                n += await self.orders.cancel_protection(trade.symbol, trade.direction, {otype},
+                n += await self.orders.cancel_protection(trade.symbol, trade.direction, otype,
                                                          client_prefix=prot_cid_prefix(kind, lk))
+            n += await self._cancel_fired_orders(trade.symbol, trade.direction, lk)
         return n
 
     def _drop_lot_protection(self, trade: Trade, lk: str) -> None:
@@ -3738,7 +3817,7 @@ class TradeManager:
                                                                 qty=real if real > 0 else virt,
                                                                 client_prefix=prot_cid_prefix(kind, own))
                     if own not in trade.lots and own not in trade.assumed_lots:  # se cerró mientras se colocaba
-                        await self.orders.cancel_protection(symbol, direction, {self._PROT_TYPES[kind]},
+                        await self.orders.cancel_protection(symbol, direction, self._PROT_TYPES[kind],
                                                             client_prefix=prot_cid_prefix(kind, own))
                         trade.lot_prot.pop(own, None)
             else:

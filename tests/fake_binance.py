@@ -227,7 +227,7 @@ class FakeBinance:
                 continue
             trig = float(a["triggerPrice"])
             long_close = a["side"] == "SELL"
-            hit = (mark >= trig) if (a["type"] == "TAKE_PROFIT_MARKET") == long_close else (mark <= trig)
+            hit = (mark >= trig) if a["type"].startswith("TAKE_PROFIT") == long_close else (mark <= trig)
             if hit:
                 del self.algos[aid]
                 pos = self.positions.get((symbol, a["positionSide"]), {"amt": 0.0})
@@ -242,7 +242,19 @@ class FakeBinance:
                         "ps": a["positionSide"], "tp": a["triggerPrice"], "q": a.get("quantity", "0")}
                 # Como Binance: TRIGGERED (con «ai», la orden creada) -> fill(s) -> FINISHED.
                 self.push({"e": "ALGO_UPDATE", "E": int(time.time() * 1000), "o": {**base, "X": "TRIGGERED", "ai": oid}})
-                if qty > 0:
+                if qty > 0 and float(a.get("price") or 0) > 0:
+                    # TAKE_PROFIT / STOP (límite): deja una LIMIT a su precio; se llena si ya es ejecutable.
+                    lp = float(a["price"])
+                    order = {"symbol": symbol, "side": a["side"], "type": "LIMIT", "origType": a["type"],
+                             "positionSide": a["positionSide"], "origQty": qty, "orderId": oid, "price": a["price"],
+                             "clientOrderId": f"algo{aid}", "status": "NEW", "reduceOnly": not opening,
+                             "timeInForce": "GTC", "executedQty": 0.0, "avgPrice": 0.0}
+                    if (a["side"] == "SELL" and mark >= lp) or (a["side"] == "BUY" and mark <= lp):
+                        self._apply_fill(order, lp, qty)
+                    else:
+                        self.orders[oid] = order
+                        self.push(self._otu(order, "NEW"))
+                elif qty > 0:
                     order = {"symbol": symbol, "side": a["side"], "type": "MARKET", "origType": a["type"],
                              "positionSide": a["positionSide"], "origQty": qty, "orderId": oid,
                              "clientOrderId": f"algo{aid}", "status": "NEW", "reduceOnly": not opening}
@@ -330,6 +342,8 @@ class FakeBinance:
             algo = {"algoId": aid, "clientAlgoId": p.get("clientAlgoId", f"a{aid}"), "symbol": p["symbol"],
                     "side": p["side"], "positionSide": p.get("positionSide", "BOTH"), "type": p["type"],
                     "triggerPrice": p["triggerPrice"], "quantity": p.get("quantity"), "algoStatus": "NEW"}
+            if p.get("price"):
+                algo["price"] = p["price"]
             self.algos[aid] = algo
             self.push({"e": "ALGO_UPDATE", "E": int(time.time() * 1000), "o": {"aid": aid, "caid": algo["clientAlgoId"],
                        "s": algo["symbol"], "X": "NEW", "o": algo["type"], "S": algo["side"], "ps": algo["positionSide"],
