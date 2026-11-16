@@ -231,7 +231,12 @@ class FakeBinance:
             if hit:
                 del self.algos[aid]
                 pos = self.positions.get((symbol, a["positionSide"]), {"amt": 0.0})
-                qty = abs(pos["amt"]) if not a.get("quantity") else min(abs(pos["amt"]), float(a["quantity"]))
+                # Hedge: una orden que compra en LONG o vende en SHORT abre (entrada stop), no cierra.
+                opening = a["positionSide"] in ("LONG", "SHORT") and (a["side"] == "BUY") == (a["positionSide"] == "LONG")
+                if opening:
+                    qty = float(a.get("quantity") or 0)
+                else:
+                    qty = abs(pos["amt"]) if not a.get("quantity") else min(abs(pos["amt"]), float(a["quantity"]))
                 oid = self._next()
                 base = {"aid": aid, "caid": a["clientAlgoId"], "s": symbol, "o": a["type"], "S": a["side"],
                         "ps": a["positionSide"], "tp": a["triggerPrice"], "q": a.get("quantity", "0")}
@@ -240,7 +245,7 @@ class FakeBinance:
                 if qty > 0:
                     order = {"symbol": symbol, "side": a["side"], "type": "MARKET", "origType": a["type"],
                              "positionSide": a["positionSide"], "origQty": qty, "orderId": oid,
-                             "clientOrderId": f"algo{aid}", "status": "NEW", "reduceOnly": True}
+                             "clientOrderId": f"algo{aid}", "status": "NEW", "reduceOnly": not opening}
                     parts = max(1, int(self.algo_fill_parts))
                     piece = round(qty / parts, 10)
                     for i in range(parts):
